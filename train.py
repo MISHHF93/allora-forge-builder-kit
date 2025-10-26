@@ -39,7 +39,7 @@ logging.basicConfig(
     filename='pipeline_run.log',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%SZ'
 )
 
 # --- Timezone helpers ---------------------------------------------------------
@@ -156,6 +156,21 @@ def _require_api_key() -> str:
         )
         sys.exit(1)
     return api_key.strip()
+
+
+def _load_pipeline_config(root_dir: str) -> Dict[str, Any]:
+    """Load pipeline configuration once for reuse."""
+    cfg_path = os.path.join(root_dir, "config", "pipeline.yaml")
+    cfg: Dict[str, Any] = {}
+    if yaml and os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as fh:
+                loaded: Any = yaml.safe_load(fh) or {}
+            if isinstance(loaded, dict):
+                cfg = cast(Dict[str, Any], loaded)
+        except (OSError, IOError, UnicodeDecodeError, ValueError, TypeError) as exc:
+            print(f"Warning: failed to load config/pipeline.yaml: {exc}")
+    return cfg
 
 
 # --- Submission helpers (integrated from prior submission script) ------------
@@ -2017,50 +2032,15 @@ def resolve_wallet() -> None:
         print(f"Warning: failed to run resolve_wallet.py: {e}")
 
 
-def run_pipeline(args) -> int:
-    pass
-
-def main() -> int:
-    root_dir = os.path.dirname(os.path.abspath(__file__))
-    # 3) Load pipeline config if available (moved to top so cfg is defined before use)
-    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "pipeline.yaml")
-    cfg: Dict[str, Any] = {}
-    if yaml and os.path.exists(cfg_path):
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as fh:
-                loaded: Any = yaml.safe_load(fh) or {}
-                if isinstance(loaded, dict):
-                    cfg = cast(Dict[str, Any], loaded)
-                else:
-                    cfg = {}
-        except (OSError, IOError, UnicodeDecodeError) as e:
-            print(f"Warning: failed to load config/pipeline.yaml: {e}")
-
-    # Args exist but default to competition spec
-    parser = argparse.ArgumentParser(description="Train model and emit predictions.json for Topic 67 (7-day BTC/USD log-return)")
-    parser.add_argument("--from-month", default="2025-01")
-    parser.add_argument("--schedule-mode", default=None, help="Schedule mode (single, loop, etc.)")
-    parser.add_argument("--cadence", default=None, help="Cadence for scheduling (e.g., 1h)")
-    parser.add_argument("--start-utc", default=None, help="Start datetime in UTC (ISO format)")
-    parser.add_argument("--end-utc", default=None, help="End datetime in UTC (ISO format)")
-    parser.add_argument("--as-of", default=None, help="As-of datetime in UTC (ISO format)")
-    parser.add_argument("--as-of-now", action="store_true", help="Use current UTC time as as_of")
-    parser.add_argument("--submit", action="store_true", help="Submit the prediction after training")
-    parser.add_argument("--submit-timeout", type=int, default=30, help="Timeout for submission in seconds")
-    parser.add_argument("--submit-retries", type=int, default=3, help="Number of retries for submission")
-    parser.add_argument("--force-submit", action="store_true", help="Force submission even if guards are active")
-    args = parser.parse_args()
-
-    # Allow CLI args to override defaults but prefer config when present
+def run_pipeline(args, cfg, root_dir) -> int:
     data_cfg: Dict[str, Any] = cfg.get("data", {})
-    from_month: str = str(data_cfg.get("from_month", args.from_month))
-
-    # Schedule configuration
+    from_month = getattr(args, "from_month", str(data_cfg.get("from_month", "2025-01")))
     sched_cfg: Dict[str, Any] = cfg.get("schedule", {})
-    mode: str = str(args.schedule_mode or sched_cfg.get("mode", "single"))
-    cadence: str = str(args.cadence or sched_cfg.get("cadence", "1h"))
-    start_raw: str = str(args.start_utc or sched_cfg.get("start", "2025-09-16T13:00:00Z"))
-    end_raw: str = str(args.end_utc or sched_cfg.get("end", "2025-12-15T13:00:00Z"))
+    mode = getattr(args, "_effective_mode", str(getattr(args, "schedule_mode", None) or sched_cfg.get("mode", "single")))
+    cadence = getattr(args, "_effective_cadence", str(getattr(args, "cadence", None) or sched_cfg.get("cadence", "1h")))
+    start_raw = str(getattr(args, "start_utc", None) or sched_cfg.get("start", "2025-09-16T13:00:00Z"))
+    end_raw = str(getattr(args, "end_utc", None) or sched_cfg.get("end", "2025-12-15T13:00:00Z"))
+
     def _parse_utc(ts: str) -> pd.Timestamp:
         t = pd.Timestamp(ts)
         if getattr(t, "tz", None) is None:
@@ -2173,61 +2153,6 @@ def main() -> int:
         except (ValueError, TypeError, KeyError):
             idx_fallback = _to_naive_utc_index(pd.DatetimeIndex(idx))
             return pd.Series([True] * len(idx_fallback), index=idx_fallback, dtype=bool)
-
-    # --- DEBUG: Print data stats before/after filtering ---
-    # (moved after full_data is assigned)
-
-    # 3) Load pipeline config if available
-    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "pipeline.yaml")
-    cfg: Dict[str, Any] = {}
-    if yaml and os.path.exists(cfg_path):
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as fh:
-                loaded: Any = yaml.safe_load(fh) or {}
-                if isinstance(loaded, dict):
-                    cfg = cast(Dict[str, Any], loaded)
-                else:
-                    cfg = {}
-        except (OSError, IOError, UnicodeDecodeError) as e:
-            print(f"Warning: failed to load config/pipeline.yaml: {e}")
-
-    # Allow CLI args to override defaults but prefer config when present
-    data_cfg: Dict[str, Any] = cfg.get("data", {})
-    from_month: str = str(data_cfg.get("from_month", args.from_month))
-
-    # Schedule configuration
-    sched_cfg: Dict[str, Any] = cfg.get("schedule", {})
-    mode: str = str(args.schedule_mode or sched_cfg.get("mode", "single"))
-    cadence: str = str(args.cadence or sched_cfg.get("cadence", "1h"))
-    start_raw: str = str(args.start_utc or sched_cfg.get("start", "2025-09-16T13:00:00Z"))
-    end_raw: str = str(args.end_utc or sched_cfg.get("end", "2025-12-15T13:00:00Z"))
-    def _parse_utc(ts: str) -> pd.Timestamp:
-        t = pd.Timestamp(ts)
-        if getattr(t, "tz", None) is None:
-            return t.tz_localize("UTC")
-        return t.tz_convert("UTC")
-    start_utc = _parse_utc(start_raw)
-    end_utc = _parse_utc(end_raw)
-    # 7-day horizon (168h) implied by target_length; kept for readability in comments
-    # Current time reference isn't used for clipping since we anchor to competition end
-    # As-of selection: CLI --as-of overrides; else default to the competition end for full-range training
-    if args.as_of:
-        as_of = _parse_utc(args.as_of)
-    elif args.as_of_now:
-        # Snap as_of to current UTC top-of-hour
-        try:
-            as_of = pd.Timestamp.now(tz="UTC").floor(cadence or "1h")
-        except (ValueError, TypeError, AttributeError):
-            as_of = pd.Timestamp.now(tz="UTC").floor("1h")
-    else:
-        # Use competition end by default to avoid premature clipping to 'now'
-        as_of = end_utc
-    # Snap to cadence (hourly) to avoid off-boundary timestamps
-    try:
-        as_of = as_of.floor(cadence or "1h")
-    except (ValueError, TypeError, AttributeError):
-        as_of = as_of.floor("1h")
-    print(f"Schedule: mode={mode} cadence={cadence} start={start_utc} end={end_utc} as_of={as_of}")
 
     # Strict competition window filtering (inclusive) with effective end bound = min(config end, last labeled ts)
     start_naive: pd.Timestamp = _to_naive_utc_ts(start_utc)
@@ -3131,6 +3056,55 @@ def main() -> int:
         except (OSError, IOError, ValueError, RuntimeError):
             pass
         return rc
+
+    return 0
+
+def main() -> int:
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    cfg = _load_pipeline_config(root_dir)
+    parser = argparse.ArgumentParser(description="Train model and emit predictions.json for Topic 67 (7-day BTC/USD log-return)")
+    parser.add_argument("--from-month", default="2025-01")
+    parser.add_argument("--schedule-mode", default=None, help="Schedule mode (single, loop, etc.)")
+    parser.add_argument("--cadence", default=None, help="Cadence for scheduling (e.g., 1h)")
+    parser.add_argument("--start-utc", default=None, help="Start datetime in UTC (ISO format)")
+    parser.add_argument("--end-utc", default=None, help="End datetime in UTC (ISO format)")
+    parser.add_argument("--as-of", default=None, help="As-of datetime in UTC (ISO format)")
+    parser.add_argument("--as-of-now", action="store_true", help="Use current UTC time as as_of")
+    parser.add_argument("--submit", action="store_true", help="Submit the prediction after training")
+    parser.add_argument("--submit-timeout", type=int, default=30, help="Timeout for submission in seconds")
+    parser.add_argument("--submit-retries", type=int, default=3, help="Number of retries for submission")
+    parser.add_argument("--force-submit", action="store_true", help="Force submission even if guards are active")
+    parser.add_argument("--loop", action="store_true", help="Continuously run training/submission cycles based on cadence")
+    args = parser.parse_args()
+    data_cfg: Dict[str, Any] = cfg.get("data", {})
+    args.from_month = str(data_cfg.get("from_month", args.from_month))
+    sched_cfg: Dict[str, Any] = cfg.get("schedule", {})
+    mode_cfg = str(args.schedule_mode or sched_cfg.get("mode", "single"))
+    effective_mode = "loop" if args.loop or mode_cfg.lower() == "loop" else mode_cfg
+    cadence = str(args.cadence or sched_cfg.get("cadence", "1h"))
+    setattr(args, "_effective_mode", effective_mode)
+    setattr(args, "_effective_cadence", cadence)
+    cadence_s = _parse_cadence(cadence)
+    def _run_once() -> int:
+        return run_pipeline(args, cfg, root_dir)
+    if effective_mode.lower() != "loop":
+        return _run_once()
+    iteration = 0
+    while True:
+        iteration += 1
+        logging.info(f"[loop] iteration={iteration} start")
+        rc = _run_once()
+        logging.info(f"[loop] iteration={iteration} completed with rc={rc}")
+        now_utc = pd.Timestamp.now(tz="UTC")
+        window_start = _window_start_utc(now=now_utc, cadence_s=cadence_s)
+        next_window = window_start + pd.Timedelta(seconds=cadence_s)
+        sleep_seconds = max(0.0, (next_window - now_utc).total_seconds())
+        logging.info(f"[loop] sleeping {sleep_seconds:.1f}s until {next_window.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        try:
+            time.sleep(sleep_seconds)
+        except KeyboardInterrupt:
+            logging.info("[loop] received KeyboardInterrupt; exiting loop")
+            return rc
 
     return 0
 
