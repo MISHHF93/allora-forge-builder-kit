@@ -2056,7 +2056,12 @@ def run_pipeline(args, cfg, root_dir) -> int:
     )
     full_data: pd.DataFrame = workflow.get_full_feature_target_dataframe(from_month=from_month)
     date_index: pd.Index = _to_naive_utc_index(pd.DatetimeIndex(pd.to_datetime(full_data.index.get_level_values("date"))))
-    _min_dt, _max_dt = date_index.min().tz_localize('UTC'), date_index.max().tz_localize('UTC') if len(date_index) > 0 else (None, None)
+    if len(date_index) > 0:
+        _min_dt = pd.Timestamp(date_index.min(), tz="UTC")
+        _max_dt = pd.Timestamp(date_index.max(), tz="UTC")
+    else:
+        _min_dt = None
+        _max_dt = None
 
     # Dynamically set end_utc to the latest available timestamp in the data if not overridden
     if args.end_utc:
@@ -2178,10 +2183,22 @@ def run_pipeline(args, cfg, root_dir) -> int:
     # Since target was computed before clipping, full_data contains only rows with valid future_close
     effective_last_t = _max_dt
     desired_last_t = end_naive
-    if effective_last_t is not None and effective_last_t < desired_last_t:
+    if effective_last_t is not None:
+        try:
+            effective_last_cmp = _to_naive_utc_ts(pd.Timestamp(effective_last_t))
+        except Exception:
+            effective_last_cmp = pd.Timestamp(effective_last_t)
+        try:
+            desired_last_cmp = _to_naive_utc_ts(pd.Timestamp(desired_last_t)) if desired_last_t is not None else None
+        except Exception:
+            desired_last_cmp = desired_last_t
+    else:
+        effective_last_cmp = None
+        desired_last_cmp = desired_last_t
+    if effective_last_cmp is not None and desired_last_cmp is not None and effective_last_cmp < desired_last_cmp:
         print(
             "WARNING: Available labeled data ends before the competition end. "
-            f"last_labeled_t={effective_last_t} < end={desired_last_t}. "
+            f"last_labeled_t={effective_last_cmp} < end={desired_last_cmp}. "
             "This typically occurs because source data beyond t+7d isn't available yet."
         )
 
@@ -2449,9 +2466,18 @@ def run_pipeline(args, cfg, root_dir) -> int:
 
     # 5) Feature selection: ensure aligned numeric columns across splits with debug logs
     def _print_cols(df: pd.DataFrame, name: str) -> None:
-        # Diagnostic only; avoid broad exception catching
+        """Log a truncated list of column names to avoid gigantic stdout lines."""
         cols = list(df.columns)
-        print(f"{name} columns ({len(cols)}): {cols}")
+        if not cols:
+            print(f"{name} columns (0): []")
+            return
+        max_preview = 25
+        preview = cols[:max_preview]
+        remainder = len(cols) - len(preview)
+        preview_str = ", ".join(str(c) for c in preview)
+        if remainder > 0:
+            preview_str = f"{preview_str}, ... (+{remainder} more)"
+        print(f"{name} columns ({len(cols)}): [{preview_str}]")
 
     _print_cols(X_train, "X_train")
     _print_cols(X_val, "X_val")
