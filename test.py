@@ -46,7 +46,6 @@ METRICS_PATH = ARTIFACT_DIR / "metrics.json"
 PREDICTIONS_PATH = ARTIFACT_DIR / "predictions.json"
 MODEL_PATH = MODELS_DIR / "xgb_model.pkl"
 SUBMISSION_LOG_PATH = ROOT_DIR / "submission_log.csv"
-<<<<<<< HEAD
 
 # Sensible defaults that keep runtimes short while touching the full pipeline.
 DEFAULT_FROM_MONTH = "2025-01"
