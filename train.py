@@ -245,6 +245,10 @@ EXPECTED_TOPIC_67: Dict[str, Any] = {
 }
 
 
+# Track topic activity state across loop iterations so we can surface transitions loudly
+_LAST_TOPIC_ACTIVE_STATE: Optional[bool] = None
+
+
 def zptae_log10_loss(y_true: List[float], y_pred: List[float], window: int = 100, p: float = 3.0, eps: float = 1e-12) -> Dict[str, float]:
     """Compute Z-transformed Power-Tanh Absolute Error and its log10(mean), with robust fallbacks.
 
@@ -595,12 +599,20 @@ def _get_emissions_params() -> Dict[str, Any]:
 
 
 def _get_topic_info(topic_id: int) -> Dict[str, Any]:
-    """Query topic info, normalizing effective_revenue, delegated_stake, reputers_count, weight, last_update."""
-    j = _run_allorad_json(["q", "emissions", "topic-info", str(int(topic_id))])
-    if not j:
-        # Fallback attempts
-        j = _run_allorad_json(["q", "emissions", "topic", str(int(topic_id))]) or {}
-    out: Dict[str, Any] = {"raw": j}
+    """Query topic status/info, normalizing effective_revenue, delegated_stake, reputers_count, weight, last_update."""
+
+    status = _run_allorad_json(["q", "emissions", "topic-status", str(int(topic_id))]) or {}
+    info = _run_allorad_json(["q", "emissions", "topic-info", str(int(topic_id))]) or {}
+    fallback_topic: Dict[str, Any] = {}
+    if not info:
+        fallback_topic = _run_allorad_json(["q", "emissions", "topic", str(int(topic_id))]) or {}
+
+    combined: Dict[str, Any] = {
+        "topic_status": status,
+        "topic_info": info,
+        "topic": fallback_topic,
+    }
+
     def _deep_find(obj: Any, keys: List[str]) -> Optional[Any]:
         if isinstance(obj, dict):
             for k, v in obj.items():
@@ -615,6 +627,7 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
                 if r is not None:
                     return r
         return None
+
     def _to_float(x: Any) -> Optional[float]:
         try:
             f = float(x)
@@ -629,18 +642,24 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
             except Exception:
                 return None
         return None
-    eff_rev = _deep_find(j, ["effective_revenue", "effectiveRevenue", "revenue", "effective"])
-    del_stk = _deep_find(j, ["delegated_stake", "delegatedStake", "stake_delegated"])    
-    reputers = _deep_find(j, ["reputers_count", "reputersCount", "reputers", "n_reputers"])   
-    weight = _deep_find(j, ["weight", "topic_weight", "score_weight"])  
-    last_update = _deep_find(j, ["last_update_height", "lastUpdateHeight", "last_update_time", "lastUpdateTime"])  
-    out.update({
+
+    eff_rev = _deep_find(combined, ["effective_revenue", "effectiveRevenue", "revenue", "effective"])
+    del_stk = _deep_find(combined, ["delegated_stake", "delegatedStake", "stake_delegated"])
+    reputers = _deep_find(combined, ["reputers_count", "reputersCount", "reputers", "n_reputers"])
+    weight = _deep_find(combined, ["weight", "topic_weight", "score_weight"])
+    last_update = _deep_find(combined, ["last_update_height", "lastUpdateHeight", "last_update_time", "lastUpdateTime"])
+
+    out: Dict[str, Any] = {
+        "raw": combined,
+        "topic_status_raw": status if status else None,
+        "topic_info_raw": info if info else None,
+        "topic_fallback_raw": fallback_topic if fallback_topic else None,
         "effective_revenue": _to_float(eff_rev),
         "delegated_stake": _to_float(del_stk),
         "reputers_count": int(reputers) if reputers is not None else None,
         "weight": _to_float(weight),
         "last_update": last_update,
-    })
+    }
     return out
 
 
@@ -854,7 +873,28 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
     eff = info.get("effective_revenue")
     stk = info.get("delegated_stake")
     reps = info.get("reputers_count")
-    is_active = (eff is not None and eff > 0) and (stk is not None and stk > 0) and (reps is not None and reps >= 1)
+    inactive_reasons: List[str] = []
+    inactive_codes: List[str] = []
+    if eff is None:
+        inactive_reasons.append("fee revenue unavailable")
+        inactive_codes.append("effective_revenue_missing")
+    elif eff <= 0:
+        inactive_reasons.append("fee revenue zero")
+        inactive_codes.append("effective_revenue_zero")
+    if stk is None:
+        inactive_reasons.append("stake unavailable")
+        inactive_codes.append("delegated_stake_missing")
+    elif stk <= 0:
+        inactive_reasons.append("stake too low")
+        inactive_codes.append("delegated_stake_non_positive")
+    if reps is None:
+        inactive_reasons.append("reputers missing")
+        inactive_codes.append("reputers_missing")
+    elif reps < 1:
+        inactive_reasons.append("reputers missing")
+        inactive_codes.append("reputers_below_minimum")
+
+    is_active = len(inactive_codes) == 0
     # Churnable criteria: at least one epoch elapsed since last update and sufficiently high weight rank
     # We approximate 'since last update' using block height and epoch length if available.
     is_churnable = False
@@ -888,8 +928,15 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
         "weight_total": total,
         "unfulfilled": unfulfilled,
         "is_active": bool(is_active),
+        "inactive_reasons": inactive_reasons,
+        "inactive_reason_codes": inactive_codes,
         "is_churnable": bool(is_churnable),
         "is_rewardable": bool(is_rewardable),
+        "activity_snapshot": {
+            "effective_revenue": eff,
+            "delegated_stake": stk,
+            "reputers_count": reps,
+        },
         "churn_reasons": reason_churn,
     }
 
@@ -3267,6 +3314,14 @@ def run_pipeline(args, cfg, root_dir) -> int:
 
         # Lifecycle: gate by Active and Churnable states per Allora Topic Life Cycle
         lifecycle = _compute_lifecycle_state(int(topic_id_cfg or 67))
+        global _LAST_TOPIC_ACTIVE_STATE
+        current_active = bool(lifecycle.get("is_active", False))
+        previous_active = _LAST_TOPIC_ACTIVE_STATE
+        if current_active and previous_active is not True:
+            msg_active = "Topic now active — submitting"
+            print(msg_active)
+            logging.info(msg_active)
+        _LAST_TOPIC_ACTIVE_STATE = current_active
         # Also enforce topic-creation parameter compatibility and funding before submission
         topic_validation = _validate_topic_creation_and_funding(int(topic_id_cfg or 67), EXPECTED_TOPIC_67)
         if not bool(topic_validation.get("funded", False)):
@@ -3300,12 +3355,36 @@ def run_pipeline(args, cfg, root_dir) -> int:
         except Exception:
             pass
         # Check Active (funding+stake+reputers)
-        if not args.force_submit and not lifecycle.get("is_active", False):
-            print("submit: topic not Active (insufficient effective revenue/stake/reputers); skipping submission")
-            logging.warning("Topic 67 is not active (insufficient effective revenue/stake/reputers); skipping submission")
+        if not args.force_submit and not current_active:
+            inactive_reasons = lifecycle.get("inactive_reasons") or []
+            snapshot = lifecycle.get("activity_snapshot") or {}
+            eff = snapshot.get("effective_revenue")
+            stk = snapshot.get("delegated_stake")
+            reps = snapshot.get("reputers_count")
+            reason_str = ", ".join(str(r) for r in inactive_reasons if r) or "unknown"
+            snap_str = (
+                f"effective_revenue={eff} delegated_stake={stk} reputers_count={reps}"
+            )
+            msg = (
+                "submit: topic not Active; "
+                f"reasons={reason_str}; snapshot={snap_str}; skipping submission"
+            )
+            print(msg)
+            logging.warning(msg)
             try:
-                w = intended_env or _resolve_wallet_for_logging(root_dir)
-                _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "inactive_insufficient_funding_or_stake", pre_log10_loss)
+                _log_submission(
+                    root_dir,
+                    ws_now,
+                    int(topic_id_cfg or 67),
+                    live_value,
+                    "skipped",
+                    None,
+                    None,
+                    False,
+                    0,
+                    "skipped_due_to_topic_status",
+                    pre_log10_loss,
+                )
             except Exception:
                 pass
             return 0
