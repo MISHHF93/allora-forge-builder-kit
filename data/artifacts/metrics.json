@@ -1,0 +1,6 @@
+{
+  "log10_loss": null,
+  "source": "none",
+  "warning": "insufficient ground truth (<2 samples)",
+  "n": 0
+}

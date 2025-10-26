@@ -1,3 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+*.pickle
+
+# Environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets and keys
+.env
+*.pem
+*.key
+*.crt
+*.der
+*.p12
+*.jks
+*.keystore
+allora-keypair.pem
+.allora_key
+.allora_key_bak
+.active_wallet_path
+
+# App artifacts and logs
+data/artifacts/predictions.json
+.last_nonce.json
+models/*.pkl
+logs/
+*.log
 # Byte-compiled / cache files
 __pycache__/
 *.py[cod]

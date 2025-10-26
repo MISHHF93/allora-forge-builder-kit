@@ -8,12 +8,80 @@ import dill
 
 class AlloraMLWorkflow:
     def __init__(self, data_api_key, tickers, hours_needed, number_of_input_candles, target_length):
-        self.api_key = data_api_key
+        # Normalize API key and store
+        self.api_key = (data_api_key or "").strip()
         self.tickers = tickers
         self.hours_needed = hours_needed  # For input window
         self.number_of_input_candles = number_of_input_candles
         self.target_length = target_length  # Target horizon in hours
         self.test_targets = None
+        self.validation_targets = None
+
+    def _headers(self):
+        """Return robust auth headers to handle different casing/standards.
+        Some gateways may expect X-API-Key while others accept x-api-key; a few accept Authorization: Bearer.
+        """
+        if not self.api_key:
+            return {}
+        return {
+            "X-API-Key": self.api_key,
+            "x-api-key": self.api_key,
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+    def _get_tiingo_key(self):
+        return (os.getenv("TIINGO_API_KEY") or "").strip()
+
+    def fetch_ohlcv_data_tiingo(self, ticker: str, from_date: str) -> pd.DataFrame:
+        """
+        Fallback fetch using Tiingo Crypto 1-min candles.
+        Maps to columns: date, open, high, low, close, volume, trades_done (filled with 0).
+        """
+        tkey = self._get_tiingo_key()
+        if not tkey:
+            raise RuntimeError("TIINGO_API_KEY not set; cannot fallback to Tiingo.")
+        # Tiingo expects startDate in ISO date and tickers like btcusd
+        url = "https://api.tiingo.com/tiingo/crypto/prices"
+        params = {
+            "tickers": ticker.lower(),
+            "startDate": from_date,
+            "resampleFreq": "1min",
+            "token": tkey,
+        }
+        r = requests.get(url, params=params, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            raise RuntimeError("Unexpected Tiingo response format")
+        # Tiingo returns a list where first element has priceData list
+        price_data = data[0].get("priceData", [])
+        if not price_data:
+            raise ValueError("No data returned from Tiingo")
+        df = pd.DataFrame(price_data)
+        # Normalize columns
+        rename_map = {
+            "date": "date",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "volume": "volume",
+        }
+        # Some fields may be named slightly differently
+        df = df.rename(columns=rename_map)
+        # Ensure required columns exist
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col not in df.columns:
+                df[col] = np.nan
+        df["date"] = pd.to_datetime(df["date"], utc=True)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        # trades_done not provided by Tiingo; fill with zeros
+        df["trades_done"] = 0
+        # Align with expected schema
+        keep_cols = ["date", "open", "high", "low", "close", "volume", "trades_done"]
+        df = df[keep_cols]
+        return df
 
     def compute_from_date(self, extra_hours: int = 12) -> str:
         total_hours = self.hours_needed + extra_hours
@@ -22,8 +90,15 @@ class AlloraMLWorkflow:
 
     def list_ready_buckets(self, ticker, from_month):
         url = "https://api.allora.network/v2/allora/market-data/ohlc/buckets/by-month"
-        headers = {"x-api-key": self.api_key}
+        headers = self._headers()
         resp = requests.get(url, headers=headers, params={"tickers": ticker, "from_month": from_month}, timeout=30)
+        if resp.status_code == 401:
+            # Provide a clear message for auth issues
+            try:
+                detail = resp.json()
+            except ValueError:
+                detail = resp.text
+            raise RuntimeError(f"Unauthorized (401) when listing buckets. Check ALLORA_API_KEY. Detail: {detail}")
         resp.raise_for_status()
         buckets = resp.json()["data"]["data"]
         return [b for b in buckets if b["state"] == "ready"]
@@ -35,14 +110,20 @@ class AlloraMLWorkflow:
 
     def fetch_ohlcv_data(self, ticker, from_date: str, max_pages: int = 1000, sleep_sec: float = 0.1) -> pd.DataFrame:
         url = "https://api.allora.network/v2/allora/market-data/ohlc"
-        headers = {"x-api-key": self.api_key}
+        headers = self._headers()
         params = {"tickers": ticker, "from_date": from_date}
 
         all_data = []
         pages_fetched = 0
 
         while pages_fetched < max_pages:
-            response = requests.get(url, headers=headers, params=params)
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            if response.status_code == 401:
+                try:
+                    detail = response.json()
+                except ValueError:
+                    detail = response.text
+                raise RuntimeError(f"Unauthorized (401) when fetching OHLC. Check ALLORA_API_KEY. Detail: {detail}")
             response.raise_for_status()
             payload = response.json()
             if not payload.get("status", False):
@@ -64,12 +145,21 @@ class AlloraMLWorkflow:
 
         for col in ["open", "high", "low", "close", "volume", "volume_notional"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["date"] = pd.to_datetime(df["date"])
+        # Ensure timezone-aware UTC timestamps
+        df["date"] = pd.to_datetime(df["date"], utc=True)
         df.drop(columns=['exchange_code'], inplace=True)
         return df
 
     def create_5_min_bars(self, df: pd.DataFrame, live_mode: bool = False) -> pd.DataFrame:
-        df = df.set_index("date").sort_index().dropna()
+        # Ensure UTC-aware datetime index
+        if "date" in df.columns:
+            di = pd.to_datetime(df["date"], utc=True)
+            df = df.set_index(di).sort_index().dropna()
+        else:
+            # If already indexed by datetime, coerce to UTC
+            di = pd.to_datetime(df.index, utc=True)
+            df = df.copy()
+            df.index = di
         # print("Raw 1-min timestamps:", df.index[-10:])  # Show last 10 timestamps for debugging
 
         if not live_mode:
@@ -83,7 +173,7 @@ class AlloraMLWorkflow:
             })
         else:
             last_ts = df.index[-1]
-            now = datetime.utcnow().replace(tzinfo=last_ts.tzinfo)
+            now = datetime.now(timezone.utc)
             if last_ts > now:
                 # print(f"Dropping incomplete 1-min bar at {last_ts} (future timestamp)")
                 df = df.iloc[:-1]
@@ -118,8 +208,12 @@ class AlloraMLWorkflow:
     def extract_rolling_daily_features(
         self, data: pd.DataFrame, lookback: int, number_of_candles: int, start_times: list
     ) -> pd.DataFrame:
-        # Convert index to array for quick lookup
-        ts_index = data.index.to_numpy()
+        # Convert index to naive UTC ndarray[datetime64[ns]] for quick lookup (avoid NumPy tz warnings)
+        idx = pd.DatetimeIndex(data.index)
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_convert("UTC").tz_localize(None)
+        # Force numpy datetime64[ns] dtype to avoid object/int comparisons
+        ts_index = idx.to_numpy(dtype="datetime64[ns]")
         data_values = data[["open", "high", "low", "close", "volume", "trades_done"]].to_numpy()
         features_list = []
         index_list = []
@@ -127,8 +221,18 @@ class AlloraMLWorkflow:
         candle_length = lookback * 12  # 12 points per hour if 5min bars
     
         for T in start_times:
+            # Normalize each start time to naive UTC datetime64[ns] to match ts_index dtype
+            if not isinstance(T, (np.datetime64, pd.Timestamp)):
+                T = pd.Timestamp(T)
+            if isinstance(T, pd.Timestamp):
+                if getattr(T, "tz", None) is not None:
+                    T = T.tz_convert("UTC").tz_localize(None)
+                T64 = T.to_datetime64()
+            else:
+                # Ensure nanosecond precision for searchsorted compatibility
+                T64 = np.datetime64(T, "ns")
             # Find the last index <= T
-            pos = np.searchsorted(ts_index, T, side="right")
+            pos = np.searchsorted(ts_index, T64, side="right")
             if pos - candle_length < 0:
                 continue
     
@@ -164,9 +268,34 @@ class AlloraMLWorkflow:
                 f"feature_{f}_{i}" for i in range(number_of_candles) for f in ["open", "high", "low", "close", "volume", "trades_done"]
             ])
     
-        features_array = np.vstack(features_list)
+        # Use float32 to reduce memory footprint significantly
+        features_array = np.vstack(features_list).astype(np.float32, copy=False)
         columns = [f"feature_{f}_{i}" for i in range(number_of_candles) for f in ["open", "high", "low", "close", "volume", "trades_done"]]
-        return pd.DataFrame(features_array, index=index_list, columns=columns)
+        out = pd.DataFrame(features_array, index=index_list, columns=columns)
+        # Ensure the features index is tz-aware UTC to match upstream df for joins
+        try:
+            out.index = pd.DatetimeIndex(out.index).tz_localize("UTC")
+        except Exception:
+            # If already tz-aware, ensure it's UTC
+            try:
+                out.index = pd.DatetimeIndex(out.index).tz_convert("UTC")
+            except Exception:
+                pass
+        return out
+
+    def get_external_features(self, from_month: str) -> pd.DataFrame:
+        """
+        Fetch on-chain metrics (e.g., gas fees, transaction counts) and macro indicators (e.g., ETH/BTC correlation, S&P 500 trends).
+        Returns a DataFrame with 'date' index and feature columns.
+        """
+        # Placeholder implementation: fetch from Allora buckets or Tiingo
+        # Example:
+        # on_chain_df = self.fetch_bucket_csv("https://api.allora.network/v2/allora/market-data/on-chain/buckets/...")  # gas_fees, tx_counts
+        # macro_df = self.fetch_ohlcv_data_tiingo("SPY", from_month)  # S&P 500 OHLC
+        # eth_btc_df = self.fetch_ohlcv_data("ethbtc", from_month)  # ETH/BTC for correlation
+        # Compute features: e.g., rolling correlation, trends
+        # For now, return empty DataFrame to avoid errors
+        return pd.DataFrame()
 
     def get_live_features(self, ticker):
         from_date = self.compute_from_date()
@@ -207,25 +336,65 @@ class AlloraMLWorkflow:
         for t in self.tickers:
             print(f"Downloading Historical Data for {t}")
             frames = []
-            for bucket in self.list_ready_buckets(t, from_month):
-                df = self.fetch_bucket_csv(bucket["download_url"])
-                frames.append(df)
+            # Optional local override to ensure full coverage through t+7d after competition end
+            try:
+                root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+                local_csv = os.path.join(root, "data", "external", f"{t}_ohlcv.csv")
+                if os.path.exists(local_csv):
+                    df_local = pd.read_csv(local_csv)
+                    # Expect columns: date, open, high, low, close, volume (trades_done optional)
+                    df_local["date"] = pd.to_datetime(df_local["date"], utc=True)
+                    for col in ["open", "high", "low", "close", "volume"]:
+                        if col not in df_local.columns:
+                            df_local[col] = np.nan
+                        else:
+                            df_local[col] = pd.to_numeric(df_local[col], errors="coerce")
+                    if "trades_done" not in df_local.columns:
+                        df_local["trades_done"] = 0
+                    frames.append(df_local[["date","open","high","low","close","volume","trades_done"]])
+            except Exception:
+                pass
+            try:
+                for bucket in self.list_ready_buckets(t, from_month):
+                    df = self.fetch_bucket_csv(bucket["download_url"])
+                    frames.append(df)
+            except RuntimeError:
+                # Likely unauthorized; fall back below
+                frames = []
+
             combined_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
             if not combined_df.empty:
                 latest_ts = sorted(pd.to_datetime(combined_df["date"]).dt.date.unique())[-2]
                 try:
-                    live_df = self.fetch_ohlcv_data(t, latest_ts.strftime("%Y-%m"))
+                    # Use day precision string for fetch_ohlcv_data
+                    live_df = self.fetch_ohlcv_data(t, latest_ts.strftime("%Y-%m-%d"))
                     combined_df = pd.concat([combined_df, live_df], ignore_index=True)
-                except ValueError:
-                    # No data returned from API, skip adding live_df
+                except (ValueError, RuntimeError):
+                    # No data or unauthorized; continue with bucket-only
                     pass
-                combined_df["date"] = pd.to_datetime(combined_df["date"])
+                combined_df["date"] = pd.to_datetime(combined_df["date"], utc=True)
                 combined_df = combined_df.drop_duplicates(subset="date")
             else:
-                combined_df = self.fetch_ohlcv_data(t, f"{from_month}-01")
-                combined_df["date"] = pd.to_datetime(combined_df["date"])
+                # Try Allora OHLC; on 401, fall back to Tiingo
+                try:
+                    combined_df = self.fetch_ohlcv_data(t, f"{from_month}-01")
+                except RuntimeError:
+                    combined_df = self.fetch_ohlcv_data_tiingo(t, f"{from_month}-01")
+                combined_df["date"] = pd.to_datetime(combined_df["date"], utc=True)
             all_data[t] = combined_df
     
+        def _downcast_numeric(df: pd.DataFrame) -> pd.DataFrame:
+            try:
+                float_cols = df.select_dtypes(include=["float64"]).columns
+                if len(float_cols):
+                    df[float_cols] = df[float_cols].astype(np.float32)
+                int_cols = df.select_dtypes(include=["int64"]).columns
+                if len(int_cols):
+                    df[int_cols] = df[int_cols].apply(pd.to_numeric, downcast="integer")
+            except Exception:
+                pass
+            return df
+
         datasets = []
         for t in self.tickers:
             print(f"Processing 5-minute bars for {t}")
@@ -234,13 +403,52 @@ class AlloraMLWorkflow:
             features = self.extract_rolling_daily_features(
                 df, self.hours_needed, self.number_of_input_candles, df.index.tolist()
             )
+            # Downcast features to float32 to save memory
+            try:
+                features = features.astype(np.float32)
+            except Exception:
+                pass
+            # Normalize both indices to tz-naive UTC for a safe join
+            try:
+                if getattr(df.index, "tz", None) is not None:
+                    df.index = df.index.tz_localize(None)
+            except Exception:
+                pass
+            try:
+                if getattr(features.index, "tz", None) is not None:
+                    features.index = features.index.tz_localize(None)
+            except Exception:
+                pass
             df = df.join(features)
+            # Downcast numeric columns to reduce consolidation memory during concat/sort
+            df = _downcast_numeric(df)
             df["ticker"] = t
             datasets.append(df)
     
-        full_data = pd.concat(datasets).sort_index()
+        # Concatenate without forcing copies; then sort in-place to avoid an extra full copy
+        full_data = pd.concat(datasets, copy=False)
+        try:
+            full_data.sort_index(inplace=True)
+        except Exception:
+            # Fallback to non-inplace if needed
+            full_data = full_data.sort_index()
+        # Merge external features
+        external_df = self.get_external_features(from_month)
+        if not external_df.empty:
+            external_df['date'] = pd.to_datetime(external_df['date'], utc=True)
+            external_df = external_df.set_index('date')
+            full_data = pd.merge_asof(full_data.reset_index().set_index('date'), external_df, left_index=True, right_index=True, direction='nearest').reset_index().set_index(['date', 'ticker'])
         full_data.index = pd.MultiIndex.from_frame(full_data.reset_index()[["date", "ticker"]])
-        full_data = full_data.dropna()  # Drop rows with missing values
+        # Drop rows without a valid target (i.e., where future_close isn't available)
+        full_data = full_data.dropna(subset=["target"])  # keep rows with valid labels
+        # Enforce non-overlapping windows: sample every target_length hours
+        step = self.target_length * 12  # 168 * 12 = 2016 for 5-min data
+        grouped = full_data.groupby(level='ticker')
+        sampled = []
+        for name, group in grouped:
+            sampled_group = group.iloc[::step]
+            sampled.append(sampled_group)
+        full_data = pd.concat(sampled)
     
         return full_data
 
@@ -278,33 +486,53 @@ class AlloraMLWorkflow:
         for t in self.tickers:
             print(f"Downloading Historical Data for {t}")
             frames = []
-            for bucket in self.list_ready_buckets(t, from_month):
-                df = self.fetch_bucket_csv(bucket["download_url"])
-                frames.append(df)
+            try:
+                for bucket in self.list_ready_buckets(t, from_month):
+                    df = self.fetch_bucket_csv(bucket["download_url"])
+                    frames.append(df)
+            except RuntimeError:
+                # Likely 401: fall back to Tiingo below
+                frames = []
+
             combined_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
             if not combined_df.empty:
                 latest_ts = sorted(pd.to_datetime(combined_df["date"]).dt.date.unique())[-2]
                 try:
                     live_df = self.fetch_ohlcv_data(t, latest_ts.strftime("%Y-%m-%d"))
                     combined_df = pd.concat([combined_df, live_df], ignore_index=True)
-                except ValueError:
-                    # No data returned from API, skip adding live_df
+                except (ValueError, RuntimeError):
+                    # No data or unauthorized; continue with combined only
                     pass
-                combined_df['date'] = pd.to_datetime(combined_df['date'])
+                combined_df['date'] = pd.to_datetime(combined_df['date'], utc=True)
                 combined_df = combined_df.drop_duplicates(subset='date')
             else:
-                combined_df = self.fetch_ohlcv_data(t, f"{from_month}-01")
-                combined_df["date"] = pd.to_datetime(combined_df["date"])
+                # Try Allora direct; if unauthorized, fallback to Tiingo
+                try:
+                    combined_df = self.fetch_ohlcv_data(t, f"{from_month}-01")
+                except RuntimeError:
+                    combined_df = self.fetch_ohlcv_data_tiingo(t, f"{from_month}-01")
+                combined_df["date"] = pd.to_datetime(combined_df["date"], utc=True)
             all_data[t] = combined_df
 
         datasets = []
         for t in self.tickers:
-            print(f"Processing 5-minute bars for {t}")
+            print("Processing 5-minute bars for", t)
             df = self.create_5_min_bars(all_data[t])
-            print(f"Computing target")
+            print("Computing target")
             df = self.compute_target(df, self.target_length)
-            print(f"Extracting features")
+            print("Extracting features")
             features = self.extract_rolling_daily_features(df, self.hours_needed, self.number_of_input_candles, df.index.tolist())
+            # Normalize both indices to tz-naive UTC for a safe join
+            try:
+                if getattr(df.index, "tz", None) is not None:
+                    df.index = df.index.tz_localize(None)
+            except Exception:
+                pass
+            try:
+                if getattr(features.index, "tz", None) is not None:
+                    features.index = features.index.tz_localize(None)
+            except Exception:
+                pass
             df = df.join(features)
             df["ticker"] = t
             datasets.append(df)
@@ -313,17 +541,26 @@ class AlloraMLWorkflow:
         full_data.index = pd.MultiIndex.from_frame(full_data.reset_index()[["date", "ticker"]])
         full_data = full_data.dropna()
 
-        # Define cutoff dates for test, validation, and training sets
-        test_cutoff = datetime.now(timezone.utc) - pd.DateOffset(months=test_months)
+        # Define cutoff dates for test, validation, and training sets (use tz-naive for reliable comparison)
+        now_utc = pd.Timestamp.utcnow()
+        test_cutoff = now_utc - pd.DateOffset(months=test_months)
         val_cutoff_start = test_cutoff - timedelta(hours=self.target_length) - pd.DateOffset(months=validation_months)
         val_cutoff_end = test_cutoff - timedelta(hours=self.target_length)
         train_cutoff = val_cutoff_start - timedelta(hours=self.target_length)
 
-        # Create masks for each set
-        test_mask = full_data.index.get_level_values("date") >= str(test_cutoff)
-        val_mask = (full_data.index.get_level_values("date") >= str(val_cutoff_start)) & \
-                   (full_data.index.get_level_values("date") < str(val_cutoff_end))
-        train_mask = full_data.index.get_level_values("date") < str(train_cutoff)
+        # Normalize date index and cutoffs to tz-naive
+        date_index = pd.to_datetime(full_data.index.get_level_values("date"))
+        if getattr(date_index, "tz", None) is not None:
+            date_index = date_index.tz_localize(None)
+        test_cutoff_naive = pd.Timestamp(test_cutoff).tz_localize(None)
+        val_start_naive = pd.Timestamp(val_cutoff_start).tz_localize(None)
+        val_end_naive = pd.Timestamp(val_cutoff_end).tz_localize(None)
+        train_cutoff_naive = pd.Timestamp(train_cutoff).tz_localize(None)
+
+        # Create masks for each set using proper Timestamp comparisons
+        test_mask = date_index >= test_cutoff_naive
+        val_mask = (date_index >= val_start_naive) & (date_index < val_end_naive)
+        train_mask = date_index < train_cutoff_naive
 
         # Store validation targets for evaluation
         self.validation_targets = full_data.loc[val_mask, ["target"]]

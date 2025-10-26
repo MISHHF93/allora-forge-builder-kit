@@ -1,6 +1,15 @@
-lightgbm
 scikit-learn
 pandas
 numpy
 matplotlib
 cloudpickle
+# Required for serialization in workflow.py
+dill
+python-dotenv
+allora-sdk
+scipy
+statsmodels
+optuna
+xgboost
+ta
+PyYAML

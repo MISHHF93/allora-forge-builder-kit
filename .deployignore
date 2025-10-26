@@ -1,0 +1,38 @@
+# Files and directories excluded from deployment to remote instances
+
+# VCS
+.git/
+.github/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Local runtime artifacts and caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+
+# Logs and temp
+logs/
+*.log
+*.tmp
+*.bak
+
+# Big artifacts you don't want to ship each deploy
+data/artifacts/
+models/
+
+# Secrets (copy explicitly via -EnvPath if needed)
+.env
+*.pem
+*.key
+allora-keypair.pem
+.allora_key
+.active_wallet_path
+.last_nonce.json
+.submission_lock.json
