@@ -2003,6 +2003,209 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
         return 1
 
 
+def _parse_submission_helper_output(stdout: str, stderr: str) -> Tuple[Optional[str], Optional[int], Optional[float], Optional[float], Optional[str]]:
+    """Best-effort extraction of tx hash, nonce, score, reward, and status from helper output."""
+    text = "\n".join([stdout or "", stderr or ""]).strip()
+    tx_hash: Optional[str] = None
+    nonce: Optional[int] = None
+    score: Optional[float] = None
+    reward: Optional[float] = None
+    status: Optional[str] = None
+
+    # Try JSON lines first
+    for line in text.splitlines():
+        candidate = line.strip()
+        if not candidate or not (candidate.startswith("{") and candidate.endswith("}")):
+            continue
+        try:
+            obj = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            if not tx_hash:
+                for key in ("tx_hash", "txHash", "txhash", "transactionHash", "hash"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and len(val) >= 40:
+                        tx_hash = val
+                        break
+            if nonce is None:
+                for key in ("nonce", "windowNonce", "block_height", "height"):
+                    val = obj.get(key)
+                    try:
+                        if isinstance(val, str) and val.isdigit():
+                            nonce = int(val)
+                            break
+                        if isinstance(val, (int, float)):
+                            nonce = int(val)
+                            break
+                    except Exception:
+                        continue
+            if score is None:
+                for key in ("score", "ema_score", "inferer_score", "log10_score"):
+                    if key in obj:
+                        val = obj.get(key)
+                        try:
+                            score = float(val)
+                        except Exception:
+                            score = None
+                        break
+            if reward is None:
+                for key in ("reward", "rewards", "amount"):
+                    if key in obj:
+                        val = obj.get(key)
+                        try:
+                            reward = float(val)
+                        except Exception:
+                            reward = None
+                        break
+            if not status:
+                for key in ("status", "message", "result"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and val:
+                        status = val
+                        break
+
+    if not tx_hash:
+        m = re.search(r"\b[0-9A-Fa-f]{64}\b", text)
+        if m:
+            tx_hash = m.group(0)
+
+    if nonce is None:
+        m = re.search(r"nonce[^0-9]*(\d{3,})", text, flags=re.IGNORECASE)
+        if m:
+            try:
+                nonce = int(m.group(1))
+            except Exception:
+                nonce = None
+
+    if score is None:
+        m = re.search(r"score[^0-9-]*([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)", text, flags=re.IGNORECASE)
+        if m:
+            try:
+                score = float(m.group(1))
+            except Exception:
+                score = None
+
+    if reward is None:
+        m = re.search(r"reward[^0-9-]*([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)", text, flags=re.IGNORECASE)
+        if m:
+            try:
+                reward = float(m.group(1))
+            except Exception:
+                reward = None
+
+    if not status and text:
+        # Use the last non-empty line as a human-readable status hint
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            status = lines[-1][:128]
+
+    return tx_hash, nonce, score, reward, status
+
+
+def _submit_via_external_helper(
+    topic_id: int,
+    value: float,
+    root_dir: str,
+    pre_log10_loss: Optional[float],
+    submit_timeout: int,
+) -> Optional[Tuple[int, bool]]:
+    """Attempt submission via submit_prediction.py (if available) or similar helper.
+
+    Returns Optional[(exit_code, success_flag)]. When None, no helper was executed.
+    """
+    candidates = [
+        os.path.join(root_dir, "submit_prediction.py"),
+        os.path.join(root_dir, "scripts", "submit_prediction.py"),
+        os.path.join(root_dir, "tools", "submit_prediction.py"),
+    ]
+    timeout_bound = max(0, int(submit_timeout or 0))
+    wallet = _resolve_wallet_for_logging(root_dir)
+    cadence_s = _load_cadence_from_config(root_dir)
+    env = os.environ.copy()
+    env.setdefault("ALLORA_TOPIC_ID", str(topic_id))
+    env.setdefault("ALLORA_PREDICTION_VALUE", str(value))
+
+    for candidate in candidates:
+        if not os.path.exists(candidate):
+            continue
+        cmd = [sys.executable, candidate, "--topic-id", str(topic_id), "--source", "model"]
+        if "--mode" not in cmd:
+            cmd.extend(["--mode", "cli"])
+        if timeout_bound > 0:
+            cmd.extend(["--timeout", str(timeout_bound)])
+        try:
+            cp = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=(timeout_bound + 30) if timeout_bound > 0 else None,
+            )
+        except subprocess.TimeoutExpired:
+            ws = _window_start_utc(cadence_s=cadence_s)
+            _log_submission(
+                root_dir,
+                ws,
+                topic_id,
+                value,
+                wallet,
+                None,
+                None,
+                False,
+                124,
+                "submit_helper_timeout",
+                pre_log10_loss,
+            )
+            return (124, False)
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            ws = _window_start_utc(cadence_s=cadence_s)
+            _log_submission(
+                root_dir,
+                ws,
+                topic_id,
+                value,
+                wallet,
+                None,
+                None,
+                False,
+                1,
+                f"submit_helper_error:{exc}",
+                pre_log10_loss,
+            )
+            return (1, False)
+
+        tx_hash, nonce, score, reward, status = _parse_submission_helper_output(cp.stdout, cp.stderr)
+        success = bool(cp.returncode == 0 and tx_hash)
+        exit_code = 0 if success else (cp.returncode if cp.returncode != 0 else 1)
+        ws = _window_start_utc(cadence_s=cadence_s)
+        _log_submission(
+            root_dir,
+            ws,
+            topic_id,
+            value,
+            wallet,
+            nonce,
+            tx_hash,
+            success,
+            exit_code,
+            status or ("submit_helper_success" if success else f"submit_helper_rc={cp.returncode}"),
+            pre_log10_loss,
+            score,
+            reward if reward is not None else ("pending" if success else None),
+        )
+        if not success:
+            print(
+                f"submit(helper): helper at {candidate} exited with rc={cp.returncode}; stdout={cp.stdout!r} stderr={cp.stderr!r}",
+                file=sys.stderr,
+            )
+        return (exit_code, success)
+
+    return None
+
+
 def sleep_until_top_of_hour_utc() -> None:
     """Sleep until the next top of hour in UTC."""
     import time
@@ -2012,6 +2215,27 @@ def sleep_until_top_of_hour_utc() -> None:
     if sleep_time > 0:
         print(f"Sleeping {sleep_time:.0f} seconds until top of hour UTC")
         time.sleep(sleep_time)
+
+
+def _sleep_until_next_window(cadence_s: int) -> None:
+    """Align to the next cadence window boundary in UTC."""
+    try:
+        now = pd.Timestamp.now(tz="UTC")
+    except Exception:
+        now = pd.Timestamp.utcnow().tz_localize("UTC")
+    window_start = _window_start_utc(now=now, cadence_s=cadence_s)
+    # If we are within one second of the boundary, skip sleeping
+    delta = (now - window_start).total_seconds()
+    if delta < 1.0 and delta >= 0.0:
+        return
+    next_window = window_start + pd.Timedelta(seconds=cadence_s)
+    wait = (next_window - now).total_seconds()
+    if wait > 0:
+        logging.info(f"[loop] aligning to cadence; sleeping {wait:.1f}s until {next_window.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        try:
+            time.sleep(wait)
+        except Exception:
+            pass
 
 
 def resolve_wallet() -> None:
@@ -2040,6 +2264,11 @@ def run_pipeline(args, cfg, root_dir) -> int:
     cadence = getattr(args, "_effective_cadence", str(getattr(args, "cadence", None) or sched_cfg.get("cadence", "1h")))
     start_raw = str(getattr(args, "start_utc", None) or sched_cfg.get("start", "2025-09-16T13:00:00Z"))
     end_raw = str(getattr(args, "end_utc", None) or sched_cfg.get("end", "2025-12-15T13:00:00Z"))
+    topic_validation: Dict[str, Any] = {}
+    topic_validation_ok = False
+    topic_validation_funded = False
+    topic_validation_epoch = False
+    topic_validation_reason: Optional[str] = None
 
     def _parse_utc(ts: str) -> pd.Timestamp:
         t = pd.Timestamp(ts)
@@ -2120,6 +2349,21 @@ def run_pipeline(args, cfg, root_dir) -> int:
         topic_id_eff = int(DEFAULT_TOPIC_ID)
         assert topic_id_eff == int(EXPECTED_TOPIC_67["topic_id"]), "Topic ID must be 67 for this workflow"
         topic_validation = _validate_topic_creation_and_funding(topic_id_eff, EXPECTED_TOPIC_67)
+        topic_validation_ok = bool(topic_validation.get("ok"))
+        topic_validation_funded = bool(topic_validation.get("funded"))
+        topic_fields = cast(Dict[str, Any], topic_validation.get("fields", {}) or {})
+        topic_validation_epoch = bool(topic_fields.get("epoch_length"))
+        mism = topic_validation.get("mismatches") or []
+        if mism:
+            topic_validation_reason = ",".join(str(m) for m in mism)
+        elif not topic_validation_ok:
+            topic_validation_reason = "topic_not_ok"
+        elif not topic_validation_funded:
+            topic_validation_reason = "topic_unfunded"
+        elif not topic_validation_epoch:
+            topic_validation_reason = "missing_epoch_length"
+        else:
+            topic_validation_reason = None
         # Persist audit file for VS Code AI and human review
         audit_dir = os.path.join(root_dir, "data", "artifacts", "logs")
         os.makedirs(audit_dir, exist_ok=True)
@@ -2134,6 +2378,8 @@ def run_pipeline(args, cfg, root_dir) -> int:
             print("Topic 67 validation: OK and funded")
     except Exception as e:
         print(f"Warning: topic creation/funding validation skipped or failed: {e}")
+        if topic_validation_reason is None:
+            topic_validation_reason = str(e)
 
     # Enforce non-overlapping targets for 7-day horizon: sample timestamps at least 168h apart
     def _non_overlapping_mask(idx: pd.DatetimeIndex, hours: int) -> pd.Series:
@@ -2866,6 +3112,29 @@ def run_pipeline(args, cfg, root_dir) -> int:
         except (OSError, IOError, ValueError, json.JSONDecodeError):
             pre_log10_loss = None
 
+        if not args.force_submit and not (topic_validation_ok and topic_validation_funded and topic_validation_epoch):
+            reason = topic_validation_reason or "topic_validation_failed"
+            logging.warning(f"Topic validation guard active; skipping submission because {reason}")
+            try:
+                ws_now_tv = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
+                wallet_log = _resolve_wallet_for_logging(root_dir)
+                _log_submission(
+                    root_dir,
+                    ws_now_tv,
+                    int(topic_id_cfg or 67),
+                    live_value,
+                    wallet_log,
+                    None,
+                    None,
+                    False,
+                    0,
+                    f"topic_validation:{reason}",
+                    pre_log10_loss,
+                )
+            except Exception:
+                pass
+            return 0
+
         # Cooldown guard: avoid EMA collisions by limiting one success per 600s window
         def _seconds_since_last_success(csv_path: str) -> Optional[int]:
             try:
@@ -3056,6 +3325,28 @@ def run_pipeline(args, cfg, root_dir) -> int:
         _env_wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
         if _env_wallet and not _env_wallet.endswith("6vma"):
             print(f"Warning: ALLORA_WALLET_ADDR does not end with '6vma' (got ...{_env_wallet[-4:]}); ensure correct worker wallet is configured.", file=sys.stderr)
+        helper_result = _submit_via_external_helper(
+            int(topic_id_cfg or 67),
+            float(live_value),
+            root_dir,
+            pre_log10_loss,
+            int(args.submit_timeout),
+        )
+        if helper_result is not None:
+            helper_rc, helper_success = helper_result
+            if helper_success:
+                try:
+                    _update_window_lock(root_dir, cadence_s, intended_env)
+                except Exception:
+                    pass
+                try:
+                    _post_submit_backfill(root_dir, tail=20, attempts=3, delay_s=2.0)
+                except Exception:
+                    pass
+                return helper_rc
+            else:
+                print("submit(helper): external helper failed, falling back to direct client submission", file=sys.stderr)
+
         api_key = _require_api_key()
         # Prefer client-based submit to guarantee forecast, fallback to SDK worker if client path fails
         rc_client = asyncio.run(_submit_with_client_xgb(int(topic_id_cfg or 67), float(live_value), root_dir, pre_log10_loss, args.force_submit))
@@ -3101,13 +3392,23 @@ def main() -> int:
     parser.add_argument("--submit-retries", type=int, default=3, help="Number of retries for submission")
     parser.add_argument("--force-submit", action="store_true", help="Force submission even if guards are active")
     parser.add_argument("--loop", action="store_true", help="Continuously run training/submission cycles based on cadence")
+    parser.add_argument("--once", action="store_true", help="Run exactly one iteration even if config requests loop")
+    parser.add_argument("--timeout", type=int, default=0, help="Loop runtime limit in seconds (0 runs indefinitely)")
     args = parser.parse_args()
     data_cfg: Dict[str, Any] = cfg.get("data", {})
     args.from_month = str(data_cfg.get("from_month", args.from_month))
     sched_cfg: Dict[str, Any] = cfg.get("schedule", {})
     mode_cfg = str(args.schedule_mode or sched_cfg.get("mode", "single"))
-    effective_mode = "loop" if args.loop or mode_cfg.lower() == "loop" else mode_cfg
-    cadence = str(args.cadence or sched_cfg.get("cadence", "1h"))
+    if getattr(args, "once", False):
+        effective_mode = "once"
+    elif args.loop or mode_cfg.lower() == "loop":
+        effective_mode = "loop"
+    else:
+        effective_mode = mode_cfg
+    if effective_mode.lower() == "loop":
+        cadence = "1h"
+    else:
+        cadence = str(args.cadence or sched_cfg.get("cadence", "1h"))
     setattr(args, "_effective_mode", effective_mode)
     setattr(args, "_effective_cadence", cadence)
     cadence_s = _parse_cadence(cadence)
@@ -3116,10 +3417,18 @@ def main() -> int:
     if effective_mode.lower() != "loop":
         return _run_once()
     iteration = 0
+    loop_timeout = max(0, int(getattr(args, "timeout", 0) or 0))
+    start_wall = time.time()
+    _sleep_until_next_window(cadence_s)
+    last_rc = 0
     while True:
+        if loop_timeout and (time.time() - start_wall) >= loop_timeout:
+            logging.info("[loop] timeout reached before next iteration; exiting loop")
+            return last_rc
         iteration += 1
         logging.info(f"[loop] iteration={iteration} start")
         rc = _run_once()
+        last_rc = rc
         logging.info(f"[loop] iteration={iteration} completed with rc={rc}")
         now_utc = pd.Timestamp.now(tz="UTC")
         window_start = _window_start_utc(now=now_utc, cadence_s=cadence_s)
@@ -3131,6 +3440,9 @@ def main() -> int:
         except KeyboardInterrupt:
             logging.info("[loop] received KeyboardInterrupt; exiting loop")
             return rc
+        if loop_timeout and (time.time() - start_wall) >= loop_timeout:
+            logging.info("[loop] timeout reached after iteration; exiting loop")
+            return last_rc
 
     return 0
 

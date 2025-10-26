@@ -46,6 +46,7 @@ METRICS_PATH = ARTIFACT_DIR / "metrics.json"
 PREDICTIONS_PATH = ARTIFACT_DIR / "predictions.json"
 MODEL_PATH = MODELS_DIR / "xgb_model.pkl"
 SUBMISSION_LOG_PATH = ROOT_DIR / "submission_log.csv"
+<<<<<<< HEAD
 
 # Sensible defaults that keep runtimes short while touching the full pipeline.
 DEFAULT_FROM_MONTH = "2025-01"
@@ -54,13 +55,27 @@ DEFAULT_END_UTC = "2025-06-10T00:00:00Z"
 DEFAULT_AS_OF = "2025-06-03T00:00:00Z"
 
 
-def ensure_api_key() -> None:
-    """Guarantee that an API key is present so ``train.py`` will proceed."""
+def ensure_api_key(*, offline: bool) -> None:
+    """Ensure API credentials are configured for the requested mode."""
+
+    if offline:
+        if not os.getenv("ALLORA_API_KEY"):
+            # Any non-empty token is acceptable for offline fallback mode.
+            os.environ["ALLORA_API_KEY"] = "offline-test-key"
+        return
 
     if not os.getenv("ALLORA_API_KEY"):
-        # Any non-empty token is acceptable for offline fallback mode.
-        os.environ["ALLORA_API_KEY"] = "offline-test-key"
+        raise RuntimeError(
+            "ALLORA_API_KEY is required for online tests.\n"
+            "Please export your real Allora API token, e.g.\n"
+            "  export ALLORA_API_KEY=\"YOUR_REAL_ALLORA_KEY\""
+        )
 
+    if "TIINGO" in os.getenv("DATA_PROVIDER", "").upper() and not os.getenv("TIINGO_API_KEY"):
+        raise RuntimeError(
+            "TIINGO_API_KEY is required when DATA_PROVIDER requests Tiingo.\n"
+            "Set it via\n  export TIINGO_API_KEY=\"YOUR_TIINGO_KEY\""
+        )
 
 def cleanup_artifacts(paths: Iterable[Path]) -> None:
     """Remove stale artifacts so each iteration starts from a clean slate."""
@@ -151,7 +166,7 @@ def assert_submission_log_schema() -> None:
 
 
 def run_iteration(train_args: Sequence[str], *, offline: bool, keep_artifacts: bool) -> None:
-    ensure_api_key()
+    ensure_api_key(offline=offline)
     if not keep_artifacts:
         cleanup_artifacts([METRICS_PATH, PREDICTIONS_PATH, MODEL_PATH])
 
