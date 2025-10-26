@@ -450,6 +450,12 @@ class AlloraMLWorkflow:
                 except RuntimeError:
                     combined_df = self.fetch_ohlcv_data_tiingo(t, f"{from_month}-01")
                 combined_df["date"] = pd.to_datetime(combined_df["date"], utc=True)
+            if combined_df.empty:
+                print(f"Warning: no OHLCV rows retrieved for {t}; generating offline fallback data.")
+                combined_df = self._offline_ohlcv_from_local(t, f"{from_month}-01")
+            if combined_df.empty:
+                print(f"Warning: offline fallback produced no rows for {t}; skipping ticker.")
+                continue
             all_data[t] = combined_df
     
         def _downcast_numeric(df: pd.DataFrame) -> pd.DataFrame:
@@ -492,8 +498,14 @@ class AlloraMLWorkflow:
             # Downcast numeric columns to reduce consolidation memory during concat/sort
             df = _downcast_numeric(df)
             df["ticker"] = t
-            datasets.append(df)
-    
+            if not df.empty:
+                datasets.append(df)
+            else:
+                print(f"Warning: engineered feature frame is empty for {t}; skipping ticker.")
+
+        if not datasets:
+            raise RuntimeError("No datasets could be constructed for the requested tickers. Ensure local fixtures exist or provide network access.")
+
         # Concatenate without forcing copies; then sort in-place to avoid an extra full copy
         full_data = pd.concat(datasets, copy=False)
         try:
@@ -516,7 +528,11 @@ class AlloraMLWorkflow:
         sampled = []
         for name, group in grouped:
             sampled_group = group.iloc[::step]
-            sampled.append(sampled_group)
+            if not sampled_group.empty:
+                sampled.append(sampled_group)
+        if not sampled:
+            print("Warning: non-overlapping sampling yielded no rows; returning empty feature set.")
+            return full_data.iloc[0:0]
         full_data = pd.concat(sampled)
     
         return full_data
