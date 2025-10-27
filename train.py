@@ -3361,7 +3361,8 @@ def run_pipeline(args, cfg, root_dir) -> int:
             eff = snapshot.get("effective_revenue")
             stk = snapshot.get("delegated_stake")
             reps = snapshot.get("reputers_count")
-            reason_str = ", ".join(str(r) for r in inactive_reasons if r) or "unknown"
+            reason_list = [str(r) for r in inactive_reasons if r]
+            reason_str = ", ".join(reason_list) if reason_list else "unknown"
             snap_str = (
                 f"effective_revenue={eff} delegated_stake={stk} reputers_count={reps}"
             )
@@ -3372,6 +3373,14 @@ def run_pipeline(args, cfg, root_dir) -> int:
             print(msg)
             logging.warning(msg)
             try:
+                detailed_status = "skipped_due_to_topic_status"
+                if reason_list:
+                    reason_suffix = ";".join(reason_list)
+                    detailed_status = f"{detailed_status}:{reason_suffix}"
+                detailed_status = "skipped_due_to_topic_status"
+                if reason_list:
+                    reason_suffix = ";".join(reason_list)
+                    detailed_status = f"{detailed_status}:{reason_suffix}"
                 _log_submission(
                     root_dir,
                     ws_now,
@@ -3382,7 +3391,7 @@ def run_pipeline(args, cfg, root_dir) -> int:
                     None,
                     False,
                     0,
-                    "skipped_due_to_topic_status",
+                    detailed_status,
                     pre_log10_loss,
                 )
             except Exception:
