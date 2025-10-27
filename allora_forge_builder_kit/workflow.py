@@ -8,7 +8,15 @@ import os
 import dill
 
 class AlloraMLWorkflow:
-    def __init__(self, data_api_key, tickers, hours_needed, number_of_input_candles, target_length):
+    def __init__(
+        self,
+        data_api_key,
+        tickers,
+        hours_needed,
+        number_of_input_candles,
+        target_length,
+        sample_spacing_hours: int | None = None,
+    ):
         # Normalize API key and store
         self.api_key = (data_api_key or "").strip()
         self.tickers = tickers
@@ -17,6 +25,8 @@ class AlloraMLWorkflow:
         self.target_length = target_length  # Target horizon in hours
         self.test_targets = None
         self.validation_targets = None
+        self.sample_spacing_hours = sample_spacing_hours or target_length
+        self.latest_data_timestamp: pd.Timestamp | None = None
 
     def _headers(self):
         """Return robust auth headers to handle different casing/standards.
@@ -396,7 +406,7 @@ class AlloraMLWorkflow:
             "directional_accuracy": directional_accuracy
         }
 
-    def get_full_feature_target_dataframe(self, from_month="2025-01") -> pd.DataFrame:
+    def get_full_feature_target_dataframe(self, from_month="2025-10") -> pd.DataFrame:
         """
         Returns a DataFrame containing all features and target values for all tickers,
         with a MultiIndex of (date, ticker). Does not split into training/validation.
@@ -433,16 +443,23 @@ class AlloraMLWorkflow:
 
             combined_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
             if not combined_df.empty:
-                latest_ts = sorted(pd.to_datetime(combined_df["date"]).dt.date.unique())[-2]
-                try:
-                    # Use day precision string for fetch_ohlcv_data
-                    live_df = self.fetch_ohlcv_data(t, latest_ts.strftime("%Y-%m-%d"))
-                    combined_df = pd.concat([combined_df, live_df], ignore_index=True)
-                except (ValueError, RuntimeError):
-                    # No data or unauthorized; continue with bucket-only
-                    pass
                 combined_df["date"] = pd.to_datetime(combined_df["date"], utc=True)
                 combined_df = combined_df.drop_duplicates(subset="date")
+                latest_ts = combined_df["date"].max()
+                if latest_ts is not None:
+                    # Attempt to top up with the most recent 48h of candles to minimize gaps
+                    fetch_start = (latest_ts - pd.Timedelta(hours=max(48, self.target_length))).strftime("%Y-%m-%d")
+                    try:
+                        live_df = self.fetch_ohlcv_data(t, fetch_start)
+                    except (ValueError, RuntimeError):
+                        try:
+                            live_df = self.fetch_ohlcv_data_tiingo(t, fetch_start)
+                        except Exception:
+                            live_df = pd.DataFrame()
+                    if not live_df.empty:
+                        live_df["date"] = pd.to_datetime(live_df["date"], utc=True)
+                        combined_df = pd.concat([combined_df, live_df], ignore_index=True)
+                        combined_df = combined_df.drop_duplicates(subset="date").sort_values("date")
             else:
                 # Try Allora OHLC; on 401, fall back to Tiingo
                 try:
@@ -456,6 +473,11 @@ class AlloraMLWorkflow:
             if combined_df.empty:
                 print(f"Warning: offline fallback produced no rows for {t}; skipping ticker.")
                 continue
+            if not combined_df.empty:
+                ticker_latest = combined_df["date"].max()
+                if ticker_latest is not None:
+                    if self.latest_data_timestamp is None or ticker_latest > self.latest_data_timestamp:
+                        self.latest_data_timestamp = ticker_latest
             all_data[t] = combined_df
     
         def _downcast_numeric(df: pd.DataFrame) -> pd.DataFrame:
@@ -522,8 +544,9 @@ class AlloraMLWorkflow:
         full_data.index = pd.MultiIndex.from_frame(full_data.reset_index()[["date", "ticker"]])
         # Drop rows without a valid target (i.e., where future_close isn't available)
         full_data = full_data.dropna(subset=["target"])  # keep rows with valid labels
-        # Enforce non-overlapping windows: sample every target_length hours
-        step = self.target_length * 12  # 168 * 12 = 2016 for 5-min data
+        # Enforce non-overlapping windows: sample every configured spacing hours
+        spacing_hours = max(1, int(self.sample_spacing_hours))
+        step = max(1, spacing_hours * 12)  # 12 samples per hour for 5-minute bars
         grouped = full_data.groupby(level='ticker')
         sampled = []
         for name, group in grouped:
@@ -537,7 +560,7 @@ class AlloraMLWorkflow:
     
         return full_data
 
-    def get_train_validation_test_data(self, from_month="2025-01", validation_months=3, test_months=3, force_redownload=False):
+    def get_train_validation_test_data(self, from_month="2025-10", validation_months=3, test_months=3, force_redownload=False):
         def generate_filename():
             """Generate a unique filename based on parameters."""
             tickers_str = "_".join(self.tickers)

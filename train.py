@@ -2399,7 +2399,8 @@ def resolve_wallet() -> None:
 
 def run_pipeline(args, cfg, root_dir) -> int:
     data_cfg: Dict[str, Any] = cfg.get("data", {})
-    from_month = getattr(args, "from_month", str(data_cfg.get("from_month", "2025-01")))
+    from_month = getattr(args, "from_month", str(data_cfg.get("from_month", "2025-10")))
+    non_overlap_hours = max(1, int(data_cfg.get("non_overlap_hours", 48)))
     sched_cfg: Dict[str, Any] = cfg.get("schedule", {})
     mode = getattr(args, "_effective_mode", str(getattr(args, "schedule_mode", None) or sched_cfg.get("mode", "single")))
     cadence = getattr(args, "_effective_cadence", str(getattr(args, "cadence", None) or sched_cfg.get("cadence", "1h")))
@@ -2422,7 +2423,8 @@ def run_pipeline(args, cfg, root_dir) -> int:
         tickers=["btcusd"],
         hours_needed=168,
         number_of_input_candles=168,
-        target_length=168
+        target_length=168,
+        sample_spacing_hours=non_overlap_hours,
     )
     full_data: pd.DataFrame = workflow.get_full_feature_target_dataframe(from_month=from_month)
     date_index: pd.Index = _to_naive_utc_index(pd.DatetimeIndex(pd.to_datetime(full_data.index.get_level_values("date"))))
@@ -2432,6 +2434,11 @@ def run_pipeline(args, cfg, root_dir) -> int:
     else:
         _min_dt = None
         _max_dt = None
+
+    if getattr(workflow, "latest_data_timestamp", None) is not None:
+        latest_obs = cast(pd.Timestamp, workflow.latest_data_timestamp)
+        if _max_dt is None or latest_obs > _max_dt:
+            _max_dt = latest_obs
 
     # Dynamically set end_utc to the latest available timestamp in the data if not overridden
     if args.end_utc:
@@ -2470,20 +2477,64 @@ def run_pipeline(args, cfg, root_dir) -> int:
     except (ValueError, TypeError, AttributeError):
         as_of = as_of.floor("1h")
 
-    # Dynamically set start_utc as before
-    start_utc = _parse_utc(start_raw)
+    # Dynamically set start_utc using the freshest data if no explicit override was provided
+    if args.start_utc:
+        start_utc = _parse_utc(args.start_utc)
+    else:
+        configured_start = _parse_utc(start_raw)
+        if _max_dt is not None:
+            dynamic_start = _max_dt - pd.Timedelta(days=60)
+            if _min_dt is not None:
+                dynamic_start = max(dynamic_start, _min_dt)
+            if dynamic_start > configured_start:
+                print(
+                    "INFO: Adjusting start window forward to leverage latest data "
+                    f"(configured_start={configured_start}, dynamic_start={dynamic_start})."
+                )
+                start_utc = dynamic_start
+            else:
+                start_utc = configured_start
+        else:
+            start_utc = configured_start
 
-    print(f"Schedule: mode={mode} cadence={cadence} start={start_utc} end={end_utc} as_of={as_of}")
+    if start_utc > end_utc:
+        adjusted_start = end_utc - pd.Timedelta(days=60)
+        if _min_dt is not None:
+            adjusted_start = max(adjusted_start, _min_dt)
+        print(
+            "WARNING: Computed start timestamp exceeds end timestamp; "
+            f"resetting start from {start_utc} to {adjusted_start}."
+        )
+        start_utc = adjusted_start
+
+    print(
+        f"Schedule: mode={mode} cadence={cadence} start={start_utc} end={end_utc} as_of={as_of} "
+        f"(non_overlap_spacing={non_overlap_hours}h)"
+    )
 
     # Validate that the selected date range does not filter out >90% of the data
     total_rows = len(full_data)
-    start_naive = _to_naive_utc_ts(start_utc)
-    end_naive = _to_naive_utc_ts(end_utc)
-    filtered_rows = ((date_index >= start_naive) & (date_index <= end_naive)).sum()
+
+    def _window_counts(s_utc: pd.Timestamp, e_utc: pd.Timestamp) -> Tuple[pd.Timestamp, pd.Timestamp, int]:
+        s_nv = _to_naive_utc_ts(s_utc)
+        e_nv = _to_naive_utc_ts(e_utc)
+        in_window = ((date_index >= s_nv) & (date_index <= e_nv)).sum()
+        return s_nv, e_nv, int(in_window)
+
+    start_naive, end_naive, filtered_rows = _window_counts(start_utc, end_utc)
     if total_rows > 0 and filtered_rows / total_rows < 0.1:
-        print(f"ERROR: More than 90% of the available data would be filtered out by the selected date range (start={start_utc}, end={end_utc}). Aborting.", file=sys.stderr)
-        print(f"[DEBUG] total_rows={total_rows}, filtered_rows={filtered_rows}", file=sys.stderr)
-        sys.exit(1)
+        print(
+            "WARNING: Selected date range is discarding more than 90% of available rows; "
+            f"realigning window to dataset coverage ({_min_dt} -> {_max_dt})."
+        )
+        if _min_dt is not None:
+            start_utc = _min_dt
+        if _max_dt is not None:
+            end_utc = _max_dt
+        start_naive, end_naive, filtered_rows = _window_counts(start_utc, end_utc)
+        print(
+            f"INFO: Window adjusted to start={start_utc} end={end_utc}; covered_rows={filtered_rows}/{total_rows}."
+        )
 
     # Topic validation and audit (moved out of abort block)
     try:
@@ -2522,7 +2573,7 @@ def run_pipeline(args, cfg, root_dir) -> int:
         if topic_validation_reason is None:
             topic_validation_reason = str(e)
 
-    # Enforce non-overlapping targets for 7-day horizon: sample timestamps at least 168h apart
+    # Enforce non-overlapping targets for 7-day horizon: sample timestamps at least `non_overlap_hours` apart
     def _non_overlapping_mask(idx: pd.DatetimeIndex, hours: int) -> pd.Series:
         """Greedy selection mask ensuring each kept timestamp is >= 'hours' after the previous kept."""
         try:
@@ -2603,17 +2654,26 @@ def run_pipeline(args, cfg, root_dir) -> int:
     # Apply eligible cutoff to avoid leakage (<= eligible_cutoff)
     eligible_mask = (date_index >= start_naive) & (date_index <= eligible_cutoff)
     df_range: pd.DataFrame = full_data.loc[eligible_mask]
-    # Apply non-overlapping decimation with 168h spacing, but relax if too few samples
+    # Apply non-overlapping decimation using configurable spacing, but relax if too few samples
     if not df_range.empty:
         dec_idx = pd.DatetimeIndex(df_range.index.get_level_values("date"))
-        dec_mask: pd.Series = _non_overlapping_mask(dec_idx, hours=int(workflow.target_length))
+        dec_mask: pd.Series = _non_overlapping_mask(dec_idx, hours=int(non_overlap_hours))
         mask_arr: NDArray[np.bool_] = dec_mask.to_numpy(dtype=bool)  # align by position
         df_range_decimated = df_range.iloc[mask_arr]
         # If too few samples, relax the decimation
         if len(df_range_decimated) < 10:
-            print(f"WARNING: Only {len(df_range_decimated)} samples after decimation, relaxing non-overlapping constraint.")
-        else:
+            print(
+                f"WARNING: Only {len(df_range_decimated)} samples after decimation with {non_overlap_hours}h spacing; "
+                "retrying with 24h spacing to widen coverage."
+            )
+            dec_mask = _non_overlapping_mask(dec_idx, hours=24)
+            df_range_decimated = df_range.iloc[dec_mask.to_numpy(dtype=bool)]
+        if len(df_range_decimated) >= 10:
             df_range = df_range_decimated
+        else:
+            print(
+                f"INFO: Keeping full eligible sample set ({len(df_range)} rows) due to low coverage after decimation."
+            )
 
     X_train: pd.DataFrame = pd.DataFrame()
     y_train: pd.Series = pd.Series(dtype=float)
@@ -2648,7 +2708,7 @@ def run_pipeline(args, cfg, root_dir) -> int:
         y_test = test_df["target"] if not test_df.empty else pd.Series(dtype=float)
     else:
         # Dynamic fallback: pick last K decimated samples within eligible range
-        dec_global: pd.Series = _non_overlapping_mask(pd.DatetimeIndex(date_index), hours=int(workflow.target_length))
+        dec_global: pd.Series = _non_overlapping_mask(pd.DatetimeIndex(date_index), hours=int(non_overlap_hours))
         mask2: NDArray[np.bool_] = dec_global.to_numpy(dtype=bool)
         full_dec: pd.DataFrame = full_data.iloc[mask2]
         di_elig: pd.DatetimeIndex = _to_naive_utc_index(pd.DatetimeIndex(full_dec.index.get_level_values("date")))
@@ -3257,7 +3317,7 @@ def run_pipeline(args, cfg, root_dir) -> int:
             reason = topic_validation_reason or "topic_validation_failed"
             skip_msg = (
                 "Submission skipped: topic is not rewardable or active due to: "
-                f"{reason}"
+                f"{reason}; artifacts retained for monitoring and loop will retry."
             )
             print(skip_msg)
             logging.warning(skip_msg)
