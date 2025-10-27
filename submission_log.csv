@@ -1,3 +1,0 @@
-timestamp_utc,topic_id,value,wallet,nonce,tx_hash,success,exit_code,status,log10_loss,score,reward
-2025-10-26T14:00:00Z,67,1e-05,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,null,null,false,0,active_not_churnable:missing_epoch_or_last_update,null,null,null
-2025-10-27T01:00:00Z,67,0.028365401551127434,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,null,null,false,0,skipped_topic_not_ready,-4.532563940577067,null,null
