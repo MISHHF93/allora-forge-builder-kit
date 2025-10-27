@@ -675,6 +675,40 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
         ],
     )
     reputer_stake = _deep_find(combined, ["reputer_stake", "reputerStake", "staked_reputers", "reputer_staked"])
+    min_stake_candidate = _deep_find(
+        combined,
+        [
+            "min_delegation",
+            "minimum_delegation",
+            "minDelegation",
+            "minimumDelegation",
+            "min_stake",
+            "minimum_stake",
+            "minStake",
+            "minimumStake",
+            "requiredDelegation",
+            "required_delegation",
+            "requiredDelegatedStake",
+            "required_delegated_stake",
+            "minimumDelegatedStake",
+            "minimum_delegated_stake",
+            "stake_minimum",
+            "stakeMinimum",
+            "minBond",
+            "min_bond",
+        ],
+    )
+    required_delegate_candidate = _deep_find(
+        combined,
+        [
+            "requiredDelegation",
+            "required_delegation",
+            "requiredDelegatedStake",
+            "required_delegated_stake",
+            "requiredStake",
+            "required_stake",
+        ],
+    )
     reputers = _deep_find(
         combined,
         [
@@ -716,6 +750,23 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
             except Exception:
                 rep_count = None
 
+    def _first_positive_float(*vals: Any) -> Optional[float]:
+        for v in vals:
+            if v in (None, ""):
+                continue
+            f = _to_float(v)
+            if f is not None and np.isfinite(f):
+                return float(f)
+        return None
+
+    min_stake_env = None
+    env_val = os.getenv("ALLORA_TOPIC_MIN_STAKE")
+    if env_val:
+        try:
+            min_stake_env = float(env_val)
+        except Exception:
+            min_stake_env = None
+
     out: Dict[str, Any] = {
         "raw": combined,
         "topic_status_raw": status if status else None,
@@ -728,6 +779,8 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
         "reputers_count": rep_count,
         "weight": _to_float(weight),
         "last_update": last_update,
+        "required_delegated_stake": _to_float(required_delegate_candidate),
+        "min_delegated_stake": _first_positive_float(min_stake_candidate, required_delegate_candidate, min_stake_env),
     }
     eff = out.get("effective_revenue")
     stk = out.get("delegated_stake") or out.get("reputer_stake")
@@ -951,6 +1004,16 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
     eff = info.get("effective_revenue")
     stk = info.get("delegated_stake")
     reps = info.get("reputers_count")
+    min_stake_required = info.get("min_delegated_stake")
+    if min_stake_required is None:
+        min_stake_required = info.get("required_delegated_stake")
+    if min_stake_required is None:
+        env_min_stake = os.getenv("ALLORA_TOPIC_MIN_STAKE")
+        if env_min_stake:
+            try:
+                min_stake_required = float(env_min_stake)
+            except Exception:
+                min_stake_required = None
     weight_est = info.get("weight_estimate") or info.get("weight")
     min_weight_env = os.getenv("ALLORA_TOPIC_MIN_WEIGHT", "0")
     try:
@@ -972,6 +1035,9 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
     elif stk <= 0:
         inactive_reasons.append("stake too low")
         inactive_codes.append("delegated_stake_non_positive")
+    elif (min_stake_required is not None) and (stk < float(min_stake_required)):
+        inactive_reasons.append("stake below minimum requirement")
+        inactive_codes.append("delegated_stake_below_minimum")
     if reps is None:
         inactive_reasons.append("reputers missing")
         inactive_codes.append("reputers_missing")
@@ -1027,6 +1093,7 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
         "activity_snapshot": {
             "effective_revenue": eff,
             "delegated_stake": stk,
+            "min_delegated_stake": min_stake_required,
             "reputers_count": reps,
             "weight_estimate": weight_est,
             "min_weight": min_weight,
@@ -3485,6 +3552,16 @@ def run_pipeline(args, cfg, root_dir) -> int:
             reputers_count = int(float(reps_raw)) if reps_raw is not None else None
         except (TypeError, ValueError):
             reputers_count = None
+        delegated_stake_raw = activity_snapshot.get("delegated_stake")
+        try:
+            delegated_stake_val = float(delegated_stake_raw) if delegated_stake_raw is not None else None
+        except (TypeError, ValueError):
+            delegated_stake_val = None
+        min_delegate_raw = activity_snapshot.get("min_delegated_stake")
+        try:
+            min_delegate_val = float(min_delegate_raw) if min_delegate_raw is not None else None
+        except (TypeError, ValueError):
+            min_delegate_val = None
         unfulfilled_raw = lifecycle.get("unfulfilled")
         try:
             unfulfilled_int = int(float(unfulfilled_raw)) if unfulfilled_raw is not None else None
@@ -3498,6 +3575,8 @@ def run_pipeline(args, cfg, root_dir) -> int:
             f"  inactive_reasons={inactive_reasons}\n"
             f"  churn_reasons={churn_reasons}\n"
             f"  reputers_count={reputers_count}\n"
+            f"  delegated_stake={delegated_stake_val}\n"
+            f"  min_delegated_stake={min_delegate_val}\n"
             f"  unfulfilled={unfulfilled_int}\n"
             f"  activity_snapshot={activity_snapshot}"
         )
@@ -3545,23 +3624,41 @@ def run_pipeline(args, cfg, root_dir) -> int:
         # Check Active (funding+stake+reputers) and rewardability/nonce hygiene
         reps_for_skip = reputers_count
         unfulfilled_for_skip = unfulfilled_int
+        stake_for_skip = delegated_stake_val
+        min_stake_for_skip = min_delegate_val
         should_skip = (
             not current_active
             or not is_rewardable
             or reps_for_skip is None
             or reps_for_skip < 1
             or (unfulfilled_for_skip is not None and unfulfilled_for_skip > 0)
+            or stake_for_skip is None
+            or (
+                min_stake_for_skip is not None
+                and stake_for_skip is not None
+                and stake_for_skip < min_stake_for_skip
+            )
         )
         if not args.force_submit and should_skip:
             snapshot = activity_snapshot
             eff = snapshot.get("effective_revenue")
             stk = snapshot.get("delegated_stake")
             reps = snapshot.get("reputers_count")
+            min_req = snapshot.get("min_delegated_stake")
             reason_list = [str(r) for r in inactive_reasons if r]
             if (reps_for_skip is None or reps_for_skip < 1) and "reputers missing" not in reason_list:
                 reason_list.append("reputers missing")
             if unfulfilled_for_skip is not None and unfulfilled_for_skip > 0:
                 reason_list.append(f"unfulfilled_nonces:{unfulfilled_for_skip}")
+            if (stake_for_skip is None) and "stake unavailable" not in reason_list:
+                reason_list.append("stake unavailable")
+            if (
+                stake_for_skip is not None
+                and min_stake_for_skip is not None
+                and stake_for_skip < min_stake_for_skip
+                and "stake below minimum requirement" not in reason_list
+            ):
+                reason_list.append("stake below minimum requirement")
             if not is_rewardable and "not_rewardable" not in reason_list:
                 reason_list.append("not_rewardable")
             reason_str = ", ".join(reason_list) if reason_list else "unknown"
@@ -3574,7 +3671,7 @@ def run_pipeline(args, cfg, root_dir) -> int:
             wait_msg = (
                 "Waiting for topic to activate: "
                 f"effective_revenue={eff} delegated_stake={stk} reputers_count={reps} "
-                f"unfulfilled={unfulfilled_for_skip}; Will retry next loop."
+                f"min_required_stake={min_req} unfulfilled={unfulfilled_for_skip}; Will retry next loop."
             )
             print(wait_msg)
             logging.info(wait_msg)
