@@ -39,7 +39,7 @@ logging.basicConfig(
     filename='pipeline_run.log',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%SZ'
 )
 
 # --- Timezone helpers ---------------------------------------------------------
@@ -158,6 +158,21 @@ def _require_api_key() -> str:
     return api_key.strip()
 
 
+def _load_pipeline_config(root_dir: str) -> Dict[str, Any]:
+    """Load pipeline configuration once for reuse."""
+    cfg_path = os.path.join(root_dir, "config", "pipeline.yaml")
+    cfg: Dict[str, Any] = {}
+    if yaml and os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as fh:
+                loaded: Any = yaml.safe_load(fh) or {}
+            if isinstance(loaded, dict):
+                cfg = cast(Dict[str, Any], loaded)
+        except (OSError, IOError, UnicodeDecodeError, ValueError, TypeError) as exc:
+            print(f"Warning: failed to load config/pipeline.yaml: {exc}")
+    return cfg
+
+
 # --- Submission helpers (integrated from prior submission script) ------------
 
 CHAIN_ID = os.getenv("ALLORA_CHAIN_ID", "allora-testnet-1")
@@ -228,6 +243,10 @@ EXPECTED_TOPIC_67: Dict[str, Any] = {
     # Submission window must exist and be > 0
     "require_worker_submission_window": True,
 }
+
+
+# Track topic activity state across loop iterations so we can surface transitions loudly
+_LAST_TOPIC_ACTIVE_STATE: Optional[bool] = None
 
 
 def zptae_log10_loss(y_true: List[float], y_pred: List[float], window: int = 100, p: float = 3.0, eps: float = 1e-12) -> Dict[str, float]:
@@ -580,12 +599,26 @@ def _get_emissions_params() -> Dict[str, Any]:
 
 
 def _get_topic_info(topic_id: int) -> Dict[str, Any]:
-    """Query topic info, normalizing effective_revenue, delegated_stake, reputers_count, weight, last_update."""
-    j = _run_allorad_json(["q", "emissions", "topic-info", str(int(topic_id))])
-    if not j:
-        # Fallback attempts
-        j = _run_allorad_json(["q", "emissions", "topic", str(int(topic_id))]) or {}
-    out: Dict[str, Any] = {"raw": j}
+    """Query topic status/info, normalizing effective_revenue, delegated_stake, reputers_count, weight, last_update."""
+
+    status = _run_allorad_json(["q", "emissions", "topic-status", str(int(topic_id))]) or {}
+    info = _run_allorad_json(["q", "emissions", "topic-info", str(int(topic_id))]) or {}
+    active_query = _run_allorad_json(["q", "emissions", "is-topic-active", str(int(topic_id))]) or {}
+    fee_query = _run_allorad_json(["q", "emissions", "topic-fee-revenue", str(int(topic_id))]) or {}
+    stake_query = _run_allorad_json(["q", "emissions", "topic-stake", str(int(topic_id))]) or {}
+    fallback_topic: Dict[str, Any] = {}
+    if not info:
+        fallback_topic = _run_allorad_json(["q", "emissions", "topic", str(int(topic_id))]) or {}
+
+    combined: Dict[str, Any] = {
+        "topic_status": status,
+        "topic_info": info,
+        "topic": fallback_topic,
+        "topic_active": active_query,
+        "topic_fee": fee_query,
+        "topic_stake": stake_query,
+    }
+
     def _deep_find(obj: Any, keys: List[str]) -> Optional[Any]:
         if isinstance(obj, dict):
             for k, v in obj.items():
@@ -600,6 +633,7 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
                 if r is not None:
                     return r
         return None
+
     def _to_float(x: Any) -> Optional[float]:
         try:
             f = float(x)
@@ -614,18 +648,96 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
             except Exception:
                 return None
         return None
-    eff_rev = _deep_find(j, ["effective_revenue", "effectiveRevenue", "revenue", "effective"])
-    del_stk = _deep_find(j, ["delegated_stake", "delegatedStake", "stake_delegated"])    
-    reputers = _deep_find(j, ["reputers_count", "reputersCount", "reputers", "n_reputers"])   
-    weight = _deep_find(j, ["weight", "topic_weight", "score_weight"])  
-    last_update = _deep_find(j, ["last_update_height", "lastUpdateHeight", "last_update_time", "lastUpdateTime"])  
-    out.update({
+
+    def _to_bool(x: Any) -> Optional[bool]:
+        if isinstance(x, bool):
+            return x
+        if isinstance(x, (int, float)):
+            return bool(x)
+        if isinstance(x, str):
+            s = x.strip().lower()
+            if s in ("true", "1", "yes", "y", "active"):
+                return True
+            if s in ("false", "0", "no", "n", "inactive"):
+                return False
+        return None
+
+    eff_rev = _deep_find(combined, ["effective_revenue", "effectiveRevenue", "revenue", "effective"])
+    del_stk = _deep_find(
+        combined,
+        [
+            "delegated_stake",
+            "delegatedStake",
+            "stake_delegated",
+            "delegated",
+            "delegatedAmount",
+            "delegatedStakeAmount",
+        ],
+    )
+    reputer_stake = _deep_find(combined, ["reputer_stake", "reputerStake", "staked_reputers", "reputer_staked"])
+    reputers = _deep_find(
+        combined,
+        [
+            "reputers_count",
+            "reputersCount",
+            "reputers",
+            "n_reputers",
+            "reputerCount",
+            "reputersLength",
+        ],
+    )
+    weight = _deep_find(combined, ["weight", "topic_weight", "score_weight"])
+    last_update = _deep_find(combined, ["last_update_height", "lastUpdateHeight", "last_update_time", "lastUpdateTime"])
+    active_flag = _deep_find(
+        combined,
+        [
+            "is_topic_active",
+            "isTopicActive",
+            "is_active",
+            "isActive",
+            "active",
+            "result",
+            "value",
+            "topic_active",
+        ],
+    )
+    if active_flag is None and active_query not in ({}, None):
+        active_flag = active_query
+
+    rep_count: Optional[int] = None
+    if isinstance(reputers, (list, tuple, set)):
+        rep_count = len(reputers)
+    elif reputers not in (None, ""):
+        try:
+            rep_count = int(str(reputers))
+        except Exception:
+            try:
+                rep_count = int(float(reputers))
+            except Exception:
+                rep_count = None
+
+    out: Dict[str, Any] = {
+        "raw": combined,
+        "topic_status_raw": status if status else None,
+        "topic_info_raw": info if info else None,
+        "topic_fallback_raw": fallback_topic if fallback_topic else None,
+        "is_topic_active": _to_bool(active_flag),
         "effective_revenue": _to_float(eff_rev),
         "delegated_stake": _to_float(del_stk),
-        "reputers_count": int(reputers) if reputers is not None else None,
+        "reputer_stake": _to_float(reputer_stake),
+        "reputers_count": rep_count,
         "weight": _to_float(weight),
         "last_update": last_update,
-    })
+    }
+    eff = out.get("effective_revenue")
+    stk = out.get("delegated_stake") or out.get("reputer_stake")
+    if eff is not None and eff > 0 and stk is not None and stk > 0:
+        try:
+            out["weight_estimate"] = float(stk) ** 0.5 * float(eff) ** 0.5
+        except Exception:
+            out["weight_estimate"] = None
+    else:
+        out["weight_estimate"] = None
     return out
 
 
@@ -839,7 +951,42 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
     eff = info.get("effective_revenue")
     stk = info.get("delegated_stake")
     reps = info.get("reputers_count")
-    is_active = (eff is not None and eff > 0) and (stk is not None and stk > 0) and (reps is not None and reps >= 1)
+    weight_est = info.get("weight_estimate") or info.get("weight")
+    min_weight_env = os.getenv("ALLORA_TOPIC_MIN_WEIGHT", "0")
+    try:
+        min_weight = max(0.0, float(min_weight_env))
+    except Exception:
+        min_weight = 0.0
+
+    inactive_reasons: List[str] = []
+    inactive_codes: List[str] = []
+    if eff is None:
+        inactive_reasons.append("fee revenue unavailable")
+        inactive_codes.append("effective_revenue_missing")
+    elif eff <= 0:
+        inactive_reasons.append("fee revenue zero")
+        inactive_codes.append("effective_revenue_zero")
+    if stk is None:
+        inactive_reasons.append("stake unavailable")
+        inactive_codes.append("delegated_stake_missing")
+    elif stk <= 0:
+        inactive_reasons.append("stake too low")
+        inactive_codes.append("delegated_stake_non_positive")
+    if reps is None:
+        inactive_reasons.append("reputers missing")
+        inactive_codes.append("reputers_missing")
+    elif reps < 1:
+        inactive_reasons.append("reputers missing")
+        inactive_codes.append("reputers_below_minimum")
+    if eff is not None and eff > 0 and stk is not None and stk > 0:
+        if weight_est is None:
+            inactive_reasons.append("weight unavailable")
+            inactive_codes.append("weight_missing")
+        elif weight_est <= min_weight:
+            inactive_reasons.append("weight below threshold")
+            inactive_codes.append("weight_below_minimum")
+
+    is_active = len(inactive_codes) == 0
     # Churnable criteria: at least one epoch elapsed since last update and sufficiently high weight rank
     # We approximate 'since last update' using block height and epoch length if available.
     is_churnable = False
@@ -873,8 +1020,17 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
         "weight_total": total,
         "unfulfilled": unfulfilled,
         "is_active": bool(is_active),
+        "inactive_reasons": inactive_reasons,
+        "inactive_reason_codes": inactive_codes,
         "is_churnable": bool(is_churnable),
         "is_rewardable": bool(is_rewardable),
+        "activity_snapshot": {
+            "effective_revenue": eff,
+            "delegated_stake": stk,
+            "reputers_count": reps,
+            "weight_estimate": weight_est,
+            "min_weight": min_weight,
+        },
         "churn_reasons": reason_churn,
     }
 
@@ -1988,6 +2144,209 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
         return 1
 
 
+def _parse_submission_helper_output(stdout: str, stderr: str) -> Tuple[Optional[str], Optional[int], Optional[float], Optional[float], Optional[str]]:
+    """Best-effort extraction of tx hash, nonce, score, reward, and status from helper output."""
+    text = "\n".join([stdout or "", stderr or ""]).strip()
+    tx_hash: Optional[str] = None
+    nonce: Optional[int] = None
+    score: Optional[float] = None
+    reward: Optional[float] = None
+    status: Optional[str] = None
+
+    # Try JSON lines first
+    for line in text.splitlines():
+        candidate = line.strip()
+        if not candidate or not (candidate.startswith("{") and candidate.endswith("}")):
+            continue
+        try:
+            obj = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            if not tx_hash:
+                for key in ("tx_hash", "txHash", "txhash", "transactionHash", "hash"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and len(val) >= 40:
+                        tx_hash = val
+                        break
+            if nonce is None:
+                for key in ("nonce", "windowNonce", "block_height", "height"):
+                    val = obj.get(key)
+                    try:
+                        if isinstance(val, str) and val.isdigit():
+                            nonce = int(val)
+                            break
+                        if isinstance(val, (int, float)):
+                            nonce = int(val)
+                            break
+                    except Exception:
+                        continue
+            if score is None:
+                for key in ("score", "ema_score", "inferer_score", "log10_score"):
+                    if key in obj:
+                        val = obj.get(key)
+                        try:
+                            score = float(val)
+                        except Exception:
+                            score = None
+                        break
+            if reward is None:
+                for key in ("reward", "rewards", "amount"):
+                    if key in obj:
+                        val = obj.get(key)
+                        try:
+                            reward = float(val)
+                        except Exception:
+                            reward = None
+                        break
+            if not status:
+                for key in ("status", "message", "result"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and val:
+                        status = val
+                        break
+
+    if not tx_hash:
+        m = re.search(r"\b[0-9A-Fa-f]{64}\b", text)
+        if m:
+            tx_hash = m.group(0)
+
+    if nonce is None:
+        m = re.search(r"nonce[^0-9]*(\d{3,})", text, flags=re.IGNORECASE)
+        if m:
+            try:
+                nonce = int(m.group(1))
+            except Exception:
+                nonce = None
+
+    if score is None:
+        m = re.search(r"score[^0-9-]*([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)", text, flags=re.IGNORECASE)
+        if m:
+            try:
+                score = float(m.group(1))
+            except Exception:
+                score = None
+
+    if reward is None:
+        m = re.search(r"reward[^0-9-]*([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)", text, flags=re.IGNORECASE)
+        if m:
+            try:
+                reward = float(m.group(1))
+            except Exception:
+                reward = None
+
+    if not status and text:
+        # Use the last non-empty line as a human-readable status hint
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            status = lines[-1][:128]
+
+    return tx_hash, nonce, score, reward, status
+
+
+def _submit_via_external_helper(
+    topic_id: int,
+    value: float,
+    root_dir: str,
+    pre_log10_loss: Optional[float],
+    submit_timeout: int,
+) -> Optional[Tuple[int, bool]]:
+    """Attempt submission via submit_prediction.py (if available) or similar helper.
+
+    Returns Optional[(exit_code, success_flag)]. When None, no helper was executed.
+    """
+    candidates = [
+        os.path.join(root_dir, "submit_prediction.py"),
+        os.path.join(root_dir, "scripts", "submit_prediction.py"),
+        os.path.join(root_dir, "tools", "submit_prediction.py"),
+    ]
+    timeout_bound = max(0, int(submit_timeout or 0))
+    wallet = _resolve_wallet_for_logging(root_dir)
+    cadence_s = _load_cadence_from_config(root_dir)
+    env = os.environ.copy()
+    env.setdefault("ALLORA_TOPIC_ID", str(topic_id))
+    env.setdefault("ALLORA_PREDICTION_VALUE", str(value))
+
+    for candidate in candidates:
+        if not os.path.exists(candidate):
+            continue
+        cmd = [sys.executable, candidate, "--topic-id", str(topic_id), "--source", "model"]
+        if "--mode" not in cmd:
+            cmd.extend(["--mode", "cli"])
+        if timeout_bound > 0:
+            cmd.extend(["--timeout", str(timeout_bound)])
+        try:
+            cp = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=(timeout_bound + 30) if timeout_bound > 0 else None,
+            )
+        except subprocess.TimeoutExpired:
+            ws = _window_start_utc(cadence_s=cadence_s)
+            _log_submission(
+                root_dir,
+                ws,
+                topic_id,
+                value,
+                wallet,
+                None,
+                None,
+                False,
+                124,
+                "submit_helper_timeout",
+                pre_log10_loss,
+            )
+            return (124, False)
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            ws = _window_start_utc(cadence_s=cadence_s)
+            _log_submission(
+                root_dir,
+                ws,
+                topic_id,
+                value,
+                wallet,
+                None,
+                None,
+                False,
+                1,
+                f"submit_helper_error:{exc}",
+                pre_log10_loss,
+            )
+            return (1, False)
+
+        tx_hash, nonce, score, reward, status = _parse_submission_helper_output(cp.stdout, cp.stderr)
+        success = bool(cp.returncode == 0 and tx_hash)
+        exit_code = 0 if success else (cp.returncode if cp.returncode != 0 else 1)
+        ws = _window_start_utc(cadence_s=cadence_s)
+        _log_submission(
+            root_dir,
+            ws,
+            topic_id,
+            value,
+            wallet,
+            nonce,
+            tx_hash,
+            success,
+            exit_code,
+            status or ("submit_helper_success" if success else f"submit_helper_rc={cp.returncode}"),
+            pre_log10_loss,
+            score,
+            reward if reward is not None else ("pending" if success else None),
+        )
+        if not success:
+            print(
+                f"submit(helper): helper at {candidate} exited with rc={cp.returncode}; stdout={cp.stdout!r} stderr={cp.stderr!r}",
+                file=sys.stderr,
+            )
+        return (exit_code, success)
+
+    return None
+
+
 def sleep_until_top_of_hour_utc() -> None:
     """Sleep until the next top of hour in UTC."""
     import time
@@ -1997,6 +2356,27 @@ def sleep_until_top_of_hour_utc() -> None:
     if sleep_time > 0:
         print(f"Sleeping {sleep_time:.0f} seconds until top of hour UTC")
         time.sleep(sleep_time)
+
+
+def _sleep_until_next_window(cadence_s: int) -> None:
+    """Align to the next cadence window boundary in UTC."""
+    try:
+        now = pd.Timestamp.now(tz="UTC")
+    except Exception:
+        now = pd.Timestamp.utcnow().tz_localize("UTC")
+    window_start = _window_start_utc(now=now, cadence_s=cadence_s)
+    # If we are within one second of the boundary, skip sleeping
+    delta = (now - window_start).total_seconds()
+    if delta < 1.0 and delta >= 0.0:
+        return
+    next_window = window_start + pd.Timedelta(seconds=cadence_s)
+    wait = (next_window - now).total_seconds()
+    if wait > 0:
+        logging.info(f"[loop] aligning to cadence; sleeping {wait:.1f}s until {next_window.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        try:
+            time.sleep(wait)
+        except Exception:
+            pass
 
 
 def resolve_wallet() -> None:
@@ -2017,50 +2397,20 @@ def resolve_wallet() -> None:
         print(f"Warning: failed to run resolve_wallet.py: {e}")
 
 
-def run_pipeline(args) -> int:
-    pass
-
-def main() -> int:
-    root_dir = os.path.dirname(os.path.abspath(__file__))
-    # 3) Load pipeline config if available (moved to top so cfg is defined before use)
-    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "pipeline.yaml")
-    cfg: Dict[str, Any] = {}
-    if yaml and os.path.exists(cfg_path):
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as fh:
-                loaded: Any = yaml.safe_load(fh) or {}
-                if isinstance(loaded, dict):
-                    cfg = cast(Dict[str, Any], loaded)
-                else:
-                    cfg = {}
-        except (OSError, IOError, UnicodeDecodeError) as e:
-            print(f"Warning: failed to load config/pipeline.yaml: {e}")
-
-    # Args exist but default to competition spec
-    parser = argparse.ArgumentParser(description="Train model and emit predictions.json for Topic 67 (7-day BTC/USD log-return)")
-    parser.add_argument("--from-month", default="2025-01")
-    parser.add_argument("--schedule-mode", default=None, help="Schedule mode (single, loop, etc.)")
-    parser.add_argument("--cadence", default=None, help="Cadence for scheduling (e.g., 1h)")
-    parser.add_argument("--start-utc", default=None, help="Start datetime in UTC (ISO format)")
-    parser.add_argument("--end-utc", default=None, help="End datetime in UTC (ISO format)")
-    parser.add_argument("--as-of", default=None, help="As-of datetime in UTC (ISO format)")
-    parser.add_argument("--as-of-now", action="store_true", help="Use current UTC time as as_of")
-    parser.add_argument("--submit", action="store_true", help="Submit the prediction after training")
-    parser.add_argument("--submit-timeout", type=int, default=30, help="Timeout for submission in seconds")
-    parser.add_argument("--submit-retries", type=int, default=3, help="Number of retries for submission")
-    parser.add_argument("--force-submit", action="store_true", help="Force submission even if guards are active")
-    args = parser.parse_args()
-
-    # Allow CLI args to override defaults but prefer config when present
+def run_pipeline(args, cfg, root_dir) -> int:
     data_cfg: Dict[str, Any] = cfg.get("data", {})
-    from_month: str = str(data_cfg.get("from_month", args.from_month))
-
-    # Schedule configuration
+    from_month = getattr(args, "from_month", str(data_cfg.get("from_month", "2025-01")))
     sched_cfg: Dict[str, Any] = cfg.get("schedule", {})
-    mode: str = str(args.schedule_mode or sched_cfg.get("mode", "single"))
-    cadence: str = str(args.cadence or sched_cfg.get("cadence", "1h"))
-    start_raw: str = str(args.start_utc or sched_cfg.get("start", "2025-09-16T13:00:00Z"))
-    end_raw: str = str(args.end_utc or sched_cfg.get("end", "2025-12-15T13:00:00Z"))
+    mode = getattr(args, "_effective_mode", str(getattr(args, "schedule_mode", None) or sched_cfg.get("mode", "single")))
+    cadence = getattr(args, "_effective_cadence", str(getattr(args, "cadence", None) or sched_cfg.get("cadence", "1h")))
+    start_raw = str(getattr(args, "start_utc", None) or sched_cfg.get("start", "2025-09-16T13:00:00Z"))
+    end_raw = str(getattr(args, "end_utc", None) or sched_cfg.get("end", "2025-12-15T13:00:00Z"))
+    topic_validation: Dict[str, Any] = {}
+    topic_validation_ok = False
+    topic_validation_funded = False
+    topic_validation_epoch = False
+    topic_validation_reason: Optional[str] = None
+
     def _parse_utc(ts: str) -> pd.Timestamp:
         t = pd.Timestamp(ts)
         if getattr(t, "tz", None) is None:
@@ -2076,7 +2426,12 @@ def main() -> int:
     )
     full_data: pd.DataFrame = workflow.get_full_feature_target_dataframe(from_month=from_month)
     date_index: pd.Index = _to_naive_utc_index(pd.DatetimeIndex(pd.to_datetime(full_data.index.get_level_values("date"))))
-    _min_dt, _max_dt = date_index.min().tz_localize('UTC'), date_index.max().tz_localize('UTC') if len(date_index) > 0 else (None, None)
+    if len(date_index) > 0:
+        _min_dt = pd.Timestamp(date_index.min(), tz="UTC")
+        _max_dt = pd.Timestamp(date_index.max(), tz="UTC")
+    else:
+        _min_dt = None
+        _max_dt = None
 
     # Dynamically set end_utc to the latest available timestamp in the data if not overridden
     if args.end_utc:
@@ -2135,6 +2490,21 @@ def main() -> int:
         topic_id_eff = int(DEFAULT_TOPIC_ID)
         assert topic_id_eff == int(EXPECTED_TOPIC_67["topic_id"]), "Topic ID must be 67 for this workflow"
         topic_validation = _validate_topic_creation_and_funding(topic_id_eff, EXPECTED_TOPIC_67)
+        topic_validation_ok = bool(topic_validation.get("ok"))
+        topic_validation_funded = bool(topic_validation.get("funded"))
+        topic_fields = cast(Dict[str, Any], topic_validation.get("fields", {}) or {})
+        topic_validation_epoch = bool(topic_fields.get("epoch_length"))
+        mism = topic_validation.get("mismatches") or []
+        if mism:
+            topic_validation_reason = ",".join(str(m) for m in mism)
+        elif not topic_validation_ok:
+            topic_validation_reason = "topic_not_ok"
+        elif not topic_validation_funded:
+            topic_validation_reason = "topic_unfunded"
+        elif not topic_validation_epoch:
+            topic_validation_reason = "missing_epoch_length"
+        else:
+            topic_validation_reason = None
         # Persist audit file for VS Code AI and human review
         audit_dir = os.path.join(root_dir, "data", "artifacts", "logs")
         os.makedirs(audit_dir, exist_ok=True)
@@ -2149,6 +2519,8 @@ def main() -> int:
             print("Topic 67 validation: OK and funded")
     except Exception as e:
         print(f"Warning: topic creation/funding validation skipped or failed: {e}")
+        if topic_validation_reason is None:
+            topic_validation_reason = str(e)
 
     # Enforce non-overlapping targets for 7-day horizon: sample timestamps at least 168h apart
     def _non_overlapping_mask(idx: pd.DatetimeIndex, hours: int) -> pd.Series:
@@ -2174,61 +2546,6 @@ def main() -> int:
             idx_fallback = _to_naive_utc_index(pd.DatetimeIndex(idx))
             return pd.Series([True] * len(idx_fallback), index=idx_fallback, dtype=bool)
 
-    # --- DEBUG: Print data stats before/after filtering ---
-    # (moved after full_data is assigned)
-
-    # 3) Load pipeline config if available
-    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "pipeline.yaml")
-    cfg: Dict[str, Any] = {}
-    if yaml and os.path.exists(cfg_path):
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as fh:
-                loaded: Any = yaml.safe_load(fh) or {}
-                if isinstance(loaded, dict):
-                    cfg = cast(Dict[str, Any], loaded)
-                else:
-                    cfg = {}
-        except (OSError, IOError, UnicodeDecodeError) as e:
-            print(f"Warning: failed to load config/pipeline.yaml: {e}")
-
-    # Allow CLI args to override defaults but prefer config when present
-    data_cfg: Dict[str, Any] = cfg.get("data", {})
-    from_month: str = str(data_cfg.get("from_month", args.from_month))
-
-    # Schedule configuration
-    sched_cfg: Dict[str, Any] = cfg.get("schedule", {})
-    mode: str = str(args.schedule_mode or sched_cfg.get("mode", "single"))
-    cadence: str = str(args.cadence or sched_cfg.get("cadence", "1h"))
-    start_raw: str = str(args.start_utc or sched_cfg.get("start", "2025-09-16T13:00:00Z"))
-    end_raw: str = str(args.end_utc or sched_cfg.get("end", "2025-12-15T13:00:00Z"))
-    def _parse_utc(ts: str) -> pd.Timestamp:
-        t = pd.Timestamp(ts)
-        if getattr(t, "tz", None) is None:
-            return t.tz_localize("UTC")
-        return t.tz_convert("UTC")
-    start_utc = _parse_utc(start_raw)
-    end_utc = _parse_utc(end_raw)
-    # 7-day horizon (168h) implied by target_length; kept for readability in comments
-    # Current time reference isn't used for clipping since we anchor to competition end
-    # As-of selection: CLI --as-of overrides; else default to the competition end for full-range training
-    if args.as_of:
-        as_of = _parse_utc(args.as_of)
-    elif args.as_of_now:
-        # Snap as_of to current UTC top-of-hour
-        try:
-            as_of = pd.Timestamp.now(tz="UTC").floor(cadence or "1h")
-        except (ValueError, TypeError, AttributeError):
-            as_of = pd.Timestamp.now(tz="UTC").floor("1h")
-    else:
-        # Use competition end by default to avoid premature clipping to 'now'
-        as_of = end_utc
-    # Snap to cadence (hourly) to avoid off-boundary timestamps
-    try:
-        as_of = as_of.floor(cadence or "1h")
-    except (ValueError, TypeError, AttributeError):
-        as_of = as_of.floor("1h")
-    print(f"Schedule: mode={mode} cadence={cadence} start={start_utc} end={end_utc} as_of={as_of}")
-
     # Strict competition window filtering (inclusive) with effective end bound = min(config end, last labeled ts)
     start_naive: pd.Timestamp = _to_naive_utc_ts(start_utc)
     end_naive: pd.Timestamp = _to_naive_utc_ts(end_utc)
@@ -2253,10 +2570,22 @@ def main() -> int:
     # Since target was computed before clipping, full_data contains only rows with valid future_close
     effective_last_t = _max_dt
     desired_last_t = end_naive
-    if effective_last_t is not None and effective_last_t < desired_last_t:
+    if effective_last_t is not None:
+        try:
+            effective_last_cmp = _to_naive_utc_ts(pd.Timestamp(effective_last_t))
+        except Exception:
+            effective_last_cmp = pd.Timestamp(effective_last_t)
+        try:
+            desired_last_cmp = _to_naive_utc_ts(pd.Timestamp(desired_last_t)) if desired_last_t is not None else None
+        except Exception:
+            desired_last_cmp = desired_last_t
+    else:
+        effective_last_cmp = None
+        desired_last_cmp = desired_last_t
+    if effective_last_cmp is not None and desired_last_cmp is not None and effective_last_cmp < desired_last_cmp:
         print(
             "WARNING: Available labeled data ends before the competition end. "
-            f"last_labeled_t={effective_last_t} < end={desired_last_t}. "
+            f"last_labeled_t={effective_last_cmp} < end={desired_last_cmp}. "
             "This typically occurs because source data beyond t+7d isn't available yet."
         )
 
@@ -2524,9 +2853,18 @@ def main() -> int:
 
     # 5) Feature selection: ensure aligned numeric columns across splits with debug logs
     def _print_cols(df: pd.DataFrame, name: str) -> None:
-        # Diagnostic only; avoid broad exception catching
+        """Log a truncated list of column names to avoid gigantic stdout lines."""
         cols = list(df.columns)
-        print(f"{name} columns ({len(cols)}): {cols}")
+        if not cols:
+            print(f"{name} columns (0): []")
+            return
+        max_preview = 25
+        preview = cols[:max_preview]
+        remainder = len(cols) - len(preview)
+        preview_str = ", ".join(str(c) for c in preview)
+        if remainder > 0:
+            preview_str = f"{preview_str}, ... (+{remainder} more)"
+        print(f"{name} columns ({len(cols)}): [{preview_str}]")
 
     _print_cols(X_train, "X_train")
     _print_cols(X_val, "X_val")
@@ -2915,6 +3253,34 @@ def main() -> int:
         except (OSError, IOError, ValueError, json.JSONDecodeError):
             pre_log10_loss = None
 
+        if not args.force_submit and not (topic_validation_ok and topic_validation_funded and topic_validation_epoch):
+            reason = topic_validation_reason or "topic_validation_failed"
+            skip_msg = (
+                "Submission skipped: topic is not rewardable or active due to: "
+                f"{reason}"
+            )
+            print(skip_msg)
+            logging.warning(skip_msg)
+            try:
+                ws_now_tv = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
+                wallet_log = _resolve_wallet_for_logging(root_dir)
+                _log_submission(
+                    root_dir,
+                    ws_now_tv,
+                    int(topic_id_cfg or 67),
+                    live_value,
+                    wallet_log,
+                    None,
+                    None,
+                    False,
+                    0,
+                    "skipped_topic_not_ready",
+                    pre_log10_loss,
+                )
+            except Exception:
+                pass
+            return 0
+
         # Cooldown guard: avoid EMA collisions by limiting one success per 600s window
         def _seconds_since_last_success(csv_path: str) -> Optional[int]:
             try:
@@ -3047,6 +3413,43 @@ def main() -> int:
 
         # Lifecycle: gate by Active and Churnable states per Allora Topic Life Cycle
         lifecycle = _compute_lifecycle_state(int(topic_id_cfg or 67))
+        global _LAST_TOPIC_ACTIVE_STATE
+        current_active = bool(lifecycle.get("is_active", False))
+        is_rewardable = bool(lifecycle.get("is_rewardable", False))
+        inactive_reasons = lifecycle.get("inactive_reasons") or []
+        churn_reasons = lifecycle.get("churn_reasons") or []
+        activity_snapshot = lifecycle.get("activity_snapshot") or {}
+
+        reps_raw = activity_snapshot.get("reputers_count")
+        try:
+            reputers_count = int(float(reps_raw)) if reps_raw is not None else None
+        except (TypeError, ValueError):
+            reputers_count = None
+        unfulfilled_raw = lifecycle.get("unfulfilled")
+        try:
+            unfulfilled_int = int(float(unfulfilled_raw)) if unfulfilled_raw is not None else None
+        except (TypeError, ValueError):
+            unfulfilled_int = None
+
+        lifecycle_report = (
+            "Lifecycle diagnostics:\n"
+            f"  is_active={current_active}\n"
+            f"  is_rewardable={is_rewardable}\n"
+            f"  inactive_reasons={inactive_reasons}\n"
+            f"  churn_reasons={churn_reasons}\n"
+            f"  reputers_count={reputers_count}\n"
+            f"  unfulfilled={unfulfilled_int}\n"
+            f"  activity_snapshot={activity_snapshot}"
+        )
+        print(lifecycle_report)
+        logging.info(lifecycle_report)
+
+        previous_active = _LAST_TOPIC_ACTIVE_STATE
+        if current_active and previous_active is not True:
+            msg_active = "Topic now active — submitting"
+            print(msg_active)
+            logging.info(msg_active)
+        _LAST_TOPIC_ACTIVE_STATE = current_active
         # Also enforce topic-creation parameter compatibility and funding before submission
         topic_validation = _validate_topic_creation_and_funding(int(topic_id_cfg or 67), EXPECTED_TOPIC_67)
         if not bool(topic_validation.get("funded", False)):
@@ -3079,13 +3482,61 @@ def main() -> int:
                 json.dump(lifecycle, lf, indent=2)
         except Exception:
             pass
-        # Check Active (funding+stake+reputers)
-        if not args.force_submit and not lifecycle.get("is_active", False):
-            print("submit: topic not Active (insufficient effective revenue/stake/reputers); skipping submission")
-            logging.warning("Topic 67 is not active (insufficient effective revenue/stake/reputers); skipping submission")
+        # Check Active (funding+stake+reputers) and rewardability/nonce hygiene
+        reps_for_skip = reputers_count
+        unfulfilled_for_skip = unfulfilled_int
+        should_skip = (
+            not current_active
+            or not is_rewardable
+            or reps_for_skip is None
+            or reps_for_skip < 1
+            or (unfulfilled_for_skip is not None and unfulfilled_for_skip > 0)
+        )
+        if not args.force_submit and should_skip:
+            snapshot = activity_snapshot
+            eff = snapshot.get("effective_revenue")
+            stk = snapshot.get("delegated_stake")
+            reps = snapshot.get("reputers_count")
+            reason_list = [str(r) for r in inactive_reasons if r]
+            if (reps_for_skip is None or reps_for_skip < 1) and "reputers missing" not in reason_list:
+                reason_list.append("reputers missing")
+            if unfulfilled_for_skip is not None and unfulfilled_for_skip > 0:
+                reason_list.append(f"unfulfilled_nonces:{unfulfilled_for_skip}")
+            if not is_rewardable and "not_rewardable" not in reason_list:
+                reason_list.append("not_rewardable")
+            reason_str = ", ".join(reason_list) if reason_list else "unknown"
+            skip_msg = (
+                "Submission skipped: topic is not rewardable or active due to: "
+                f"{reason_str}"
+            )
+            print(skip_msg)
+            logging.warning(skip_msg)
+            wait_msg = (
+                "Waiting for topic to activate: "
+                f"effective_revenue={eff} delegated_stake={stk} reputers_count={reps} "
+                f"unfulfilled={unfulfilled_for_skip}; Will retry next loop."
+            )
+            print(wait_msg)
+            logging.info(wait_msg)
             try:
-                w = intended_env or _resolve_wallet_for_logging(root_dir)
-                _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "inactive_insufficient_funding_or_stake", pre_log10_loss)
+                detailed_status = "skipped_topic_not_ready"
+                try:
+                    wallet_for_log = intended_env or _resolve_wallet_for_logging(root_dir)
+                except Exception:
+                    wallet_for_log = intended_env
+                _log_submission(
+                    root_dir,
+                    ws_now,
+                    int(topic_id_cfg or 67),
+                    live_value,
+                    wallet_for_log,
+                    None,
+                    None,
+                    False,
+                    0,
+                    detailed_status,
+                    pre_log10_loss,
+                )
             except Exception:
                 pass
             return 0
@@ -3105,6 +3556,28 @@ def main() -> int:
         _env_wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
         if _env_wallet and not _env_wallet.endswith("6vma"):
             print(f"Warning: ALLORA_WALLET_ADDR does not end with '6vma' (got ...{_env_wallet[-4:]}); ensure correct worker wallet is configured.", file=sys.stderr)
+        helper_result = _submit_via_external_helper(
+            int(topic_id_cfg or 67),
+            float(live_value),
+            root_dir,
+            pre_log10_loss,
+            int(args.submit_timeout),
+        )
+        if helper_result is not None:
+            helper_rc, helper_success = helper_result
+            if helper_success:
+                try:
+                    _update_window_lock(root_dir, cadence_s, intended_env)
+                except Exception:
+                    pass
+                try:
+                    _post_submit_backfill(root_dir, tail=20, attempts=3, delay_s=2.0)
+                except Exception:
+                    pass
+                return helper_rc
+            else:
+                print("submit(helper): external helper failed, falling back to direct client submission", file=sys.stderr)
+
         api_key = _require_api_key()
         # Prefer client-based submit to guarantee forecast, fallback to SDK worker if client path fails
         rc_client = asyncio.run(_submit_with_client_xgb(int(topic_id_cfg or 67), float(live_value), root_dir, pre_log10_loss, args.force_submit))
@@ -3131,6 +3604,76 @@ def main() -> int:
         except (OSError, IOError, ValueError, RuntimeError):
             pass
         return rc
+
+    return 0
+
+def main() -> int:
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    cfg = _load_pipeline_config(root_dir)
+    parser = argparse.ArgumentParser(description="Train model and emit predictions.json for Topic 67 (7-day BTC/USD log-return)")
+    parser.add_argument("--from-month", default="2025-01")
+    parser.add_argument("--schedule-mode", default=None, help="Schedule mode (single, loop, etc.)")
+    parser.add_argument("--cadence", default=None, help="Cadence for scheduling (e.g., 1h)")
+    parser.add_argument("--start-utc", default=None, help="Start datetime in UTC (ISO format)")
+    parser.add_argument("--end-utc", default=None, help="End datetime in UTC (ISO format)")
+    parser.add_argument("--as-of", default=None, help="As-of datetime in UTC (ISO format)")
+    parser.add_argument("--as-of-now", action="store_true", help="Use current UTC time as as_of")
+    parser.add_argument("--submit", action="store_true", help="Submit the prediction after training")
+    parser.add_argument("--submit-timeout", type=int, default=30, help="Timeout for submission in seconds")
+    parser.add_argument("--submit-retries", type=int, default=3, help="Number of retries for submission")
+    parser.add_argument("--force-submit", action="store_true", help="Force submission even if guards are active")
+    parser.add_argument("--loop", action="store_true", help="Continuously run training/submission cycles based on cadence")
+    parser.add_argument("--once", action="store_true", help="Run exactly one iteration even if config requests loop")
+    parser.add_argument("--timeout", type=int, default=0, help="Loop runtime limit in seconds (0 runs indefinitely)")
+    args = parser.parse_args()
+    data_cfg: Dict[str, Any] = cfg.get("data", {})
+    args.from_month = str(data_cfg.get("from_month", args.from_month))
+    sched_cfg: Dict[str, Any] = cfg.get("schedule", {})
+    mode_cfg = str(args.schedule_mode or sched_cfg.get("mode", "single"))
+    if getattr(args, "once", False):
+        effective_mode = "once"
+    elif args.loop or mode_cfg.lower() == "loop":
+        effective_mode = "loop"
+    else:
+        effective_mode = mode_cfg
+    if effective_mode.lower() == "loop":
+        cadence = "1h"
+    else:
+        cadence = str(args.cadence or sched_cfg.get("cadence", "1h"))
+    setattr(args, "_effective_mode", effective_mode)
+    setattr(args, "_effective_cadence", cadence)
+    cadence_s = _parse_cadence(cadence)
+    def _run_once() -> int:
+        return run_pipeline(args, cfg, root_dir)
+    if effective_mode.lower() != "loop":
+        return _run_once()
+    iteration = 0
+    loop_timeout = max(0, int(getattr(args, "timeout", 0) or 0))
+    start_wall = time.time()
+    _sleep_until_next_window(cadence_s)
+    last_rc = 0
+    while True:
+        if loop_timeout and (time.time() - start_wall) >= loop_timeout:
+            logging.info("[loop] timeout reached before next iteration; exiting loop")
+            return last_rc
+        iteration += 1
+        logging.info(f"[loop] iteration={iteration} start")
+        rc = _run_once()
+        last_rc = rc
+        logging.info(f"[loop] iteration={iteration} completed with rc={rc}")
+        now_utc = pd.Timestamp.now(tz="UTC")
+        window_start = _window_start_utc(now=now_utc, cadence_s=cadence_s)
+        next_window = window_start + pd.Timedelta(seconds=cadence_s)
+        sleep_seconds = max(0.0, (next_window - now_utc).total_seconds())
+        logging.info(f"[loop] sleeping {sleep_seconds:.1f}s until {next_window.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        try:
+            time.sleep(sleep_seconds)
+        except KeyboardInterrupt:
+            logging.info("[loop] received KeyboardInterrupt; exiting loop")
+            return rc
+        if loop_timeout and (time.time() - start_wall) >= loop_timeout:
+            logging.info("[loop] timeout reached after iteration; exiting loop")
+            return last_rc
 
     return 0
 
