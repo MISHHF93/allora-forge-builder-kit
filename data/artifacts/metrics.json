@@ -1,6 +1,7 @@
 {
-  "log10_loss": null,
-  "source": "none",
-  "warning": "insufficient ground truth (<2 samples)",
-  "n": 0
+  "log10_loss": -4.532563940577067,
+  "source": "validation",
+  "mae": 0.000628199428319931,
+  "mse": 6.158579786419427e-07,
+  "n": 2
 }
