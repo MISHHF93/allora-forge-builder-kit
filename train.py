@@ -603,6 +603,9 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
 
     status = _run_allorad_json(["q", "emissions", "topic-status", str(int(topic_id))]) or {}
     info = _run_allorad_json(["q", "emissions", "topic-info", str(int(topic_id))]) or {}
+    active_query = _run_allorad_json(["q", "emissions", "is-topic-active", str(int(topic_id))]) or {}
+    fee_query = _run_allorad_json(["q", "emissions", "topic-fee-revenue", str(int(topic_id))]) or {}
+    stake_query = _run_allorad_json(["q", "emissions", "topic-stake", str(int(topic_id))]) or {}
     fallback_topic: Dict[str, Any] = {}
     if not info:
         fallback_topic = _run_allorad_json(["q", "emissions", "topic", str(int(topic_id))]) or {}
@@ -611,6 +614,9 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
         "topic_status": status,
         "topic_info": info,
         "topic": fallback_topic,
+        "topic_active": active_query,
+        "topic_fee": fee_query,
+        "topic_stake": stake_query,
     }
 
     def _deep_find(obj: Any, keys: List[str]) -> Optional[Any]:
@@ -643,23 +649,95 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
                 return None
         return None
 
+    def _to_bool(x: Any) -> Optional[bool]:
+        if isinstance(x, bool):
+            return x
+        if isinstance(x, (int, float)):
+            return bool(x)
+        if isinstance(x, str):
+            s = x.strip().lower()
+            if s in ("true", "1", "yes", "y", "active"):
+                return True
+            if s in ("false", "0", "no", "n", "inactive"):
+                return False
+        return None
+
     eff_rev = _deep_find(combined, ["effective_revenue", "effectiveRevenue", "revenue", "effective"])
-    del_stk = _deep_find(combined, ["delegated_stake", "delegatedStake", "stake_delegated"])
-    reputers = _deep_find(combined, ["reputers_count", "reputersCount", "reputers", "n_reputers"])
+    del_stk = _deep_find(
+        combined,
+        [
+            "delegated_stake",
+            "delegatedStake",
+            "stake_delegated",
+            "delegated",
+            "delegatedAmount",
+            "delegatedStakeAmount",
+        ],
+    )
+    reputer_stake = _deep_find(combined, ["reputer_stake", "reputerStake", "staked_reputers", "reputer_staked"])
+    reputers = _deep_find(
+        combined,
+        [
+            "reputers_count",
+            "reputersCount",
+            "reputers",
+            "n_reputers",
+            "reputerCount",
+            "reputersLength",
+        ],
+    )
     weight = _deep_find(combined, ["weight", "topic_weight", "score_weight"])
     last_update = _deep_find(combined, ["last_update_height", "lastUpdateHeight", "last_update_time", "lastUpdateTime"])
+    active_flag = _deep_find(
+        combined,
+        [
+            "is_topic_active",
+            "isTopicActive",
+            "is_active",
+            "isActive",
+            "active",
+            "result",
+            "value",
+            "topic_active",
+        ],
+    )
+    if active_flag is None and active_query not in ({}, None):
+        active_flag = active_query
+
+    rep_count: Optional[int] = None
+    if isinstance(reputers, (list, tuple, set)):
+        rep_count = len(reputers)
+    elif reputers not in (None, ""):
+        try:
+            rep_count = int(str(reputers))
+        except Exception:
+            try:
+                rep_count = int(float(reputers))
+            except Exception:
+                rep_count = None
 
     out: Dict[str, Any] = {
         "raw": combined,
         "topic_status_raw": status if status else None,
         "topic_info_raw": info if info else None,
         "topic_fallback_raw": fallback_topic if fallback_topic else None,
+        "is_topic_active": _to_bool(active_flag),
         "effective_revenue": _to_float(eff_rev),
         "delegated_stake": _to_float(del_stk),
-        "reputers_count": int(reputers) if reputers is not None else None,
+        "reputer_stake": _to_float(reputer_stake),
+        "reputers_count": rep_count,
         "weight": _to_float(weight),
         "last_update": last_update,
     }
+    eff = out.get("effective_revenue")
+    stk = out.get("delegated_stake") or out.get("reputer_stake")
+    if eff is not None and eff > 0 and stk is not None and stk > 0:
+        try:
+            out["weight_estimate"] = float(stk) ** 0.5 * float(eff) ** 0.5
+        except Exception:
+            out["weight_estimate"] = None
+    else:
+        out["weight_estimate"] = None
     return out
 
 
@@ -873,6 +951,13 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
     eff = info.get("effective_revenue")
     stk = info.get("delegated_stake")
     reps = info.get("reputers_count")
+    weight_est = info.get("weight_estimate") or info.get("weight")
+    min_weight_env = os.getenv("ALLORA_TOPIC_MIN_WEIGHT", "0")
+    try:
+        min_weight = max(0.0, float(min_weight_env))
+    except Exception:
+        min_weight = 0.0
+
     inactive_reasons: List[str] = []
     inactive_codes: List[str] = []
     if eff is None:
@@ -893,6 +978,13 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
     elif reps < 1:
         inactive_reasons.append("reputers missing")
         inactive_codes.append("reputers_below_minimum")
+    if eff is not None and eff > 0 and stk is not None and stk > 0:
+        if weight_est is None:
+            inactive_reasons.append("weight unavailable")
+            inactive_codes.append("weight_missing")
+        elif weight_est <= min_weight:
+            inactive_reasons.append("weight below threshold")
+            inactive_codes.append("weight_below_minimum")
 
     is_active = len(inactive_codes) == 0
     # Churnable criteria: at least one epoch elapsed since last update and sufficiently high weight rank
@@ -936,6 +1028,8 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
             "effective_revenue": eff,
             "delegated_stake": stk,
             "reputers_count": reps,
+            "weight_estimate": weight_est,
+            "min_weight": min_weight,
         },
         "churn_reasons": reason_churn,
     }
@@ -3363,26 +3457,32 @@ def run_pipeline(args, cfg, root_dir) -> int:
             reps = snapshot.get("reputers_count")
             reason_list = [str(r) for r in inactive_reasons if r]
             reason_str = ", ".join(reason_list) if reason_list else "unknown"
-            snap_str = (
-                f"effective_revenue={eff} delegated_stake={stk} reputers_count={reps}"
-            )
+            snap_parts = [
+                f"effective_revenue={eff}",
+                f"delegated_stake={stk}",
+                f"reputers_count={reps}",
+                f"weight_estimate={snapshot.get('weight_estimate')}",
+                f"min_weight={snapshot.get('min_weight')}",
+            ]
+            snap_str = " ".join(snap_parts)
             msg = (
-                "submit: topic not Active; "
-                f"reasons={reason_str}; snapshot={snap_str}; skipping submission"
+                "Skipping submission: topic not active — "
+                f"{reason_str}; metrics=({snap_str}). Will retry next loop."
             )
             print(msg)
             logging.warning(msg)
             try:
-                detailed_status = "skipped_due_to_topic_status"
-                if reason_list:
-                    reason_suffix = ";".join(reason_list)
-                    detailed_status = f"{detailed_status}:{reason_suffix}"
+                detailed_status = "skipped_topic_not_active"
+                try:
+                    wallet_for_log = intended_env or _resolve_wallet_for_logging(root_dir)
+                except Exception:
+                    wallet_for_log = intended_env
                 _log_submission(
                     root_dir,
                     ws_now,
                     int(topic_id_cfg or 67),
                     live_value,
-                    "skipped",
+                    wallet_for_log,
                     None,
                     None,
                     False,
