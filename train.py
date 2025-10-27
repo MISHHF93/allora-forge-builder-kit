@@ -3410,6 +3410,22 @@ def run_pipeline(args, cfg, root_dir) -> int:
         lifecycle = _compute_lifecycle_state(int(topic_id_cfg or 67))
         global _LAST_TOPIC_ACTIVE_STATE
         current_active = bool(lifecycle.get("is_active", False))
+        is_rewardable = bool(lifecycle.get("is_rewardable", False))
+        inactive_reasons = lifecycle.get("inactive_reasons") or []
+        churn_reasons = lifecycle.get("churn_reasons") or []
+        activity_snapshot = lifecycle.get("activity_snapshot") or {}
+
+        lifecycle_report = (
+            "Lifecycle diagnostics:\n"
+            f"  is_active={current_active}\n"
+            f"  is_rewardable={is_rewardable}\n"
+            f"  inactive_reasons={inactive_reasons}\n"
+            f"  churn_reasons={churn_reasons}\n"
+            f"  activity_snapshot={activity_snapshot}"
+        )
+        print(lifecycle_report)
+        logging.info(lifecycle_report)
+
         previous_active = _LAST_TOPIC_ACTIVE_STATE
         if current_active and previous_active is not True:
             msg_active = "Topic now active — submitting"
@@ -3449,30 +3465,29 @@ def run_pipeline(args, cfg, root_dir) -> int:
         except Exception:
             pass
         # Check Active (funding+stake+reputers)
-        if not args.force_submit and not current_active:
-            inactive_reasons = lifecycle.get("inactive_reasons") or []
-            snapshot = lifecycle.get("activity_snapshot") or {}
+        if not args.force_submit and (not current_active or not is_rewardable):
+            snapshot = activity_snapshot
             eff = snapshot.get("effective_revenue")
             stk = snapshot.get("delegated_stake")
             reps = snapshot.get("reputers_count")
             reason_list = [str(r) for r in inactive_reasons if r]
+            if not is_rewardable and "not_rewardable" not in reason_list:
+                reason_list.append("not_rewardable")
             reason_str = ", ".join(reason_list) if reason_list else "unknown"
-            snap_parts = [
-                f"effective_revenue={eff}",
-                f"delegated_stake={stk}",
-                f"reputers_count={reps}",
-                f"weight_estimate={snapshot.get('weight_estimate')}",
-                f"min_weight={snapshot.get('min_weight')}",
-            ]
-            snap_str = " ".join(snap_parts)
-            msg = (
-                "Skipping submission: topic not active — "
-                f"{reason_str}; metrics=({snap_str}). Will retry next loop."
+            skip_msg = (
+                "Submission skipped: topic is not rewardable or active due to: "
+                f"{reason_str}"
             )
-            print(msg)
-            logging.warning(msg)
+            print(skip_msg)
+            logging.warning(skip_msg)
+            wait_msg = (
+                "Waiting for topic to activate: "
+                f"effective_revenue={eff} delegated_stake={stk} reputers_count={reps}; Will retry next loop."
+            )
+            print(wait_msg)
+            logging.info(wait_msg)
             try:
-                detailed_status = "skipped_topic_not_active"
+                detailed_status = "skipped_inactive_topic"
                 try:
                     wallet_for_log = intended_env or _resolve_wallet_for_logging(root_dir)
                 except Exception:
