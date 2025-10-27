@@ -540,28 +540,101 @@ def _current_block_height(timeout: int = 15) -> Optional[int]:
 
 
 # --- Topic lifecycle and emissions params helpers ---------------------------------
-def _run_allorad_json(args: List[str], timeout: int = 20) -> Optional[Dict[str, Any]]:
+def _run_allorad_json(args: List[str], timeout: int = 20, label: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Run an allorad CLI query with JSON output, --node and --trace, return parsed JSON or None.
     This is a best-effort helper and will not raise on failures."""
     cmd = ["allorad"] + [str(a) for a in args] + ["--node", str(DEFAULT_RPC), "--output", "json", "--trace"]
+    label = label or " ".join(str(a) for a in args)
     try:
         cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
         out = (cp.stdout or cp.stderr or "").strip()
+        if cp.returncode not in (0, None):
+            logging.warning("allorad query failed (%s): rc=%s stderr=%s", label, cp.returncode, (cp.stderr or "").strip())
         if not out:
+            logging.debug("allorad query produced no output (%s)", label)
             return None
         try:
-            return cast(Dict[str, Any], json.loads(out))
+            data = cast(Dict[str, Any], json.loads(out))
+            logging.debug("allorad query success (%s) keys=%s", label, list(data.keys()) if isinstance(data, dict) else type(data))
+            return data
         except Exception:
             # Some builds print JSON to stderr; try swapping
             try:
-                return cast(Dict[str, Any], json.loads(cp.stderr or "{}"))
-            except Exception:
+                data = cast(Dict[str, Any], json.loads(cp.stderr or "{}"))
+                logging.debug("allorad query parsed from stderr (%s) keys=%s", label, list(data.keys()) if isinstance(data, dict) else type(data))
+                return data
+            except Exception as exc:
+                logging.warning("Failed to parse allorad JSON (%s): %s", label, exc)
                 return None
     except FileNotFoundError:
-        print("Warning: allorad CLI not found; lifecycle checks limited")
+        msg = "Warning: allorad CLI not found; lifecycle checks limited"
+        logging.warning(msg)
+        print(msg)
         return None
-    except Exception:
+    except subprocess.TimeoutExpired as exc:
+        logging.warning("allorad query timeout (%s): %ss", label, exc.timeout)
         return None
+    except Exception as exc:
+        logging.warning("allorad query error (%s): %s", label, exc)
+        return None
+
+
+def _deep_find_any(obj: Any, keys: List[str]) -> Optional[Any]:
+    """Recursively search for the first value whose key (case insensitive) is in keys.
+
+    Handles nested dict/list/tuple/set objects and tries to decode JSON strings when possible.
+    """
+
+    if not keys:
+        return None
+
+    target_keys = {str(k).lower() for k in keys if k is not None}
+    if not target_keys:
+        return None
+
+    seen: Set[int] = set()
+
+    def _walk(node: Any) -> Optional[Any]:
+        node_id = id(node)
+        if node_id in seen:
+            return None
+        seen.add(node_id)
+
+        if isinstance(node, dict):
+            for k, v in node.items():
+                key_l = str(k).lower()
+                if key_l in target_keys:
+                    return v
+                # Attempt to parse embedded JSON payloads in strings
+                if isinstance(v, str):
+                    v_stripped = v.strip()
+                    if v_stripped.startswith("{") or v_stripped.startswith("["):
+                        try:
+                            parsed = json.loads(v_stripped)
+                            r = _walk(parsed)
+                            if r is not None:
+                                return r
+                        except Exception:
+                            pass
+                r = _walk(v)
+                if r is not None:
+                    return r
+        elif isinstance(node, (list, tuple, set)):
+            for item in node:
+                r = _walk(item)
+                if r is not None:
+                    return r
+        elif isinstance(node, str):
+            val = node.strip()
+            if val.startswith("{") or val.startswith("["):
+                try:
+                    parsed = json.loads(val)
+                    return _walk(parsed)
+                except Exception:
+                    return None
+        return None
+
+    return _walk(obj)
 
 
 def _get_emissions_params() -> Dict[str, Any]:
@@ -601,52 +674,141 @@ def _get_emissions_params() -> Dict[str, Any]:
 def _get_topic_info(topic_id: int) -> Dict[str, Any]:
     """Query topic status/info, normalizing effective_revenue, delegated_stake, reputers_count, weight, last_update."""
 
-    status = _run_allorad_json(["q", "emissions", "topic-status", str(int(topic_id))]) or {}
-    info = _run_allorad_json(["q", "emissions", "topic-info", str(int(topic_id))]) or {}
-    active_query = _run_allorad_json(["q", "emissions", "is-topic-active", str(int(topic_id))]) or {}
-    fee_query = _run_allorad_json(["q", "emissions", "topic-fee-revenue", str(int(topic_id))]) or {}
-    stake_query = _run_allorad_json(["q", "emissions", "topic-stake", str(int(topic_id))]) or {}
-    fallback_topic: Dict[str, Any] = {}
-    if not info:
-        fallback_topic = _run_allorad_json(["q", "emissions", "topic", str(int(topic_id))]) or {}
+    topic_int = int(topic_id)
+    topic_str = str(topic_int)
 
-    combined: Dict[str, Any] = {
-        "topic_status": status,
-        "topic_info": info,
-        "topic": fallback_topic,
-        "topic_active": active_query,
-        "topic_fee": fee_query,
-        "topic_stake": stake_query,
-    }
+    cli_specs: List[Tuple[str, List[str]]] = [
+        ("topic_status", ["q", "emissions", "topic-status", topic_str]),
+        ("topic_info", ["q", "emissions", "topic-info", topic_str]),
+        ("topic", ["q", "emissions", "topic", topic_str]),
+        ("topic_active", ["q", "emissions", "is-topic-active", topic_str]),
+        ("topic_fee", ["q", "emissions", "topic-fee-revenue", topic_str]),
+        ("topic_stake", ["q", "emissions", "topic-stake", topic_str]),
+        ("topic_stake_delegations", ["q", "emissions", "topic-stake-delegations", topic_str]),
+        ("topic_reputers", ["q", "emissions", "topic-reputers", topic_str]),
+        ("topic_minimum_stake", ["q", "emissions", "topic-minimum-stake", topic_str]),
+        ("topic_rewards", ["q", "emissions", "topic-rewardable", topic_str]),
+    ]
 
-    def _deep_find(obj: Any, keys: List[str]) -> Optional[Any]:
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if k in keys:
-                    return v
-                r = _deep_find(v, keys)
-                if r is not None:
-                    return r
-        if isinstance(obj, list):
-            for it in obj:
-                r = _deep_find(it, keys)
-                if r is not None:
-                    return r
-        return None
+    cli_results: Dict[str, Any] = {}
+    cli_debug: List[Dict[str, Any]] = []
+
+    for label, args in cli_specs:
+        data = _run_allorad_json(args, label=f"{label}:{topic_str}")
+        entry: Dict[str, Any] = {"label": label, "args": args}
+        if data:
+            cli_results[label] = data
+            entry["status"] = "ok"
+            if isinstance(data, dict):
+                entry["keys"] = list(data.keys())[:10]
+        else:
+            entry["status"] = "empty"
+        cli_debug.append(entry)
+
+    rest_results: Dict[str, Any] = {}
+    rest_debug: List[Dict[str, Any]] = []
+    rest_base = _derive_rest_base_from_rpc(DEFAULT_RPC)
+    rest_paths: List[Tuple[str, str]] = []
+    if rest_base:
+        rest_paths = [
+            ("rest_topic", f"{rest_base}/allora/emissions/topic/{topic_str}"),
+            ("rest_topic_status", f"{rest_base}/allora/emissions/topic/{topic_str}/status"),
+            ("rest_topic_stake", f"{rest_base}/allora/emissions/topic/{topic_str}/stake"),
+            ("rest_topic_reputers", f"{rest_base}/allora/emissions/topic/{topic_str}/reputers"),
+            ("rest_topic_summary", f"{rest_base}/emissions/topic/{topic_str}"),
+        ]
+
+    for label, url in rest_paths:
+        attempt_entry: Dict[str, Any] = {"label": label, "url": url}
+        for attempt in range(2):
+            try:
+                resp = requests.get(url, timeout=8)
+                attempt_entry.setdefault("attempts", []).append({"attempt": attempt + 1, "status_code": resp.status_code})
+                if resp.status_code != 200:
+                    logging.warning("REST query non-200 (%s): status=%s", label, resp.status_code)
+                    continue
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = {"raw": resp.text[:512]}
+                rest_results[label] = payload
+                attempt_entry["status"] = "ok"
+                break
+            except requests.RequestException as exc:
+                logging.warning("REST query error (%s): %s", label, exc)
+                attempt_entry.setdefault("errors", []).append(str(exc))
+                time.sleep(0.5)
+        rest_debug.append(attempt_entry)
+
+    combined: Dict[str, Any] = {**cli_results, **rest_results}
+    combined["query_debug"] = {"cli": cli_debug, "rest": rest_debug}
 
     def _to_float(x: Any) -> Optional[float]:
-        try:
-            f = float(x)
-            return f if np.isfinite(f) else None
-        except Exception:
+        if isinstance(x, (int, float)) and np.isfinite(float(x)):
+            return float(x)
+        if isinstance(x, np.generic):  # type: ignore[attr-defined]
             try:
-                # parse coin strings like "123uallo"
-                s = str(x)
-                num = "".join(ch for ch in s if (ch.isdigit() or ch == "."))
-                if num:
-                    return float(num)
+                f = float(x)
+                return f if np.isfinite(f) else None
             except Exception:
                 return None
+        if isinstance(x, str):
+            s = x.strip()
+            if not s:
+                return None
+            if s.startswith("{") or s.startswith("["):
+                try:
+                    parsed = json.loads(s)
+                    return _to_float(parsed)
+                except Exception:
+                    pass
+            try:
+                return float(s)
+            except Exception:
+                digits = re.findall(r"-?\d+(?:\.\d+)?", s)
+                if not digits:
+                    return None
+                try:
+                    val = float(digits[0])
+                except Exception:
+                    return None
+                denom = re.sub(r"-?\d+(?:\.\d+)?", "", s).lower()
+                if "uallo" in denom:
+                    return val / 1e6
+                if "nallo" in denom:
+                    return val / 1e9
+                return val
+        if isinstance(x, dict):
+            if "denom" in x and x.get("amount") not in (None, ""):
+                amount = _to_float(x.get("amount"))
+                if amount is None:
+                    return None
+                denom = str(x.get("denom", "")).lower()
+                if "uallo" in denom:
+                    return amount / 1e6
+                if "nallo" in denom:
+                    return amount / 1e9
+                return amount
+            for key in (
+                "amount",
+                "value",
+                "quantity",
+                "total",
+                "total_stake",
+                "totalStake",
+                "delegated_amount",
+                "delegatedAmount",
+                "staked",
+                "stake",
+            ):
+                if key in x:
+                    val = _to_float(x[key])
+                    if val is not None:
+                        return val
+        if isinstance(x, (list, tuple, set)):
+            vals = [v for v in (_to_float(v) for v in x) if v is not None]
+            if vals:
+                return float(np.sum(vals))
         return None
 
     def _to_bool(x: Any) -> Optional[bool]:
@@ -662,85 +824,149 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
                 return False
         return None
 
-    eff_rev = _deep_find(combined, ["effective_revenue", "effectiveRevenue", "revenue", "effective"])
-    del_stk = _deep_find(
+    def _first_positive_float(*vals: Any) -> Optional[float]:
+        for v in vals:
+            if v in (None, ""):
+                continue
+            f = _to_float(v)
+            if f is not None and np.isfinite(f) and f > 0:
+                return float(f)
+        return None
+
+    eff_rev = _deep_find_any(
+        combined,
+        [
+            "effective_revenue",
+            "effectiverevenue",
+            "revenue",
+            "effective",
+            "fee_revenue",
+            "feerevenue",
+            "topic_revenue",
+        ],
+    )
+    delegated_numeric = _deep_find_any(
         combined,
         [
             "delegated_stake",
-            "delegatedStake",
+            "delegatedstake",
             "stake_delegated",
             "delegated",
-            "delegatedAmount",
-            "delegatedStakeAmount",
+            "delegatedamount",
+            "delegatedstakeamount",
+            "total_delegated",
+            "totaldelegated",
+            "total_stake",
+            "totalstake",
+            "reputerstake",
         ],
     )
-    reputer_stake = _deep_find(combined, ["reputer_stake", "reputerStake", "staked_reputers", "reputer_staked"])
-    min_stake_candidate = _deep_find(
+    delegations_list = _deep_find_any(
+        combined,
+        [
+            "delegations",
+            "topic_delegations",
+            "topicdelegations",
+            "stakes",
+            "delegators",
+            "delegated_stakers",
+        ],
+    )
+    reputer_stake = _deep_find_any(
+        combined,
+        ["reputer_stake", "reputerstake", "staked_reputers", "reputer_staked"],
+    )
+    min_stake_candidate = _deep_find_any(
         combined,
         [
             "min_delegation",
             "minimum_delegation",
-            "minDelegation",
-            "minimumDelegation",
+            "mindele",
+            "minimumdelegation",
             "min_stake",
             "minimum_stake",
-            "minStake",
-            "minimumStake",
-            "requiredDelegation",
+            "minstake",
+            "minimumstake",
+            "requireddelegation",
             "required_delegation",
-            "requiredDelegatedStake",
+            "requireddelegatedstake",
             "required_delegated_stake",
-            "minimumDelegatedStake",
+            "minimumdelegatedstake",
             "minimum_delegated_stake",
             "stake_minimum",
-            "stakeMinimum",
-            "minBond",
+            "stakeminimum",
+            "minbond",
             "min_bond",
+            "minimum_required_stake",
+            "minimumrequiredstake",
         ],
     )
-    required_delegate_candidate = _deep_find(
+    required_delegate_candidate = _deep_find_any(
         combined,
         [
-            "requiredDelegation",
+            "requireddelegation",
             "required_delegation",
-            "requiredDelegatedStake",
+            "requireddelegatedstake",
             "required_delegated_stake",
-            "requiredStake",
+            "requiredstake",
             "required_stake",
+            "delegation_required",
         ],
     )
-    reputers = _deep_find(
+    reputers = _deep_find_any(
         combined,
         [
             "reputers_count",
-            "reputersCount",
+            "reputerscount",
             "reputers",
             "n_reputers",
-            "reputerCount",
-            "reputersLength",
+            "reputercount",
+            "reputerslength",
+            "participant_count",
+            "participantcount",
+            "active_reputers",
+            "activereputers",
+            "reputer_addresses",
         ],
     )
-    weight = _deep_find(combined, ["weight", "topic_weight", "score_weight"])
-    last_update = _deep_find(combined, ["last_update_height", "lastUpdateHeight", "last_update_time", "lastUpdateTime"])
-    active_flag = _deep_find(
+    weight = _deep_find_any(combined, ["weight", "topic_weight", "score_weight", "topicweight"])
+    last_update = _deep_find_any(
+        combined,
+        ["last_update_height", "lastupdateheight", "last_update_time", "lastupdatetime", "last_height"],
+    )
+    active_flag = _deep_find_any(
         combined,
         [
             "is_topic_active",
-            "isTopicActive",
+            "istopicactive",
             "is_active",
-            "isActive",
+            "isactive",
             "active",
             "result",
             "value",
             "topic_active",
         ],
     )
-    if active_flag is None and active_query not in ({}, None):
-        active_flag = active_query
+    if active_flag is None and cli_results.get("topic_active") not in ({}, None):
+        active_flag = cli_results.get("topic_active")
 
     rep_count: Optional[int] = None
     if isinstance(reputers, (list, tuple, set)):
         rep_count = len(reputers)
+    elif isinstance(reputers, dict):
+        # Attempt to locate array-like fields inside dictionary
+        for key in ("addresses", "list", "items", "reputers"):
+            val = reputers.get(key)
+            if isinstance(val, (list, tuple, set)):
+                rep_count = len(val)
+                break
+        if rep_count is None:
+            scalar = _deep_find_any(reputers, ["count", "length", "size"])
+            if scalar is not None:
+                try:
+                    rep_count = int(float(scalar))
+                except Exception:
+                    rep_count = None
     elif reputers not in (None, ""):
         try:
             rep_count = int(str(reputers))
@@ -750,14 +976,29 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
             except Exception:
                 rep_count = None
 
-    def _first_positive_float(*vals: Any) -> Optional[float]:
-        for v in vals:
-            if v in (None, ""):
-                continue
-            f = _to_float(v)
-            if f is not None and np.isfinite(f):
-                return float(f)
-        return None
+    # Sum delegation list if needed
+    if delegations_list is not None and isinstance(delegations_list, (list, tuple, set)):
+        delegation_values: List[float] = []
+        for entry in delegations_list:
+            amount = None
+            if isinstance(entry, dict):
+                amount = _deep_find_any(
+                    entry,
+                    [
+                        "amount",
+                        "delegated_amount",
+                        "delegatedAmount",
+                        "stake",
+                        "value",
+                    ],
+                )
+            if amount is None:
+                amount = entry
+            parsed = _to_float(amount)
+            if parsed is not None:
+                delegation_values.append(parsed)
+        if delegation_values:
+            delegated_numeric = float(np.sum(delegation_values))
 
     min_stake_env = None
     env_val = os.getenv("ALLORA_TOPIC_MIN_STAKE")
@@ -767,20 +1008,22 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
         except Exception:
             min_stake_env = None
 
+    eff_float = _to_float(eff_rev)
+    delegated_float = _to_float(delegated_numeric)
+    reputer_stake_float = _to_float(reputer_stake)
+
     out: Dict[str, Any] = {
         "raw": combined,
-        "topic_status_raw": status if status else None,
-        "topic_info_raw": info if info else None,
-        "topic_fallback_raw": fallback_topic if fallback_topic else None,
         "is_topic_active": _to_bool(active_flag),
-        "effective_revenue": _to_float(eff_rev),
-        "delegated_stake": _to_float(del_stk),
-        "reputer_stake": _to_float(reputer_stake),
+        "effective_revenue": eff_float,
+        "delegated_stake": delegated_float,
+        "reputer_stake": reputer_stake_float,
         "reputers_count": rep_count,
         "weight": _to_float(weight),
         "last_update": last_update,
         "required_delegated_stake": _to_float(required_delegate_candidate),
         "min_delegated_stake": _first_positive_float(min_stake_candidate, required_delegate_candidate, min_stake_env),
+        "query_debug": combined.get("query_debug"),
     }
     eff = out.get("effective_revenue")
     stk = out.get("delegated_stake") or out.get("reputer_stake")
@@ -791,6 +1034,16 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
             out["weight_estimate"] = None
     else:
         out["weight_estimate"] = None
+
+    if out.get("delegated_stake") is None or out.get("reputers_count") is None:
+        logging.warning(
+            "Topic %s lifecycle probe missing fields: delegated_stake=%s reputers_count=%s (attempts=%s)",
+            topic_str,
+            out.get("delegated_stake"),
+            out.get("reputers_count"),
+            json.dumps(out.get("query_debug"), default=str)[:512],
+        )
+
     return out
 
 
@@ -806,19 +1059,7 @@ def _fetch_topic_config(topic_id: int) -> Dict[str, Any]:
     merged: Dict[str, Any] = {"a": j1, "b": j2}
     def _deep_find(obj: Any, *names: str) -> Optional[Any]:
         names_l = [n for n in names if n]
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if k in names_l:
-                    return v
-                r = _deep_find(v, *names_l)
-                if r is not None:
-                    return r
-        if isinstance(obj, list):
-            for it in obj:
-                r = _deep_find(it, *names_l)
-                if r is not None:
-                    return r
-        return None
+        return _deep_find_any(obj, names_l)
     def _to_bool(x: Any) -> Optional[bool]:
         if isinstance(x, bool):
             return x
