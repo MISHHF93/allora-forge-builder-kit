@@ -165,7 +165,10 @@ def assert_submission_log_schema() -> None:
         )
 
 
-def run_iteration(train_args: Sequence[str], *, offline: bool, keep_artifacts: bool) -> None:
+def run_iteration(
+    train_args: Sequence[str], *, offline: bool, keep_artifacts: bool, expect_submission: bool
+) -> None:
+    expect_submission = expect_submission or any(arg == "--submit" for arg in train_args)
     ensure_api_key(offline=offline)
     if not keep_artifacts:
         cleanup_artifacts([METRICS_PATH, PREDICTIONS_PATH, MODEL_PATH])
@@ -189,6 +192,19 @@ def run_iteration(train_args: Sequence[str], *, offline: bool, keep_artifacts: b
         raise AssertionError("predictions.json missing required keys")
 
     assert_submission_log_schema()
+
+    if expect_submission:
+        df = pd.read_csv(SUBMISSION_LOG_PATH)
+        if df.empty:
+            raise AssertionError("Expected a submission_log.csv row when --submit is used")
+        last = df.iloc[-1]
+        status = str(last.get("status", ""))
+        success_flag = bool(last.get("success", False))
+        if not success_flag and status != "skipped_topic_not_ready":
+            raise AssertionError(
+                "Submission status mismatch. Expected 'skipped_topic_not_ready' for skipped submissions,"
+                f" observed '{status}'."
+            )
 
     print(
         "[OK] iteration complete — log10_loss={} topic_id={} value={}".format(
@@ -239,7 +255,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     offline = not args.online
     for idx in range(1, args.iterations + 1):
         print(f"[INFO] Starting iteration {idx}/{args.iterations} (offline={offline})")
-        run_iteration(train_args, offline=offline, keep_artifacts=args.keep_artifacts)
+        run_iteration(
+            train_args,
+            offline=offline,
+            keep_artifacts=args.keep_artifacts,
+            expect_submission=args.submit,
+        )
     print("[INFO] All iterations completed successfully.")
     return 0
 

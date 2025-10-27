@@ -3255,7 +3255,12 @@ def run_pipeline(args, cfg, root_dir) -> int:
 
         if not args.force_submit and not (topic_validation_ok and topic_validation_funded and topic_validation_epoch):
             reason = topic_validation_reason or "topic_validation_failed"
-            logging.warning(f"Topic validation guard active; skipping submission because {reason}")
+            skip_msg = (
+                "Submission skipped: topic is not rewardable or active due to: "
+                f"{reason}"
+            )
+            print(skip_msg)
+            logging.warning(skip_msg)
             try:
                 ws_now_tv = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
                 wallet_log = _resolve_wallet_for_logging(root_dir)
@@ -3269,7 +3274,7 @@ def run_pipeline(args, cfg, root_dir) -> int:
                     None,
                     False,
                     0,
-                    f"topic_validation:{reason}",
+                    "skipped_topic_not_ready",
                     pre_log10_loss,
                 )
             except Exception:
@@ -3415,12 +3420,25 @@ def run_pipeline(args, cfg, root_dir) -> int:
         churn_reasons = lifecycle.get("churn_reasons") or []
         activity_snapshot = lifecycle.get("activity_snapshot") or {}
 
+        reps_raw = activity_snapshot.get("reputers_count")
+        try:
+            reputers_count = int(float(reps_raw)) if reps_raw is not None else None
+        except (TypeError, ValueError):
+            reputers_count = None
+        unfulfilled_raw = lifecycle.get("unfulfilled")
+        try:
+            unfulfilled_int = int(float(unfulfilled_raw)) if unfulfilled_raw is not None else None
+        except (TypeError, ValueError):
+            unfulfilled_int = None
+
         lifecycle_report = (
             "Lifecycle diagnostics:\n"
             f"  is_active={current_active}\n"
             f"  is_rewardable={is_rewardable}\n"
             f"  inactive_reasons={inactive_reasons}\n"
             f"  churn_reasons={churn_reasons}\n"
+            f"  reputers_count={reputers_count}\n"
+            f"  unfulfilled={unfulfilled_int}\n"
             f"  activity_snapshot={activity_snapshot}"
         )
         print(lifecycle_report)
@@ -3464,13 +3482,26 @@ def run_pipeline(args, cfg, root_dir) -> int:
                 json.dump(lifecycle, lf, indent=2)
         except Exception:
             pass
-        # Check Active (funding+stake+reputers)
-        if not args.force_submit and (not current_active or not is_rewardable):
+        # Check Active (funding+stake+reputers) and rewardability/nonce hygiene
+        reps_for_skip = reputers_count
+        unfulfilled_for_skip = unfulfilled_int
+        should_skip = (
+            not current_active
+            or not is_rewardable
+            or reps_for_skip is None
+            or reps_for_skip < 1
+            or (unfulfilled_for_skip is not None and unfulfilled_for_skip > 0)
+        )
+        if not args.force_submit and should_skip:
             snapshot = activity_snapshot
             eff = snapshot.get("effective_revenue")
             stk = snapshot.get("delegated_stake")
             reps = snapshot.get("reputers_count")
             reason_list = [str(r) for r in inactive_reasons if r]
+            if (reps_for_skip is None or reps_for_skip < 1) and "reputers missing" not in reason_list:
+                reason_list.append("reputers missing")
+            if unfulfilled_for_skip is not None and unfulfilled_for_skip > 0:
+                reason_list.append(f"unfulfilled_nonces:{unfulfilled_for_skip}")
             if not is_rewardable and "not_rewardable" not in reason_list:
                 reason_list.append("not_rewardable")
             reason_str = ", ".join(reason_list) if reason_list else "unknown"
@@ -3482,12 +3513,13 @@ def run_pipeline(args, cfg, root_dir) -> int:
             logging.warning(skip_msg)
             wait_msg = (
                 "Waiting for topic to activate: "
-                f"effective_revenue={eff} delegated_stake={stk} reputers_count={reps}; Will retry next loop."
+                f"effective_revenue={eff} delegated_stake={stk} reputers_count={reps} "
+                f"unfulfilled={unfulfilled_for_skip}; Will retry next loop."
             )
             print(wait_msg)
             logging.info(wait_msg)
             try:
-                detailed_status = "skipped_inactive_topic"
+                detailed_status = "skipped_topic_not_ready"
                 try:
                     wallet_for_log = intended_env or _resolve_wallet_for_logging(root_dir)
                 except Exception:
