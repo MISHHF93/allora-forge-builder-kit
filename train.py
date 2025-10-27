@@ -351,6 +351,28 @@ def _has_submitted_this_hour(log_path: str, window_timestamp: pd.Timestamp) -> b
     return False
 
 
+def _has_submitted_for_nonce(log_path: str, nonce: int) -> bool:
+    """Check if we already have a successful submission for a specific nonce/epoch."""
+    try:
+        if not os.path.exists(log_path):
+            return False
+        import csv as _csv
+        with open(log_path, "r", encoding="utf-8") as fh:
+            r = _csv.DictReader(fh)
+            for row in r:
+                if (row.get("success", "").strip().lower() in ("true", "1")):
+                    row_nonce = row.get("nonce", "").strip()
+                    if row_nonce and row_nonce != "null":
+                        try:
+                            if int(row_nonce) == nonce:
+                                return True
+                        except (ValueError, TypeError):
+                            continue
+    except (OSError, IOError, ValueError):
+        return False
+    return False
+
+
 def _resolve_wallet_for_logging(root_dir: str) -> Optional[str]:
     env_wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
     if env_wallet:
@@ -678,16 +700,14 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
     topic_str = str(topic_int)
 
     cli_specs: List[Tuple[str, List[str]]] = [
-        ("topic_status", ["q", "emissions", "topic-status", topic_str]),
-        ("topic_info", ["q", "emissions", "topic-info", topic_str]),
         ("topic", ["q", "emissions", "topic", topic_str]),
         ("topic_active", ["q", "emissions", "is-topic-active", topic_str]),
         ("topic_fee", ["q", "emissions", "topic-fee-revenue", topic_str]),
         ("topic_stake", ["q", "emissions", "topic-stake", topic_str]),
-        ("topic_stake_delegations", ["q", "emissions", "topic-stake-delegations", topic_str]),
-        ("topic_reputers", ["q", "emissions", "topic-reputers", topic_str]),
-        ("topic_minimum_stake", ["q", "emissions", "topic-minimum-stake", topic_str]),
-        ("topic_rewards", ["q", "emissions", "topic-rewardable", topic_str]),
+        ("active_reputers", ["q", "emissions", "active-reputers", topic_str]),
+        ("unfulfilled_worker", ["q", "emissions", "unfulfilled-worker-nonces", topic_str]),
+        ("unfulfilled_reputer", ["q", "emissions", "unfulfilled-reputer-nonces", topic_str]),
+        ("emissions_params", ["q", "emissions", "params"]),
     ]
 
     cli_results: Dict[str, Any] = {}
@@ -833,34 +853,75 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
                 return float(f)
         return None
 
-    eff_rev = _deep_find_any(
-        combined,
-        [
-            "effective_revenue",
-            "effectiverevenue",
-            "revenue",
-            "effective",
-            "fee_revenue",
-            "feerevenue",
-            "topic_revenue",
-        ],
-    )
-    delegated_numeric = _deep_find_any(
-        combined,
-        [
-            "delegated_stake",
-            "delegatedstake",
-            "stake_delegated",
-            "delegated",
-            "delegatedamount",
-            "delegatedstakeamount",
-            "total_delegated",
-            "totaldelegated",
-            "total_stake",
-            "totalstake",
-            "reputerstake",
-        ],
-    )
+    # Extract specific values from known response formats
+    eff_rev = None
+    weight = None
+    delegated_stake = None
+    rep_count = None
+    active_flag = None
+    
+    # Parse topic query response
+    topic_data = cli_results.get("topic", {})
+    if isinstance(topic_data, dict):
+        eff_rev = topic_data.get("effective_revenue")
+        weight = topic_data.get("weight")
+        
+    # Parse topic-stake query response 
+    stake_data = cli_results.get("topic_stake", {})
+    if isinstance(stake_data, dict):
+        stake_amount = stake_data.get("amount")
+        if stake_amount is not None:
+            delegated_stake = stake_amount
+    
+    # Parse active-reputers query response
+    reputers_data = cli_results.get("active_reputers", {})
+    if isinstance(reputers_data, dict):
+        # Try various ways the reputers might be returned
+        if "reputers" in reputers_data:
+            reputers_list = reputers_data["reputers"]
+            if isinstance(reputers_list, list):
+                rep_count = len(reputers_list)
+        elif "addresses" in reputers_data:
+            addresses_list = reputers_data["addresses"]
+            if isinstance(addresses_list, list):
+                rep_count = len(addresses_list)
+    elif isinstance(reputers_data, list):
+        rep_count = len(reputers_data)
+    
+    # Fallback to deep search for other fields
+    if eff_rev is None:
+        eff_rev = _deep_find_any(
+            combined,
+            [
+                "effective_revenue",
+                "effectiverevenue", 
+                "revenue",
+                "effective",
+                "fee_revenue",
+                "feerevenue",
+                "topic_revenue",
+            ],
+        )
+    
+    if delegated_stake is None:
+        delegated_numeric = _deep_find_any(
+            combined,
+            [
+                "amount",  # from topic-stake response
+                "delegated_stake",
+                "delegatedstake",
+                "stake_delegated", 
+                "delegated",
+                "delegatedamount",
+                "delegatedstakeamount",
+                "total_delegated",
+                "totaldelegated",
+                "total_stake",
+                "totalstake",
+                "reputerstake",
+            ],
+        )
+        delegated_stake = delegated_numeric
     delegations_list = _deep_find_any(
         combined,
         [
@@ -913,27 +974,8 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
             "delegation_required",
         ],
     )
-    reputers = _deep_find_any(
-        combined,
-        [
-            "reputers_count",
-            "reputerscount",
-            "reputers",
-            "n_reputers",
-            "reputercount",
-            "reputerslength",
-            "participant_count",
-            "participantcount",
-            "active_reputers",
-            "activereputers",
-            "reputer_addresses",
-        ],
-    )
-    weight = _deep_find_any(combined, ["weight", "topic_weight", "score_weight", "topicweight"])
-    last_update = _deep_find_any(
-        combined,
-        ["last_update_height", "lastupdateheight", "last_update_time", "lastupdatetime", "last_height"],
-    )
+    
+    # Extract active flag early for use in reputer count estimation
     active_flag = _deep_find_any(
         combined,
         [
@@ -949,32 +991,96 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
     )
     if active_flag is None and cli_results.get("topic_active") not in ({}, None):
         active_flag = cli_results.get("topic_active")
-
-    rep_count: Optional[int] = None
-    if isinstance(reputers, (list, tuple, set)):
-        rep_count = len(reputers)
-    elif isinstance(reputers, dict):
-        # Attempt to locate array-like fields inside dictionary
-        for key in ("addresses", "list", "items", "reputers"):
-            val = reputers.get(key)
-            if isinstance(val, (list, tuple, set)):
-                rep_count = len(val)
-                break
-        if rep_count is None:
-            scalar = _deep_find_any(reputers, ["count", "length", "size"])
-            if scalar is not None:
+    
+    # Extract reputers count if not already found
+    if rep_count is None:
+        reputers = _deep_find_any(
+            combined,
+            [
+                "reputers_count",
+                "reputerscount",
+                "reputers",
+                "n_reputers",
+                "reputercount",
+                "reputerslength",
+                "participant_count",
+                "participantcount",
+                "active_reputers",
+                "activereputers",
+                "reputer_addresses",
+            ],
+        )
+        
+        if isinstance(reputers, (list, tuple, set)):
+            rep_count = len(reputers)
+        elif isinstance(reputers, dict):
+            # Attempt to locate array-like fields inside dictionary
+            for key in ("addresses", "list", "items", "reputers"):
+                val = reputers.get(key)
+                if isinstance(val, (list, tuple, set)):
+                    rep_count = len(val)
+                    break
+            if rep_count is None:
+                scalar = _deep_find_any(reputers, ["count", "length", "size"])
+                if scalar is not None:
+                    try:
+                        rep_count = int(float(scalar))
+                    except Exception:
+                        rep_count = None
+        elif reputers not in (None, ""):
+            try:
+                rep_count = int(str(reputers))
+            except Exception:
                 try:
-                    rep_count = int(float(scalar))
+                    rep_count = int(float(reputers))
                 except Exception:
                     rep_count = None
-    elif reputers not in (None, ""):
+    
+    # Estimate reputer count when direct data unavailable but topic appears operational
+    if rep_count is None:
+        # Look for indicators that reputers exist
+        active_reputer_quantile = _deep_find_any(combined, ["active_reputer_quantile", "activereputer_quantile"])
+        has_stake = delegated_stake is not None and _to_float(delegated_stake) > 0
+        has_revenue = eff_rev is not None and _to_float(eff_rev) > 0
+        is_active = _to_bool(active_flag)
+        
+        # Check if topic-quantile-reputer-score command returned data
+        quantile_result = None
         try:
-            rep_count = int(str(reputers))
+            # Try the quantile query that we know works
+            node_param = "--node https://allora-testnet-rpc.polkachu.com:443"
+            cmd = f"allorad q emissions topic-quantile-reputer-score {topic_str} {node_param}"
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=15
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                import json
+                try:
+                    quantile_data = json.loads(result.stdout.strip())
+                    if quantile_data.get("value") and float(quantile_data["value"]) > 0:
+                        quantile_result = True
+                except:
+                    pass
         except Exception:
-            try:
-                rep_count = int(float(reputers))
-            except Exception:
-                rep_count = None
+            pass
+        
+        # Estimate reputer count based on evidence
+        if quantile_result or (active_reputer_quantile and _to_float(active_reputer_quantile) > 0):
+            # If we have quantile data, there must be reputers
+            rep_count = 1  # Conservative minimum estimate
+            logging.info(f"Topic {topic_str}: Estimated reputers_count={rep_count} based on quantile evidence")
+        elif has_stake and has_revenue and is_active:
+            # Topic is functional with substantial stake/revenue, likely has reputers
+            rep_count = 1  # Conservative minimum estimate 
+            logging.info(f"Topic {topic_str}: Estimated reputers_count={rep_count} based on operational evidence")
+        else:
+            logging.info(f"Topic {topic_str}: No evidence of reputers found")
+    if weight is None:
+        weight = _deep_find_any(combined, ["weight", "topic_weight", "score_weight", "topicweight"])
+    last_update = _deep_find_any(
+        combined,
+        ["last_update_height", "lastupdateheight", "last_update_time", "lastupdatetime", "last_height"],
+    )
 
     # Sum delegation list if needed
     if delegations_list is not None and isinstance(delegations_list, (list, tuple, set)):
@@ -998,7 +1104,7 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
             if parsed is not None:
                 delegation_values.append(parsed)
         if delegation_values:
-            delegated_numeric = float(np.sum(delegation_values))
+            delegated_stake = float(np.sum(delegation_values))
 
     min_stake_env = None
     env_val = os.getenv("ALLORA_TOPIC_MIN_STAKE")
@@ -1008,8 +1114,21 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
         except Exception:
             min_stake_env = None
 
+    # Extract network-wide minimum stake from emissions parameters
+    network_min_stake = None
+    emissions_params = cli_results.get("emissions_params", {})
+    if isinstance(emissions_params, dict):
+        params_data = emissions_params.get("params", {})
+        if isinstance(params_data, dict):
+            required_min_stake = params_data.get("required_minimum_stake")
+            if required_min_stake is not None:
+                try:
+                    network_min_stake = float(required_min_stake)
+                except Exception:
+                    network_min_stake = None
+
     eff_float = _to_float(eff_rev)
-    delegated_float = _to_float(delegated_numeric)
+    delegated_float = _to_float(delegated_stake)
     reputer_stake_float = _to_float(reputer_stake)
 
     out: Dict[str, Any] = {
@@ -1022,7 +1141,7 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
         "weight": _to_float(weight),
         "last_update": last_update,
         "required_delegated_stake": _to_float(required_delegate_candidate),
-        "min_delegated_stake": _first_positive_float(min_stake_candidate, required_delegate_candidate, min_stake_env),
+        "min_delegated_stake": _first_positive_float(min_stake_candidate, required_delegate_candidate, min_stake_env, network_min_stake),
         "query_debug": combined.get("query_debug"),
     }
     eff = out.get("effective_revenue")
@@ -1764,15 +1883,9 @@ async def _submit_with_sdk(topic_id: int, value: float, api_key: str, timeout_s:
                                 _log_submission(root_dir, ws, topic_id, value, wallet_str, None, None, False, 3, "not_whitelisted")
                                 return 3
                             if "cannot update ema more than once per window" in low:
-                                # Treat as duplicate-success for logging purposes
-                                ws = _window_start_utc(cadence_s=cadence_s)
-                                loss_to_log = last_loss if (last_loss is not None) else pre_log10_loss
-                                _log_submission(root_dir, ws, topic_id, value, wallet_str, last_nonce, last_tx, False, 0, "duplicate_window", loss_to_log, last_score, last_reward)
-                                try:
-                                    _update_window_lock(root_dir, cadence_s, wallet_str)
-                                except Exception:
-                                    pass
-                                return 0
+                                # Re-raise as RuntimeError to be handled by the main exception handler
+                                # This ensures consistent handling and messaging
+                                raise RuntimeError(msg)
                             else:
                                 print(f"Worker error: {msg}", file=sys.stderr)
                                 continue
@@ -1846,6 +1959,8 @@ async def _submit_with_sdk(topic_id: int, value: float, api_key: str, timeout_s:
         except (RuntimeError, ValueError, OSError, TimeoutError) as e:
             msg = str(e)
             if "cannot update ema more than once per window" in msg.lower():
+                print("INFO: Submission rejected - already submitted for this epoch/window")
+                print("TIP: This is normal behavior to prevent duplicate submissions")
                 ws = _window_start_utc(cadence_s=cadence_s)
                 # If SDK didn't provide a loss, fall back to precomputed metric for traceability
                 loss_to_log = last_loss if (last_loss is not None) else pre_log10_loss
@@ -3769,15 +3884,25 @@ def run_pipeline(args, cfg, root_dir) -> int:
             except Exception:
                 pass
             return 0
+
+        # Additional blockchain-level duplicate check to prevent EMA errors
+        # This applies even with --force-submit to avoid blockchain rejections
         intended_env = os.getenv("ALLORA_WALLET_ADDR", "").strip() or None
-        if (not args.force_submit) and _guard_already_submitted_this_window(root_dir, cadence_s, intended_env):
-            print("submit: skipped; already submitted in current window (guard)")
-            try:
-                w = intended_env or _resolve_wallet_for_logging(root_dir)
-                _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "skipped_window")
-            except Exception:
-                pass
-            return 0
+        try:
+            topic_info = _run_allorad_json(["q", "emissions", "topic", str(int(topic_id_cfg or 67))]) or {}
+            last_epoch = topic_info.get("topic", {}).get("epoch_last_ended")
+            if last_epoch:
+                # Check if we already have a successful submission for this epoch
+                if _has_submitted_for_nonce(log_csv, int(last_epoch)):
+                    print(f"submit: skipped; already submitted for current epoch {last_epoch} (blockchain protection)")
+                    try:
+                        w = intended_env or _resolve_wallet_for_logging(root_dir)
+                        _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, last_epoch, None, False, 0, "epoch_already_submitted")
+                    except Exception:
+                        pass
+                    return 0
+        except Exception as e:
+            logging.warning(f"Could not check blockchain epoch status: {e}")
 
         # Lifecycle: gate by Active and Churnable states per Allora Topic Life Cycle
         lifecycle = _compute_lifecycle_state(int(topic_id_cfg or 67))
