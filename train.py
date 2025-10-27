@@ -3377,10 +3377,6 @@ def run_pipeline(args, cfg, root_dir) -> int:
                 if reason_list:
                     reason_suffix = ";".join(reason_list)
                     detailed_status = f"{detailed_status}:{reason_suffix}"
-                detailed_status = "skipped_due_to_topic_status"
-                if reason_list:
-                    reason_suffix = ";".join(reason_list)
-                    detailed_status = f"{detailed_status}:{reason_suffix}"
                 _log_submission(
                     root_dir,
                     ws_now,
