@@ -179,6 +179,11 @@ CHAIN_ID = os.getenv("ALLORA_CHAIN_ID", "allora-testnet-1")
 DEFAULT_TOPIC_ID = 67
 DEFAULT_RPC = os.getenv("ALLORA_RPC_URL") or os.getenv("ALLORA_NODE") or "https://allora-rpc.testnet.allora.network"
 
+# Cache expensive topic configuration fetches so repeated lifecycle checks do not
+# overwhelm the node. This is intentionally simple – the configuration is
+# effectively static during a run so we never need to invalidate it.
+_TOPIC_CONFIG_CACHE: Dict[int, Dict[str, Any]] = {}
+
 
 def _derive_rest_base_from_rpc(rpc_url: str) -> str:
     """Best-effort derive REST base URL from an RPC URL.
@@ -1222,6 +1227,17 @@ def _fetch_topic_config(topic_id: int) -> Dict[str, Any]:
     return out
 
 
+def _get_topic_config_cached(topic_id: int) -> Dict[str, Any]:
+    """Return a cached topic configuration to avoid redundant CLI queries."""
+    global _TOPIC_CONFIG_CACHE
+    if topic_id not in _TOPIC_CONFIG_CACHE:
+        try:
+            _TOPIC_CONFIG_CACHE[topic_id] = _fetch_topic_config(topic_id)
+        except Exception:
+            _TOPIC_CONFIG_CACHE[topic_id] = {}
+    return _TOPIC_CONFIG_CACHE.get(topic_id, {})
+
+
 def _validate_topic_creation_and_funding(topic_id: int, expected: Dict[str, Any]) -> Dict[str, Any]:
     """Validate that the topic exists, has sane parameters aligned with expectations, and is funded.
     Returns a result dict: { ok: bool, funded: bool, mismatches: [..], fields: {..}, info: {..} } and prints concise reasons.
@@ -1357,9 +1373,86 @@ def _get_unfulfilled_nonces_count(topic_id: int) -> Optional[int]:
 def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
     params = _get_emissions_params()
     info = _get_topic_info(topic_id)
+    topic_cfg = _get_topic_config_cached(topic_id)
     rank, total = _get_weights_rank(topic_id)
     unfulfilled = _get_unfulfilled_nonces_count(topic_id)
     epoch_len = params.get("epoch_length")
+
+    def _to_positive_int(val: Any) -> Optional[int]:
+        try:
+            n = int(float(val))
+            return n if n > 0 else None
+        except Exception:
+            return None
+
+    submission_window_blocks: Optional[int] = None
+    env_window = os.getenv("ALLORA_SUBMISSION_WINDOW_BLOCKS")
+    if env_window:
+        submission_window_blocks = _to_positive_int(env_window)
+    if submission_window_blocks is None and isinstance(topic_cfg, dict):
+        submission_window_blocks = _to_positive_int(topic_cfg.get("worker_submission_window"))
+
+    raw_info = info.get("raw") if isinstance(info, dict) else None
+    last_epoch_candidate: Optional[Any] = None
+    if isinstance(raw_info, dict):
+        last_epoch_candidate = _deep_find_any(
+            raw_info,
+            [
+                "epoch_last_ended",
+                "epochLastEnded",
+                "last_epoch_ended",
+                "lastEpochEnded",
+                "epoch_last_end",
+                "epochLastEnd",
+                "last_epoch",
+                "epoch_last",
+            ],
+        )
+    last_epoch_end: Optional[int]
+    try:
+        last_epoch_end = int(str(last_epoch_candidate)) if last_epoch_candidate is not None else None
+    except Exception:
+        last_epoch_end = None
+
+    try:
+        current_block_height = _current_block_height()
+        current_block_height = int(current_block_height) if current_block_height is not None else None
+    except Exception:
+        current_block_height = None
+
+    blocks_since_epoch: Optional[int] = None
+    epoch_progress: Optional[int] = None
+    blocks_remaining: Optional[int] = None
+    window_open: Optional[bool] = None
+    window_confident = False
+    epoch_len_int = _to_positive_int(epoch_len)
+    if (
+        epoch_len_int is not None
+        and submission_window_blocks is not None
+        and submission_window_blocks > 0
+        and isinstance(last_epoch_end, int)
+        and isinstance(current_block_height, int)
+    ):
+        window_confident = True
+        blocks_since_epoch = max(0, int(current_block_height) - int(last_epoch_end))
+        epoch_progress = blocks_since_epoch % epoch_len_int
+        blocks_remaining = epoch_len_int - epoch_progress
+        if blocks_remaining <= 0:
+            blocks_remaining += epoch_len_int
+        window_open = 0 < blocks_remaining <= int(submission_window_blocks)
+
+    submission_window_state: Dict[str, Any] = {
+        "epoch_length": epoch_len_int,
+        "window_size": submission_window_blocks,
+        "last_epoch_end": last_epoch_end,
+        "current_block": current_block_height,
+        "blocks_since_last_epoch_end": blocks_since_epoch,
+        "epoch_progress": epoch_progress,
+        "blocks_remaining_in_epoch": blocks_remaining,
+        "confidence": bool(window_confident),
+        "is_open": window_open if window_open is not None else None,
+    }
+
     # Active criteria: effective revenue and delegated stake positive; reputers >=1
     eff = info.get("effective_revenue")
     stk = info.get("delegated_stake")
@@ -1422,7 +1515,7 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
             last_up = int(str(info.get("last_update")))
         except Exception:
             last_up = None
-        cur_h = _current_block_height() or None
+        cur_h = current_block_height
         if last_up is not None and cur_h is not None and cur_h - last_up >= int(epoch_len):
             is_churnable = True
         else:
@@ -1450,6 +1543,8 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
         "inactive_reason_codes": inactive_codes,
         "is_churnable": bool(is_churnable),
         "is_rewardable": bool(is_rewardable),
+        "submission_window_open": window_open if window_open is not None else None,
+        "submission_window": submission_window_state,
         "activity_snapshot": {
             "effective_revenue": eff,
             "delegated_stake": stk,
@@ -3912,6 +4007,9 @@ def run_pipeline(args, cfg, root_dir) -> int:
         inactive_reasons = lifecycle.get("inactive_reasons") or []
         churn_reasons = lifecycle.get("churn_reasons") or []
         activity_snapshot = lifecycle.get("activity_snapshot") or {}
+        submission_window_state = lifecycle.get("submission_window") or {}
+        window_is_open = submission_window_state.get("is_open")
+        window_confident = bool(submission_window_state.get("confidence"))
 
         reps_raw = activity_snapshot.get("reputers_count")
         try:
@@ -3938,13 +4036,16 @@ def run_pipeline(args, cfg, root_dir) -> int:
             "Lifecycle diagnostics:\n"
             f"  is_active={current_active}\n"
             f"  is_rewardable={is_rewardable}\n"
+            f"  submission_window_open={window_is_open}\n"
+            f"  submission_window_confidence={window_confident}\n"
             f"  inactive_reasons={inactive_reasons}\n"
             f"  churn_reasons={churn_reasons}\n"
             f"  reputers_count={reputers_count}\n"
             f"  delegated_stake={delegated_stake_val}\n"
             f"  min_delegated_stake={min_delegate_val}\n"
             f"  unfulfilled={unfulfilled_int}\n"
-            f"  activity_snapshot={activity_snapshot}"
+            f"  activity_snapshot={activity_snapshot}\n"
+            f"  submission_window_state={submission_window_state}"
         )
         print(lifecycle_report)
         logging.info(lifecycle_report)
@@ -3994,7 +4095,7 @@ def run_pipeline(args, cfg, root_dir) -> int:
         min_stake_for_skip = min_delegate_val
         should_skip = (
             not current_active
-            or not is_rewardable
+            or (window_confident and window_is_open is False)
             or reps_for_skip is None
             or reps_for_skip < 1
             or (unfulfilled_for_skip is not None and unfulfilled_for_skip > 0)
@@ -4025,11 +4126,17 @@ def run_pipeline(args, cfg, root_dir) -> int:
                 and "stake below minimum requirement" not in reason_list
             ):
                 reason_list.append("stake below minimum requirement")
-            if not is_rewardable and "not_rewardable" not in reason_list:
-                reason_list.append("not_rewardable")
+            if window_confident and window_is_open is False:
+                remaining = submission_window_state.get("blocks_remaining_in_epoch")
+                if isinstance(remaining, int):
+                    reason_list.append(f"submission_window_closed(remaining={remaining})")
+                else:
+                    reason_list.append("submission_window_closed")
+            if (not window_confident) and window_is_open is False and "submission_window_closed" not in reason_list:
+                reason_list.append("submission_window_closed")
             reason_str = ", ".join(reason_list) if reason_list else "unknown"
             skip_msg = (
-                "Submission skipped: topic is not rewardable or active due to: "
+                "Submission skipped: topic not ready for submission due to: "
                 f"{reason_str}"
             )
             print(skip_msg)
@@ -4037,7 +4144,9 @@ def run_pipeline(args, cfg, root_dir) -> int:
             wait_msg = (
                 "Waiting for topic to activate: "
                 f"effective_revenue={eff} delegated_stake={stk} reputers_count={reps} "
-                f"min_required_stake={min_req} unfulfilled={unfulfilled_for_skip}; Will retry next loop."
+                f"min_required_stake={min_req} unfulfilled={unfulfilled_for_skip} "
+                f"window_open={window_is_open} window_confidence={window_confident} "
+                f"blocks_remaining={submission_window_state.get('blocks_remaining_in_epoch')}; Will retry next loop."
             )
             print(wait_msg)
             logging.info(wait_msg)
