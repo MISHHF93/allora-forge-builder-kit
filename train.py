@@ -1344,7 +1344,7 @@ def _get_weights_rank(topic_id: int) -> Tuple[Optional[int], Optional[int]]:
 
 
 def _get_unfulfilled_nonces_count(topic_id: int) -> Optional[int]:
-    j = _run_allorad_json(["q", "emissions", "unfulfilled-nonces", str(int(topic_id))])
+    j = _run_allorad_json(["q", "emissions", "unfulfilled-worker-nonces", str(int(topic_id))])
     if not j:
         return None
     # Try common shapes
