@@ -1,0 +1,359 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+from allora_sdk.rpc_client.config import AlloraNetworkConfig, AlloraWalletConfig
+from allora_sdk.worker import AlloraWorker
+
+from .environment import write_last_nonce
+from .logging_utils import get_stage_logger
+from .submission_log import ensure_submission_log_schema, log_submission_row
+
+DEFAULT_GRPC_URL = "grpc+https://allora-grpc.testnet.allora.network:443"
+DEFAULT_WEBSOCKET_URL = "wss://allora-rpc.testnet.allora.network/websocket"
+DEFAULT_CHAIN_ID = "allora-testnet-1"
+DEFAULT_FEE_DENOM = "uallo"
+DEFAULT_MIN_GAS_PRICE = 10.0
+
+
+@dataclass
+class SubmissionResult:
+    success: bool
+    exit_code: int
+    status: str
+    tx_hash: Optional[str]
+    nonce: Optional[int]
+    score: Optional[float] = None
+    reward: Optional[float] = None
+
+
+@dataclass
+class SubmissionConfig:
+    topic_id: int
+    timeout_seconds: int
+    retries: int
+    log_path: Path
+    repo_root: Path
+    api_key: str
+
+    chain_id: str = DEFAULT_CHAIN_ID
+    grpc_url: str = DEFAULT_GRPC_URL
+    websocket_url: str = DEFAULT_WEBSOCKET_URL
+    fee_denom: str = DEFAULT_FEE_DENOM
+    min_gas_price: float = DEFAULT_MIN_GAS_PRICE
+
+
+async def submit_prediction(value: float, cfg: SubmissionConfig) -> SubmissionResult:
+    logger = get_stage_logger("submit")
+    ensure_submission_log_schema(str(cfg.log_path))
+
+    attempt = 0
+    while attempt <= cfg.retries:
+        attempt += 1
+        logger.info("Submitting value %.6f for topic %s (attempt %d/%d)", value, cfg.topic_id, attempt, cfg.retries + 1)
+        try:
+            wallet_cfg = AlloraWalletConfig.from_env()
+        except ValueError as exc:
+            logger.error("Wallet configuration missing: %s", exc)
+            return _record_failure(cfg, value, "wallet_configuration_error", None, None)
+
+        network_cfg = AlloraNetworkConfig(
+            chain_id=cfg.chain_id,
+            url=cfg.grpc_url,
+            websocket_url=cfg.websocket_url,
+            fee_denom=cfg.fee_denom,
+            fee_minimum_gas_price=float(cfg.min_gas_price),
+        )
+
+        worker = AlloraWorker(
+            run=lambda _: float(value),
+            wallet=wallet_cfg,
+            network=network_cfg,
+            api_key=cfg.api_key,
+            topic_id=cfg.topic_id,
+            polling_interval=int(cfg.timeout_seconds),
+        )
+
+        try:
+            result = await _run_worker(worker, timeout=cfg.timeout_seconds)
+        except asyncio.TimeoutError:
+            logger.warning("Submission attempt timed out after %ss", cfg.timeout_seconds)
+            worker.stop()
+            if attempt > cfg.retries:
+                return _record_failure(cfg, value, "timeout", None, None)
+            await asyncio.sleep(2.0)
+            continue
+        except Exception as exc:  # noqa: BLE001 - surface to logs
+            worker.stop()
+            logger.exception("Submission attempt failed: %s", exc)
+            if attempt > cfg.retries:
+                return _record_failure(cfg, value, str(exc), None, None)
+            await asyncio.sleep(2.0)
+            continue
+
+        worker.stop()
+        if result is None:
+            logger.warning("Worker completed without producing a transaction")
+            if attempt > cfg.retries:
+                return _record_failure(cfg, value, "no_result", None, None)
+            await asyncio.sleep(1.0)
+            continue
+
+        prediction, tx_hash, nonce, tx_result = result
+        score, reward = _extract_submission_metrics(tx_result)
+        logger.info(
+            "Submission succeeded (tx=%s nonce=%s score=%s reward=%s)",
+            tx_hash,
+            nonce,
+            f"{score:.6f}" if score is not None else "null",
+            f"{reward:.6f}" if reward is not None else "null",
+        )
+        _log_csv(
+            cfg,
+            prediction,
+            True,
+            0,
+            "submitted",
+            tx_hash,
+            nonce,
+            score=score,
+            reward=reward,
+        )
+        write_last_nonce(cfg.repo_root, {
+            "topic_id": cfg.topic_id,
+            "value": prediction,
+            "tx_hash": tx_hash,
+            "nonce": nonce,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "wallet": os.getenv("ALLORA_WALLET_ADDR") or None,
+        })
+        return SubmissionResult(True, 0, "submitted", tx_hash, nonce, score, reward)
+
+    return _record_failure(cfg, value, "exhausted_retries", None, None)
+
+
+async def _run_worker(
+    worker: AlloraWorker, timeout: int
+) -> Optional[tuple[float, Optional[str], Optional[int], Any]]:
+    async for outcome in worker.run(timeout=timeout or None):
+        if isinstance(outcome, Exception):
+            raise outcome
+        tx = outcome.tx_result
+        tx.ensure_successful()
+        return outcome.prediction, tx.hash, _extract_nonce(tx), tx
+    return None
+
+
+def _extract_nonce(tx: Any) -> Optional[int]:
+    # Allora events expose nonce either in events dict or raw log. Try both.
+    events = getattr(tx, "events", None)
+    if isinstance(events, dict):
+        for event in events.values():
+            if isinstance(event, dict):
+                for key, value in event.items():
+                    if str(key).lower() in {"nonce", "window_nonce"}:
+                        try:
+                            return int(value)
+                        except (TypeError, ValueError):
+                            continue
+    raw = getattr(tx, "raw_log", "")
+    if isinstance(raw, str):
+        for token in raw.replace("\n", " ").split():
+            if token.isdigit():
+                try:
+                    return int(token)
+                except ValueError:
+                    continue
+    return None
+
+
+def _extract_submission_metrics(tx: Any) -> tuple[Optional[float], Optional[float]]:
+    """Extract score and reward metrics from a transaction result if present."""
+
+    score: Optional[float] = None
+    reward: Optional[float] = None
+
+    def _consider(key: Any, value: Any) -> None:
+        nonlocal score, reward
+        key_str = str(key or "").lower()
+        val = value
+        if score is None and any(token in key_str for token in ("score", "ema")):
+            score_candidate = _coerce_float(val)
+            if score_candidate is None and isinstance(val, str):
+                score_candidate = _extract_numeric_fragment(val)
+            if score_candidate is not None:
+                score = score_candidate
+
+        if reward is None and (
+            "reward" in key_str or (
+                "amount" in key_str and isinstance(val, str) and "allo" in val.lower()
+            )
+        ):
+            reward_candidate = _parse_reward_value(val)
+            if reward_candidate is not None:
+                reward = reward_candidate
+
+    def _walk(mapping: Any) -> None:
+        if isinstance(mapping, dict):
+            for k, v in mapping.items():
+                if isinstance(v, dict):
+                    _walk(v)
+                else:
+                    _consider(k, v)
+
+    events = getattr(tx, "events", None)
+    _walk(events)
+
+    logs = getattr(tx, "logs", None)
+    if isinstance(logs, list):
+        for entry in logs:
+            entry_events = getattr(entry, "events", None)
+            _walk(entry_events)
+
+    raw = getattr(tx, "raw_log", None)
+    if isinstance(raw, str):
+        if score is None:
+            score = _extract_numeric_fragment(raw, keywords=("score", "ema"))
+        if reward is None:
+            reward = _parse_reward_value(raw)
+
+    return score, reward
+
+
+def _extract_numeric_fragment(text: str, keywords: tuple[str, ...] = ()) -> Optional[float]:
+    if not isinstance(text, str):
+        return None
+    snippet_sources = []
+    lowered = text.lower()
+    for keyword in keywords:
+        idx = lowered.find(keyword)
+        if idx != -1:
+            snippet_sources.append(text[idx : idx + 120])
+    if not snippet_sources:
+        snippet_sources.append(text)
+
+    for snippet in snippet_sources:
+        match = re.search(r"-?\d+(?:\.\d+)?", snippet)
+        if match:
+            try:
+                return float(match.group(0))
+            except ValueError:
+                continue
+    return None
+
+
+def _parse_reward_value(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    micro_match = re.search(r"(-?\d+(?:\.\d+)?)\s*uallo", lowered)
+    if micro_match:
+        try:
+            return float(micro_match.group(1)) / 1_000_000.0
+        except ValueError:
+            return None
+
+    allo_match = re.search(r"(-?\d+(?:\.\d+)?)\s*allo", lowered)
+    if allo_match:
+        try:
+            return float(allo_match.group(1))
+        except ValueError:
+            return None
+
+    snippets = []
+    for keyword in ("reward", "amount"):
+        idx = lowered.find(keyword)
+        if idx != -1:
+            snippets.append(text[idx : idx + 80])
+    for snippet in snippets:
+        match = re.search(r"(-?\d+(?:\.\d+)?)", snippet)
+        if match:
+            try:
+                value_f = float(match.group(1))
+                if "uallo" in snippet.lower():
+                    return value_f / 1_000_000.0
+                return value_f
+            except ValueError:
+                continue
+    return None
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, (float, int)):
+            return float(value)
+        text = str(value).strip()
+        if not text:
+            return None
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_decimal(value: Optional[float], *, digits: int) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return f"{float(value):.{int(digits)}f}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_failure(
+    cfg: SubmissionConfig,
+    value: float,
+    status: str,
+    tx_hash: Optional[str],
+    nonce: Optional[int],
+) -> SubmissionResult:
+    logger = get_stage_logger("submit")
+    logger.error("Submission failed (%s)", status)
+    _log_csv(cfg, value, False, 1, status, tx_hash, nonce)
+    return SubmissionResult(False, 1, status, tx_hash, nonce)
+
+
+def _log_csv(
+    cfg: SubmissionConfig,
+    value: float,
+    success: bool,
+    exit_code: int,
+    status: str,
+    tx_hash: Optional[str],
+    nonce: Optional[int],
+    *,
+    score: Optional[float] = None,
+    reward: Optional[float] = None,
+) -> None:
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    wallet = os.getenv("ALLORA_WALLET_ADDR") or None
+    formatted_value = _format_decimal(value, digits=6)
+    formatted_score = _format_decimal(score, digits=6)
+    formatted_reward = _format_decimal(reward, digits=6)
+    log_submission_row(
+        str(cfg.log_path),
+        {
+            "timestamp_utc": timestamp,
+            "topic_id": cfg.topic_id,
+            "value": formatted_value,
+            "wallet": wallet,
+            "nonce": nonce,
+            "tx_hash": tx_hash,
+            "success": success,
+            "exit_code": exit_code,
+            "status": status,
+            "log10_loss": None,
+            "score": formatted_score,
+            "reward": formatted_reward,
+        },
+    )
