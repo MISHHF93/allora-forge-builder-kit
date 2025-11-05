@@ -179,6 +179,11 @@ CHAIN_ID = os.getenv("ALLORA_CHAIN_ID", "allora-testnet-1")
 DEFAULT_TOPIC_ID = 67
 DEFAULT_RPC = os.getenv("ALLORA_RPC_URL") or os.getenv("ALLORA_NODE") or "https://allora-rpc.testnet.allora.network"
 
+# Cache expensive topic configuration fetches so repeated lifecycle checks do not
+# overwhelm the node. This is intentionally simple – the configuration is
+# effectively static during a run so we never need to invalidate it.
+_TOPIC_CONFIG_CACHE: Dict[int, Dict[str, Any]] = {}
+
 
 def _derive_rest_base_from_rpc(rpc_url: str) -> str:
     """Best-effort derive REST base URL from an RPC URL.
@@ -372,38 +377,6 @@ def _has_submitted_for_nonce(log_path: str, nonce: int) -> bool:
         return False
     return False
 
-
-def _resolve_wallet_for_logging(root_dir: str) -> Optional[str]:
-    env_wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
-    if env_wallet:
-        return env_wallet
-    # last nonce cache
-    try:
-        ln_path = os.path.join(root_dir, ".last_nonce.json")
-        if os.path.exists(ln_path):
-            with open(ln_path, "r", encoding="utf-8") as f:
-                j = json.load(f)
-            aw = j.get("address")
-            if isinstance(aw, str) and aw.strip():
-                return aw.strip()
-    except (OSError, IOError, json.JSONDecodeError):
-        pass
-    # from CSV
-    try:
-        csv_path = os.path.join(root_dir, "submission_log.csv")
-        if os.path.exists(csv_path):
-            import csv as _csv
-            last_wallet: Optional[str] = None
-            with open(csv_path, "r", encoding="utf-8") as fh:
-                r = _csv.DictReader(fh)
-                for row in r:
-                    w = (row.get("wallet") or "").strip()
-                    if w and w.lower() != "null":
-                        last_wallet = w
-            return last_wallet
-    except (OSError, IOError, ValueError):
-        pass
-    return None
 
 
 def _guard_already_submitted_this_window(root_dir: str, cadence_s: int, wallet: Optional[str]) -> bool:
@@ -1222,6 +1195,17 @@ def _fetch_topic_config(topic_id: int) -> Dict[str, Any]:
     return out
 
 
+def _get_topic_config_cached(topic_id: int) -> Dict[str, Any]:
+    """Return a cached topic configuration to avoid redundant CLI queries."""
+    global _TOPIC_CONFIG_CACHE
+    if topic_id not in _TOPIC_CONFIG_CACHE:
+        try:
+            _TOPIC_CONFIG_CACHE[topic_id] = _fetch_topic_config(topic_id)
+        except Exception:
+            _TOPIC_CONFIG_CACHE[topic_id] = {}
+    return _TOPIC_CONFIG_CACHE.get(topic_id, {})
+
+
 def _validate_topic_creation_and_funding(topic_id: int, expected: Dict[str, Any]) -> Dict[str, Any]:
     """Validate that the topic exists, has sane parameters aligned with expectations, and is funded.
     Returns a result dict: { ok: bool, funded: bool, mismatches: [..], fields: {..}, info: {..} } and prints concise reasons.
@@ -1328,7 +1312,7 @@ def _get_weights_rank(topic_id: int) -> Tuple[Optional[int], Optional[int]]:
 
 
 def _get_unfulfilled_nonces_count(topic_id: int) -> Optional[int]:
-    j = _run_allorad_json(["q", "emissions", "unfulfilled-nonces", str(int(topic_id))])
+    j = _run_allorad_json(["q", "emissions", "unfulfilled-worker-nonces", str(int(topic_id))])
     if not j:
         return None
     # Try common shapes
@@ -1357,9 +1341,86 @@ def _get_unfulfilled_nonces_count(topic_id: int) -> Optional[int]:
 def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
     params = _get_emissions_params()
     info = _get_topic_info(topic_id)
+    topic_cfg = _get_topic_config_cached(topic_id)
     rank, total = _get_weights_rank(topic_id)
     unfulfilled = _get_unfulfilled_nonces_count(topic_id)
     epoch_len = params.get("epoch_length")
+
+    def _to_positive_int(val: Any) -> Optional[int]:
+        try:
+            n = int(float(val))
+            return n if n > 0 else None
+        except Exception:
+            return None
+
+    submission_window_blocks: Optional[int] = None
+    env_window = os.getenv("ALLORA_SUBMISSION_WINDOW_BLOCKS")
+    if env_window:
+        submission_window_blocks = _to_positive_int(env_window)
+    if submission_window_blocks is None and isinstance(topic_cfg, dict):
+        submission_window_blocks = _to_positive_int(topic_cfg.get("worker_submission_window"))
+
+    raw_info = info.get("raw") if isinstance(info, dict) else None
+    last_epoch_candidate: Optional[Any] = None
+    if isinstance(raw_info, dict):
+        last_epoch_candidate = _deep_find_any(
+            raw_info,
+            [
+                "epoch_last_ended",
+                "epochLastEnded",
+                "last_epoch_ended",
+                "lastEpochEnded",
+                "epoch_last_end",
+                "epochLastEnd",
+                "last_epoch",
+                "epoch_last",
+            ],
+        )
+    last_epoch_end: Optional[int]
+    try:
+        last_epoch_end = int(str(last_epoch_candidate)) if last_epoch_candidate is not None else None
+    except Exception:
+        last_epoch_end = None
+
+    try:
+        current_block_height = _current_block_height()
+        current_block_height = int(current_block_height) if current_block_height is not None else None
+    except Exception:
+        current_block_height = None
+
+    blocks_since_epoch: Optional[int] = None
+    epoch_progress: Optional[int] = None
+    blocks_remaining: Optional[int] = None
+    window_open: Optional[bool] = None
+    window_confident = False
+    epoch_len_int = _to_positive_int(epoch_len)
+    if (
+        epoch_len_int is not None
+        and submission_window_blocks is not None
+        and submission_window_blocks > 0
+        and isinstance(last_epoch_end, int)
+        and isinstance(current_block_height, int)
+    ):
+        window_confident = True
+        blocks_since_epoch = max(0, int(current_block_height) - int(last_epoch_end))
+        epoch_progress = blocks_since_epoch % epoch_len_int
+        blocks_remaining = epoch_len_int - epoch_progress
+        if blocks_remaining <= 0:
+            blocks_remaining += epoch_len_int
+        window_open = 0 < blocks_remaining <= int(submission_window_blocks)
+
+    submission_window_state: Dict[str, Any] = {
+        "epoch_length": epoch_len_int,
+        "window_size": submission_window_blocks,
+        "last_epoch_end": last_epoch_end,
+        "current_block": current_block_height,
+        "blocks_since_last_epoch_end": blocks_since_epoch,
+        "epoch_progress": epoch_progress,
+        "blocks_remaining_in_epoch": blocks_remaining,
+        "confidence": bool(window_confident),
+        "is_open": window_open if window_open is not None else None,
+    }
+
     # Active criteria: effective revenue and delegated stake positive; reputers >=1
     eff = info.get("effective_revenue")
     stk = info.get("delegated_stake")
@@ -1422,7 +1483,7 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
             last_up = int(str(info.get("last_update")))
         except Exception:
             last_up = None
-        cur_h = _current_block_height() or None
+        cur_h = current_block_height
         if last_up is not None and cur_h is not None and cur_h - last_up >= int(epoch_len):
             is_churnable = True
         else:
@@ -1450,6 +1511,8 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
         "inactive_reason_codes": inactive_codes,
         "is_churnable": bool(is_churnable),
         "is_rewardable": bool(is_rewardable),
+        "submission_window_open": window_open if window_open is not None else None,
+        "submission_window": submission_window_state,
         "activity_snapshot": {
             "effective_revenue": eff,
             "delegated_stake": stk,
@@ -1991,796 +2054,6 @@ async def _submit_with_sdk(topic_id: int, value: float, api_key: str, timeout_s:
     return 2
 
 
-async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, pre_log10_loss: Optional[float], force_submit: bool = False) -> int:
-    """Submit using emissions client and ONLY xgb prediction for both inference and forecast.
-    - inference.value := xgb_val (already computed live prediction)
-    - forecast.value := 0.05 * abs(xgb_val) (dummy uncertainty)
-    Ensures forecast is non-null without relying on artifacts on disk.
-    """
-    # Forecast value: ±5% dummy variance (use magnitude)
-    try:
-        xgb_val = float(xgb_val)
-    except Exception:
-        print("ERROR: live xgb value is not numeric", file=sys.stderr)
-        ws = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
-        _log_submission(root_dir, ws, topic_id, None, _resolve_wallet_for_logging(root_dir), None, None, False, 1, "xgb_not_numeric", pre_log10_loss)
-        return 1
-    forecast_val = 0.05 * abs(xgb_val)
-
-    # Resolve wallet (env/log placeholder until we construct LocalWallet below)
-    wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip() or _resolve_wallet_for_logging(root_dir)
-
-    # Resolve nonce helpers. We'll poll for the worker window to open via can-submit,
-    # then select the fresh unfulfilled nonce for this topic. Fallback to current height.
-    def _query_unfulfilled_nonce(topic: int, wal: Optional[str], timeout: int = 20) -> Optional[int]:
-        cmd = [
-            "allorad", "q", "emissions", "unfulfilled-worker-nonces", str(int(topic)),
-            "--node", str(DEFAULT_RPC), "--output", "json", "--trace",
-        ]
-        try:
-            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        except FileNotFoundError:
-            return None
-        except Exception:
-            return None
-        out = (cp.stdout or cp.stderr or "").strip()
-        try:
-            j = json.loads(out)
-        except Exception:
-            # Try to extract first integer-looking nonce
-            m = re.search(r"\b(\d{6,})\b", out)
-            return int(m.group(1)) if m else None
-        # Heuristic: look for fields like nonces, block_heights, or wallet-keyed maps
-        # Prefer entries for our wallet when present
-        def _find_nonces(obj: Any) -> List[int]:
-            res: List[int] = []
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    kl = str(k).lower()
-                    if kl in ("nonces", "block_heights", "heights") and isinstance(v, (list, tuple)):
-                        for it in v:
-                            try:
-                                res.append(int(it))
-                            except Exception:
-                                continue
-                    # Sometimes structure is {wallet: [nonces]}
-                    try:
-                        if isinstance(v, (list, tuple)) and wal and (wal in str(k)):
-                            for it in v:
-                                try:
-                                    res.append(int(it))
-                                except Exception:
-                                    continue
-                    except Exception:
-                        pass
-                    res.extend(_find_nonces(v))
-            elif isinstance(obj, list):
-                for it in obj:
-                    res.extend(_find_nonces(it))
-            return res
-        arr = _find_nonces(j)
-        if arr:
-            # choose the most recent (max)
-            try:
-                return max(int(x) for x in arr)
-            except Exception:
-                return None
-        return None
-
-    def _query_topic_last_worker_commit_nonce(topic: int, timeout: int = 15) -> Optional[int]:
-        cmd = [
-            "allorad", "q", "emissions", "topic-last-worker-commit", str(int(topic)),
-            "--node", str(DEFAULT_RPC), "--output", "json", "--trace",
-        ]
-        try:
-            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        except FileNotFoundError:
-            return None
-        except Exception:
-            return None
-        out = (cp.stdout or cp.stderr or "").strip()
-        try:
-            j = json.loads(out)
-        except Exception:
-            return None
-        try:
-            n = j.get("last_commit", {}).get("nonce", {}).get("block_height")
-            return int(n) if n is not None else None
-        except Exception:
-            return None
-
-    def _can_submit_worker_payload(topic: int, wal: Optional[str], timeout: int = 10) -> Optional[bool]:
-        if not wal:
-            return None
-        cmd = [
-            "allorad", "q", "emissions", "can-submit-worker-payload", str(int(topic)), str(wal),
-            "--node", str(DEFAULT_RPC), "--chain-id", str(CHAIN_ID), "--output", "json", "--trace",
-        ]
-        try:
-            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        except FileNotFoundError:
-            return None
-        except Exception:
-            return None
-        out = (cp.stdout or cp.stderr or "").strip()
-        try:
-            j = json.loads(out)
-            # Expected key: can_submit_worker_payload: true/false
-            for k in ("can_submit_worker_payload", "canSubmit", "result", "value"):
-                if k in j:
-                    v = j.get(k)
-                    if isinstance(v, bool):
-                        return v
-                    if isinstance(v, str):
-                        vl = v.strip().lower()
-                        if vl in ("true", "1", "yes"):
-                            return True
-                        if vl in ("false", "0", "no"):
-                            return False
-        except Exception:
-            # Regex fallback
-            m = re.search(r"true|false|1|0", out, flags=re.IGNORECASE)
-            if m:
-                s = m.group(0).lower()
-                return s in ("true", "1")
-        return None
-
-    # Build REST clients and wallet first so we can derive the authoritative wallet address
-    try:
-        # Imports based on current installed SDK
-        from allora_sdk.rpc_client.client_emissions import EmissionsTxs  # type: ignore
-        from allora_sdk.rpc_client.config import AlloraNetworkConfig  # type: ignore
-        from allora_sdk.rpc_client.tx_manager import TxManager  # type: ignore
-        from allora_sdk.rest.cosmos_tx_v1beta1_rest_client import CosmosTxV1Beta1RestServiceClient  # type: ignore
-        from allora_sdk.rest.cosmos_auth_v1beta1_rest_client import CosmosAuthV1Beta1RestQueryClient  # type: ignore
-        from allora_sdk.rest.cosmos_bank_v1beta1_rest_client import CosmosBankV1Beta1RestQueryClient  # type: ignore
-        from cosmpy.aerial.wallet import LocalWallet  # type: ignore
-
-        # Resolve mnemonic from .allora_key (same file the worker uses)
-        key_path = os.path.join(root_dir, ".allora_key")
-        if not os.path.exists(key_path):
-            raise RuntimeError(".allora_key not found; cannot construct LocalWallet for client submission")
-        with open(key_path, "r", encoding="utf-8") as kf:
-            mnemonic = kf.read().strip()
-        if not mnemonic or len(mnemonic.split()) < 12:
-            raise RuntimeError("Invalid mnemonic in .allora_key")
-
-        wallet_obj = LocalWallet.from_mnemonic(mnemonic, prefix="allo")
-        # Try to get canonical address string from wallet_obj if available
-        try:
-            wal_addr = getattr(wallet_obj, "address", None)
-            if callable(wal_addr):
-                wal_addr = wal_addr()  # some versions expose address() method
-            if isinstance(wal_addr, str) and wal_addr:
-                wallet = wal_addr
-        except Exception:
-            pass
-
-        # Build REST clients against the REST base URL (not RPC)
-        base_url = _derive_rest_base_from_rpc(DEFAULT_RPC)
-        tx_client = CosmosTxV1Beta1RestServiceClient(base_url)
-        auth_client = CosmosAuthV1Beta1RestQueryClient(base_url)
-        bank_client = CosmosBankV1Beta1RestQueryClient(base_url)
-
-        # Network config (fee params, chain id)
-        if str(CHAIN_ID) == "allora-testnet-1":
-            net_cfg = AlloraNetworkConfig.testnet()
-        elif str(CHAIN_ID) == "allora-mainnet-1":
-            net_cfg = AlloraNetworkConfig.mainnet()
-        else:
-            # Custom with provided CHAIN_ID; fallback to testnet fee params
-            net_cfg = AlloraNetworkConfig(
-                chain_id=str(CHAIN_ID),
-                # Use REST base URL directly; some SDKs expect a gRPC-like string but TxManager relies on REST clients passed above
-                url=base_url,
-                websocket_url=None,
-                fee_denom="uallo",
-                fee_minimum_gas_price=10.0,
-            )
-
-        # Construct TxManager and EmissionsTxs
-        tm = TxManager(wallet=wallet_obj, tx_client=tx_client, auth_client=auth_client, bank_client=bank_client, config=net_cfg)
-        # Prefer block broadcast to get a synchronous tx response containing txhash; try multiple variants for compatibility
-        def _try_set_bcast(mode: str) -> None:
-            try:
-                if hasattr(tm, "set_broadcast_mode") and callable(getattr(tm, "set_broadcast_mode")):
-                    tm.set_broadcast_mode(mode)  # type: ignore
-                elif hasattr(tm, "broadcast_mode"):
-                    setattr(tm, "broadcast_mode", mode)
-            except Exception:
-                pass
-        for m in ("block", "BROADCAST_MODE_BLOCK"):
-            _try_set_bcast(m)
-        # Best-effort fee defaults if supported
-        for attr, val in (("gas_limit", 300000), ("gas_price", 10.0)):
-            try:
-                if hasattr(tm, attr):
-                    setattr(tm, attr, val)  # type: ignore
-            except Exception:
-                pass
-        txs = EmissionsTxs(tm)
-    except Exception as e:
-        print(f"ERROR: client-based xgb submit failed: {e}", file=sys.stderr)
-        ws = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
-        _log_submission(root_dir, ws, topic_id, xgb_val if 'xgb_val' in locals() else None, wallet, None, None, False, 1, "client_submit_exception", pre_log10_loss)
-        return 1
-
-    # Wait for the worker window to open (up to ~90s), then choose the freshest nonce
-    wait_deadline = time.time() + 90.0
-    chosen_nonce: Optional[int] = None
-    while time.time() < wait_deadline:
-        can_sub = _can_submit_worker_payload(int(topic_id), wallet)
-        unf = _query_unfulfilled_nonce(int(topic_id), wallet)
-        # Prefer explicit unfulfilled nonce when present
-        if isinstance(unf, int) and unf > 0:
-            chosen_nonce = int(unf)
-            break
-        # If we can submit but unfulfilled list isn't populated yet, use current height
-        if can_sub is True:
-            h = _current_block_height()
-            if isinstance(h, int) and h > 0:
-                chosen_nonce = int(h)
-                break
-        # Sleep briefly before polling again
-        try:
-            await asyncio.sleep(2.0)
-        except Exception:
-            time.sleep(2.0)
-
-    # Final fallback: last worker commit nonce or current height
-    if chosen_nonce is None:
-        chosen_nonce = (
-            _query_unfulfilled_nonce(int(topic_id), wallet)
-            or _current_block_height()
-            or _query_topic_last_worker_commit_nonce(int(topic_id))
-            or 0
-        )
-    nonce_h = int(chosen_nonce or 0)
-    if nonce_h <= 0:
-        print("Warning: could not resolve a valid worker nonce; submission may fail", file=sys.stderr)
-
-    # Build forecast elements and extra data
-    forecast_elements = [{"inferer": str(wallet or ""), "value": str(forecast_val)}]
-    extra_payload = {
-        "policy": "xgb_only",
-        "note": "forecast=5pct_abs(xgb)",
-    }
-    try:
-        extra_data = json.dumps(extra_payload, separators=(",", ":")).encode("utf-8")
-    except Exception:
-        extra_data = b""
-
-    # Perform async insert and wait for inclusion (TxManager returns a PendingTx)
-    try:
-        # Some SDK versions require different broadcast modes; try a few if txhash isn't returned
-        tx_hash = None
-        last_tx_resp: Any = None
-        def _extract_tx_hash(obj: Any, depth: int = 0) -> Optional[str]:
-            if obj is None or depth > 3:
-                return None
-            for key in ("txhash", "hash", "tx_hash"):
-                try:
-                    if isinstance(obj, dict) and key in obj and isinstance(obj[key], str) and len(obj[key]) >= 64:
-                        return obj[key]
-                    if hasattr(obj, key):
-                        val = getattr(obj, key)
-                        if isinstance(val, str) and len(val) >= 64:
-                            return val
-                except Exception:
-                    pass
-            try:
-                if isinstance(obj, dict) and "tx_response" in obj:
-                    r = _extract_tx_hash(obj["tx_response"], depth + 1)
-                    if r:
-                        return r
-            except Exception:
-                pass
-            try:
-                if hasattr(obj, "tx_response"):
-                    r = _extract_tx_hash(getattr(obj, "tx_response"), depth + 1)
-                    if r:
-                        return r
-            except Exception:
-                pass
-            try:
-                s = str(obj)
-                m = re.search(r"\b([0-9A-Fa-f]{64})\b", s)
-                if m:
-                    return m.group(1)
-            except Exception:
-                pass
-            return None
-
-        broadcast_modes_to_try = ["block", "BROADCAST_MODE_BLOCK", "sync", "BROADCAST_MODE_SYNC"]
-        for bmode in broadcast_modes_to_try:
-            # Switch mode if possible
-            try:
-                if hasattr(tm, "set_broadcast_mode") and callable(getattr(tm, "set_broadcast_mode")):
-                    tm.set_broadcast_mode(bmode)  # type: ignore
-                elif hasattr(tm, "broadcast_mode"):
-                    setattr(tm, "broadcast_mode", bmode)
-            except Exception:
-                pass
-            # SDKs have varied argument names across versions.
-            # Try with forecast_elements first; if signature mismatch, retry with forecast.
-            try:
-                try:
-                    pending = await txs.insert_worker_payload(
-                        topic_id=int(topic_id),
-                        inference_value=str(xgb_val),
-                        nonce=int(nonce_h),
-                        forecast_elements=forecast_elements,
-                        extra_data=extra_data,
-                        proof="",
-                    )
-                except TypeError:
-                    pending = await txs.insert_worker_payload(
-                        topic_id=int(topic_id),
-                        inference_value=str(xgb_val),
-                        nonce=int(nonce_h),
-                        forecast=forecast_elements,
-                        extra_data=extra_data,
-                        proof="",
-                    )
-                try:
-                    last_tx_resp = await pending
-                    tx_hash = _extract_tx_hash(last_tx_resp)
-                except Exception:
-                    # If wait failed, try to extract from pending or manager state
-                    try:
-                        tx_hash = tx_hash or getattr(pending, "last_tx_hash", None)
-                    except Exception:
-                        pass
-                    try:
-                        tx_hash = tx_hash or _extract_tx_hash(getattr(pending, "tx_response", None))
-                    except Exception:
-                        pass
-                    try:
-                        mgr = getattr(txs, "tx_manager", None)
-                        if mgr is not None:
-                            tx_hash = tx_hash or _extract_tx_hash(mgr)
-                    except Exception:
-                        pass
-            except Exception:
-                # Try next mode
-                tx_hash = None
-            # Stop if we have a hash
-            if tx_hash:
-                break
-        nonce_out: Optional[int] = int(nonce_h) if nonce_h else None
-
-        # Enrich: attempt to extract EMA score and reward from the committed tx, else fall back to queries
-        def _parse_float_any(x: Any) -> Optional[float]:
-            try:
-                v = float(x)
-                return v if np.isfinite(v) else None
-            except Exception:
-                return None
-
-        def _extract_from_tx_json(txj: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-            """Parse Cosmos tx JSON for EMA score and rewards.
-            Searches logs[].events for EventEMAScoresSet and transfer events.
-            """
-            score_val: Optional[float] = None
-            reward_amt: Optional[float] = None
-            logs = txj.get("logs") or []
-            # Some RPCs return stringified raw_log; ignore that path here
-            for lg in logs:
-                events = lg.get("events") or []
-                for ev in events:
-                    et = str(ev.get("type", "")).lower()
-                    attrs = ev.get("attributes") or []
-                    # EMA score event
-                    if "eventemascoresset" in et or "emascore" in et or "score" in et:
-                        for a in attrs:
-                            k = str(a.get("key", "")).lower()
-                            if k in ("scores", "inferer_scores", "infererscores", "ema_scores", "emascores"):
-                                val = a.get("value")
-                                try:
-                                    arr = json.loads(val)
-                                    if isinstance(arr, list) and arr:
-                                        sv = _parse_float_any(arr[0])
-                                        if sv is not None:
-                                            score_val = sv
-                                except Exception:
-                                    m = re.search(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", str(val))
-                                    if m:
-                                        sv = _parse_float_any(m.group(1))
-                                        if sv is not None:
-                                            score_val = sv
-                    # reward detection via coin_received/transfer with recipient==wallet
-                    if et in ("coin_received", "transfer"):
-                        ad: Dict[str, List[str]] = {}
-                        for a in attrs:
-                            k = str(a.get("key", "")).lower(); v = str(a.get("value", ""))
-                            ad.setdefault(k, []).append(v)
-                        recips = [r for r in ad.get("receiver", []) + ad.get("recipient", []) if r]
-                        if wallet and wallet in recips:
-                            for am in ad.get("amount", []):
-                                for part in re.split(r"[\s,]+", am.strip()):
-                                    if not part:
-                                        continue
-                                    m2 = re.match(r"^([0-9]*\.?[0-9]+)([a-zA-Z/\.]+)$", part)
-                                    if not m2:
-                                        continue
-                                    amt = _parse_float_any(m2.group(1))
-                                    unit = m2.group(2).lower()
-                                    if amt is None:
-                                        continue
-                                    if "allo" in unit:
-                                        scale = 1e6 if unit.startswith("u") else 1.0
-                                        reward_amt = (reward_amt or 0.0) + (amt / scale)
-            return score_val, reward_amt
-
-        # Reusable EMA score query with retries (inferer role)
-        def _query_ema_score_retry(topic: int, wal: Optional[str], retries: int = 3, delay_s: float = 2.0, timeout: int = 15) -> Optional[float]:
-            if not wal:
-                return None
-            cmd = [
-                "allorad", "q", "emissions", "inferer-score-ema", str(int(topic)), str(wal),
-                "--node", str(DEFAULT_RPC), "--chain-id", str(CHAIN_ID), "--output", "json", "--trace",
-            ]
-            def _try_once() -> Optional[float]:
-                try:
-                    cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-                except Exception:
-                    return None
-                out = (cp.stdout or cp.stderr or "").strip()
-                try:
-                    j = json.loads(out)
-                    # Probe common numeric fields; otherwise deep search for first float
-                    for key in ("score", "ema", "score_ema", "inferer_score_ema", "value", "result"):
-                        if key in j:
-                            v = _parse_float_any(j.get(key))
-                            if v is not None:
-                                return v
-                    # Deep search
-                    def _find_num(o: Any) -> Optional[float]:
-                        if isinstance(o, (int, float)) and np.isfinite(o):
-                            return float(o)
-                        if isinstance(o, str):
-                            return _parse_float_any(o)
-                        if isinstance(o, dict):
-                            for v in o.values():
-                                r = _find_num(v)
-                                if r is not None:
-                                    return r
-                        if isinstance(o, (list, tuple)):
-                            for v in o:
-                                r = _find_num(v)
-                                if r is not None:
-                                    return r
-                        return None
-                    return _find_num(j)
-                except Exception:
-                    m = re.search(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", out)
-                    if m:
-                        return _parse_float_any(m.group(1))
-                return None
-            for _ in range(max(1, int(retries) + 1)):
-                val = _try_once()
-                if val is not None:
-                    return val
-                try:
-                    time.sleep(float(delay_s))
-                except Exception:
-                    pass
-            return None
-
-        score_final: Optional[float] = None
-        reward_final: Any = None
-        chain_code: Optional[int] = None
-        chain_codespace: Optional[str] = None
-        if tx_hash:
-            # Query the tx via CLI for full event logs; allow a couple retries for indexers to catch up
-            for _ in range(3):
-                try:
-                    cp = subprocess.run([
-                        "allorad", "q", "tx", str(tx_hash), "--node", str(DEFAULT_RPC), "--output", "json", "--trace"
-                    ], capture_output=True, text=True, timeout=25)
-                    out = (cp.stdout or cp.stderr or "").strip()
-                    j = json.loads(out)
-                    # Record chain result code
-                    try:
-                        chain_code = int(j.get("code", 0))
-                    except Exception:
-                        chain_code = 0
-                    chain_codespace = j.get("codespace") or ""
-                    sc, rw = _extract_from_tx_json(j)
-                    if score_final is None:
-                        score_final = sc
-                    if reward_final is None:
-                        reward_final = rw
-                    if score_final is not None and reward_final is not None:
-                        break
-                except Exception:
-                    pass
-                try:
-                    time.sleep(2.0)
-                except Exception:
-                    pass
-        # Best-effort fallback for score via EMA query if not in the tx logs yet
-        if score_final is None and wallet:
-            score_final = _query_ema_score_retry(int(topic_id), wallet, retries=4, delay_s=2.0, timeout=15)
-        # Reward fallback via tx query helper if not already populated
-        if reward_final is None and tx_hash:
-            try:
-                # Re-use the tx query above if needed; otherwise mark pending
-                reward_final = "pending"
-            except Exception:
-                reward_final = "pending"
-
-        # Determine success based on chain response code (0 = success)
-        success_flag = bool(chain_code == 0) if (chain_code is not None and tx_hash) else bool(tx_hash)
-        exit_code_out = 0 if success_flag else 1
-        # If score not yet available, note 'score=pending' in status for transparency
-        pending_note = "; score=pending" if (success_flag and score_final is None) else ""
-        status_msg = ("submitted" if success_flag else (f"chain_error:{chain_codespace}/{chain_code}" if tx_hash else "no_tx_hash")) + pending_note
-
-        # Log success/failure with enriched details
-        ws = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
-        _log_submission(
-            root_dir,
-            ws,
-            topic_id,
-            xgb_val,
-            wallet,
-            int(nonce_out) if nonce_out is not None else None,
-            str(tx_hash) if tx_hash else None,
-            success_flag,
-            exit_code_out,
-            status_msg,
-            pre_log10_loss,
-            score_final,
-            reward_final if (reward_final is not None) else "pending",
-        )
-        # Console diagnostics to aid wrapper parsing and human review
-        try:
-            nonce_dbg = int(nonce_out) if nonce_out is not None else None
-        except Exception:
-            nonce_dbg = None
-        print(f"submit(client): nonce={nonce_dbg} tx_hash={tx_hash or 'null'} code={(chain_code if chain_code is not None else 'n/a')} status={status_msg}")
-        if not tx_hash:
-            # Print a short hint to aid future debugging without leaking sensitive data
-            try:
-                print("submit(client): hint=hash_missing_check_broadcast_mode_and_signature")
-            except Exception:
-                pass
-        if score_final is not None:
-            print(f"submit(client): ema_score={score_final}")
-        if isinstance(reward_final, (int, float)):
-            print(f"submit(client): reward={reward_final}")
-        # Cache last nonce
-        try:
-            with open(os.path.join(root_dir, ".last_nonce.json"), "w", encoding="utf-8") as f:
-                json.dump({"topic_id": topic_id, "nonce": int(nonce_out or 0), "address": wallet, "ts": int(time.time())}, f)
-        except Exception:
-            pass
-        # Trigger fallback when no tx hash or chain error, else success
-        if (not tx_hash) or (chain_code is not None and chain_code != 0):
-            return 2
-        return 0
-    except Exception as e:
-        print(f"ERROR: client-based xgb submit failed: {e}", file=sys.stderr)
-        ws = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
-        _log_submission(root_dir, ws, topic_id, xgb_val if 'xgb_val' in locals() else None, wallet, None, None, False, 1, "client_submit_exception", pre_log10_loss)
-        return 1
-
-
-def _parse_submission_helper_output(stdout: str, stderr: str) -> Tuple[Optional[str], Optional[int], Optional[float], Optional[float], Optional[str]]:
-    """Best-effort extraction of tx hash, nonce, score, reward, and status from helper output."""
-    text = "\n".join([stdout or "", stderr or ""]).strip()
-    tx_hash: Optional[str] = None
-    nonce: Optional[int] = None
-    score: Optional[float] = None
-    reward: Optional[float] = None
-    status: Optional[str] = None
-
-    # Try JSON lines first
-    for line in text.splitlines():
-        candidate = line.strip()
-        if not candidate or not (candidate.startswith("{") and candidate.endswith("}")):
-            continue
-        try:
-            obj = json.loads(candidate)
-        except (json.JSONDecodeError, ValueError, TypeError):
-            continue
-        if isinstance(obj, dict):
-            if not tx_hash:
-                for key in ("tx_hash", "txHash", "txhash", "transactionHash", "hash"):
-                    val = obj.get(key)
-                    if isinstance(val, str) and len(val) >= 40:
-                        tx_hash = val
-                        break
-            if nonce is None:
-                for key in ("nonce", "windowNonce", "block_height", "height"):
-                    val = obj.get(key)
-                    try:
-                        if isinstance(val, str) and val.isdigit():
-                            nonce = int(val)
-                            break
-                        if isinstance(val, (int, float)):
-                            nonce = int(val)
-                            break
-                    except Exception:
-                        continue
-            if score is None:
-                for key in ("score", "ema_score", "inferer_score", "log10_score"):
-                    if key in obj:
-                        val = obj.get(key)
-                        try:
-                            score = float(val)
-                        except Exception:
-                            score = None
-                        break
-            if reward is None:
-                for key in ("reward", "rewards", "amount"):
-                    if key in obj:
-                        val = obj.get(key)
-                        try:
-                            reward = float(val)
-                        except Exception:
-                            reward = None
-                        break
-            if not status:
-                for key in ("status", "message", "result"):
-                    val = obj.get(key)
-                    if isinstance(val, str) and val:
-                        status = val
-                        break
-
-    if not tx_hash:
-        m = re.search(r"\b[0-9A-Fa-f]{64}\b", text)
-        if m:
-            tx_hash = m.group(0)
-
-    if nonce is None:
-        m = re.search(r"nonce[^0-9]*(\d{3,})", text, flags=re.IGNORECASE)
-        if m:
-            try:
-                nonce = int(m.group(1))
-            except Exception:
-                nonce = None
-
-    if score is None:
-        m = re.search(r"score[^0-9-]*([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)", text, flags=re.IGNORECASE)
-        if m:
-            try:
-                score = float(m.group(1))
-            except Exception:
-                score = None
-
-    if reward is None:
-        m = re.search(r"reward[^0-9-]*([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)", text, flags=re.IGNORECASE)
-        if m:
-            try:
-                reward = float(m.group(1))
-            except Exception:
-                reward = None
-
-    if not status and text:
-        # Use the last non-empty line as a human-readable status hint
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if lines:
-            status = lines[-1][:128]
-
-    return tx_hash, nonce, score, reward, status
-
-
-def _submit_via_external_helper(
-    topic_id: int,
-    value: float,
-    root_dir: str,
-    pre_log10_loss: Optional[float],
-    submit_timeout: int,
-) -> Optional[Tuple[int, bool]]:
-    """Attempt submission via submit_prediction.py (if available) or similar helper.
-
-    Returns Optional[(exit_code, success_flag)]. When None, no helper was executed.
-    """
-    candidates = [
-        os.path.join(root_dir, "submit_prediction.py"),
-        os.path.join(root_dir, "scripts", "submit_prediction.py"),
-        os.path.join(root_dir, "tools", "submit_prediction.py"),
-    ]
-    timeout_bound = max(0, int(submit_timeout or 0))
-    wallet = _resolve_wallet_for_logging(root_dir)
-    cadence_s = _load_cadence_from_config(root_dir)
-    env = os.environ.copy()
-    env.setdefault("ALLORA_TOPIC_ID", str(topic_id))
-    env.setdefault("ALLORA_PREDICTION_VALUE", str(value))
-
-    for candidate in candidates:
-        if not os.path.exists(candidate):
-            continue
-        cmd = [sys.executable, candidate, "--topic-id", str(topic_id), "--source", "model"]
-        if "--mode" not in cmd:
-            cmd.extend(["--mode", "cli"])
-        if timeout_bound > 0:
-            cmd.extend(["--timeout", str(timeout_bound)])
-        try:
-            cp = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=(timeout_bound + 30) if timeout_bound > 0 else None,
-            )
-        except subprocess.TimeoutExpired:
-            ws = _window_start_utc(cadence_s=cadence_s)
-            _log_submission(
-                root_dir,
-                ws,
-                topic_id,
-                value,
-                wallet,
-                None,
-                None,
-                False,
-                124,
-                "submit_helper_timeout",
-                pre_log10_loss,
-            )
-            return (124, False)
-        except FileNotFoundError:
-            continue
-        except Exception as exc:
-            ws = _window_start_utc(cadence_s=cadence_s)
-            _log_submission(
-                root_dir,
-                ws,
-                topic_id,
-                value,
-                wallet,
-                None,
-                None,
-                False,
-                1,
-                f"submit_helper_error:{exc}",
-                pre_log10_loss,
-            )
-            return (1, False)
-
-        tx_hash, nonce, score, reward, status = _parse_submission_helper_output(cp.stdout, cp.stderr)
-        success = bool(cp.returncode == 0 and tx_hash)
-        exit_code = 0 if success else (cp.returncode if cp.returncode != 0 else 1)
-        ws = _window_start_utc(cadence_s=cadence_s)
-        _log_submission(
-            root_dir,
-            ws,
-            topic_id,
-            value,
-            wallet,
-            nonce,
-            tx_hash,
-            success,
-            exit_code,
-            status or ("submit_helper_success" if success else f"submit_helper_rc={cp.returncode}"),
-            pre_log10_loss,
-            score,
-            reward if reward is not None else ("pending" if success else None),
-        )
-        if not success:
-            print(
-                f"submit(helper): helper at {candidate} exited with rc={cp.returncode}; stdout={cp.stdout!r} stderr={cp.stderr!r}",
-                file=sys.stderr,
-            )
-        return (exit_code, success)
-
-    return None
-
-
-def sleep_until_top_of_hour_utc() -> None:
-    """Sleep until the next top of hour in UTC."""
-    import time
-    now = time.time()
-    next_hour = ((now // 3600) + 1) * 3600
-    sleep_time = next_hour - now
-    if sleep_time > 0:
-        print(f"Sleeping {sleep_time:.0f} seconds until top of hour UTC")
-        time.sleep(sleep_time)
-
-
 def _sleep_until_next_window(cadence_s: int) -> None:
     """Align to the next cadence window boundary in UTC."""
     try:
@@ -2802,23 +2075,6 @@ def _sleep_until_next_window(cadence_s: int) -> None:
             pass
 
 
-def resolve_wallet() -> None:
-    """Resolve wallet address using scripts/resolve_wallet.py and set env var."""
-    import subprocess
-    try:
-        result = subprocess.run([sys.executable, "scripts/resolve_wallet.py"], capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            wallet = result.stdout.strip()
-            if wallet:
-                os.environ["ALLORA_WALLET_ADDR"] = wallet
-                print(f"Resolved wallet: {wallet}")
-            else:
-                print("Warning: resolve_wallet.py returned empty wallet")
-        else:
-            print(f"Warning: resolve_wallet.py failed: {result.stderr.strip()}")
-    except (subprocess.TimeoutExpired, OSError) as e:
-        print(f"Warning: failed to run resolve_wallet.py: {e}")
-
 
 def run_pipeline(args, cfg, root_dir) -> int:
     data_cfg: Dict[str, Any] = cfg.get("data", {})
@@ -2827,8 +2083,8 @@ def run_pipeline(args, cfg, root_dir) -> int:
     sched_cfg: Dict[str, Any] = cfg.get("schedule", {})
     mode = getattr(args, "_effective_mode", str(getattr(args, "schedule_mode", None) or sched_cfg.get("mode", "single")))
     cadence = getattr(args, "_effective_cadence", str(getattr(args, "cadence", None) or sched_cfg.get("cadence", "1h")))
-    start_raw = str(getattr(args, "start_utc", None) or sched_cfg.get("start", "2025-09-16T13:00:00Z"))
-    end_raw = str(getattr(args, "end_utc", None) or sched_cfg.get("end", "2025-12-15T13:00:00Z"))
+    start_raw = str(getattr(args, "start_utc", None) or sched_cfg.get("start", "2025-09-16T00:00:00Z"))
+    end_raw = str(getattr(args, "end_utc", None) or sched_cfg.get("end", "2025-12-15T23:00:00Z"))
     topic_validation: Dict[str, Any] = {}
     topic_validation_ok = False
     topic_validation_funded = False
@@ -3713,420 +2969,7 @@ def run_pipeline(args, cfg, root_dir) -> int:
     # Deduplicate historical rows keeping at most one per (timestamp_utc, topic_id), preferring success rows
     dedupe_submission_log_file(log_csv)
 
-    # 9) Optional: trigger submission now using SDK directly
-    if args.submit:
-        # Clamp and validate live_value
-        if not (np.isfinite(live_value)):
-            print("ERROR: live_value is not finite; aborting submission.", file=sys.stderr)
-            return 1
-        if abs(live_value) > 2.0:
-            print("Warning: live prediction magnitude large; clamping to +/-2.", file=sys.stderr)
-            live_value = float(max(-2.0, min(2.0, live_value)))
 
-        # Read precomputed log10_loss if available
-        pre_log10_loss: Optional[float] = None
-        try:
-            mpath = os.path.join(root_dir, "data", "artifacts", "metrics.json")
-            if os.path.exists(mpath):
-                with open(mpath, "r", encoding="utf-8") as mf:
-                    _m = json.load(mf) or {}
-                if isinstance(_m, dict) and "log10_loss" in _m:
-                    v = _m.get("log10_loss")
-                    pre_log10_loss = float(v) if v is not None else None
-        except (OSError, IOError, ValueError, json.JSONDecodeError):
-            pre_log10_loss = None
-
-        if not args.force_submit and not (topic_validation_ok and topic_validation_funded and topic_validation_epoch):
-            reason = topic_validation_reason or "topic_validation_failed"
-            skip_msg = (
-                "Submission skipped: topic is not rewardable or active due to: "
-                f"{reason}; artifacts retained for monitoring and loop will retry."
-            )
-            print(skip_msg)
-            logging.warning(skip_msg)
-            try:
-                ws_now_tv = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
-                wallet_log = _resolve_wallet_for_logging(root_dir)
-                _log_submission(
-                    root_dir,
-                    ws_now_tv,
-                    int(topic_id_cfg or 67),
-                    live_value,
-                    wallet_log,
-                    None,
-                    None,
-                    False,
-                    0,
-                    "skipped_topic_not_ready",
-                    pre_log10_loss,
-                )
-            except Exception:
-                pass
-            return 0
-
-        # Cooldown guard: avoid EMA collisions by limiting one success per 600s window
-        def _seconds_since_last_success(csv_path: str) -> Optional[int]:
-            try:
-                if not os.path.exists(csv_path):
-                    return None
-                import csv as _csv
-                last_ts: Optional[pd.Timestamp] = None
-                with open(csv_path, "r", encoding="utf-8") as fh:
-                    r = _csv.DictReader(fh)
-                    for row in r:
-                        succ = (row.get("success", "").strip().lower() in ("true", "1"))
-                        ts = (row.get("timestamp_utc") or "").strip()
-                        if succ and ts:
-                            try:
-                                t = pd.Timestamp(ts).tz_localize("UTC") if pd.Timestamp(ts).tzinfo is None else pd.Timestamp(ts).tz_convert("UTC")
-                                if (last_ts is None) or (t > last_ts):
-                                    last_ts = t
-                            except Exception:
-                                continue
-                if last_ts is None:
-                    return None
-                now_u = pd.Timestamp.now(tz="UTC")
-                return int((now_u - last_ts).total_seconds())
-            except Exception:
-                return None
-
-        sec_ago = _seconds_since_last_success(log_csv)
-        if (sec_ago is not None) and (sec_ago < 600):
-            print(f"submit: cooldown active; last success {sec_ago}s ago < 600s; skipping to avoid EMA collision")
-            try:
-                ws_now_cd = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
-                w = _resolve_wallet_for_logging(root_dir)
-                _log_submission(root_dir, ws_now_cd, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "cooldown_600s", pre_log10_loss)
-            except Exception:
-                pass
-            return 0
-
-        # High-loss filter: require pre_log10_loss to be within top 25% (lowest losses)
-        def _recent_loss_q(csv_path: str, q: float = 0.25, k: int = 40) -> Optional[float]:
-            try:
-                if not os.path.exists(csv_path):
-                    return None
-                import csv as _csv
-                vals: List[float] = []
-                with open(csv_path, "r", encoding="utf-8") as fh:
-                    r = _csv.DictReader(fh)
-                    for row in r:
-                        s = (row.get("log10_loss") or "").strip()
-                        if s == "" or s.lower() == "null":
-                            continue
-                        try:
-                            v = float(s)
-                        except Exception:
-                            continue
-                        if np.isfinite(v):
-                            vals.append(v)
-                if not vals:
-                    return None
-                arr = np.array(vals[-k:], dtype=float)
-                if arr.size < 5:
-                    return None
-                return float(np.quantile(arr, q))
-            except Exception:
-                return None
-
-        q25 = _recent_loss_q(log_csv, q=0.25, k=40)
-        if (pre_log10_loss is not None) and (q25 is not None):
-            # Lower loss is better; require being <= q25
-            if not (pre_log10_loss <= q25):
-                print(f"submit: filtered out high-loss prediction (loss={pre_log10_loss:.6g} > q25={q25:.6g})")
-                try:
-                    ws_now_fl = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
-                    w = _resolve_wallet_for_logging(root_dir)
-                    _log_submission(root_dir, ws_now_fl, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "filtered_high_loss", pre_log10_loss)
-                except Exception:
-                    pass
-                return 0
-
-        # Competition window guard (UTC)
-        def _comp_window_from_config(root: str) -> Tuple[pd.Timestamp, pd.Timestamp]:
-            try:
-                if yaml is not None:
-                    cfg_path2 = os.path.join(root, "config", "pipeline.yaml")
-                    if os.path.exists(cfg_path2):
-                        with open(cfg_path2, "r", encoding="utf-8") as fh2:
-                            cfg2 = yaml.safe_load(fh2) or {}
-                        if isinstance(cfg2, dict):
-                            sch = cfg2.get("schedule", {}) or {}
-                            s = sch.get("start")
-                            e = sch.get("end")
-                            if isinstance(s, str) and isinstance(e, str):
-                                sdt = pd.Timestamp(s).tz_localize("UTC") if pd.Timestamp(s).tzinfo is None else pd.Timestamp(s).tz_convert("UTC")
-                                edt = pd.Timestamp(e).tz_localize("UTC") if pd.Timestamp(e).tzinfo is None else pd.Timestamp(e).tz_convert("UTC")
-                                return sdt, edt
-            except (OSError, IOError, ValueError, TypeError):
-                pass
-            return pd.Timestamp("2025-09-16T13:00:00Z"), pd.Timestamp("2025-12-15T13:00:00Z")
-
-        cadence_s = _load_cadence_from_config(root_dir)
-        ws_now = _window_start_utc(cadence_s=cadence_s)
-        comp_start, comp_end = _comp_window_from_config(root_dir)
-        now_utc = pd.Timestamp.now(tz="UTC")
-        if (not args.force_submit) and (not (comp_start <= now_utc < comp_end)):
-            print("submit: outside competition window; skipping submission")
-            try:
-                w = _resolve_wallet_for_logging(root_dir)
-                _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "outside_window")
-            except Exception:
-                pass
-            return 0
-        # Duplicate guards
-        # If --force-submit is NOT provided, enforce per-window duplicate guard.
-        if (not args.force_submit) and _has_submitted_this_hour(log_csv, ws_now):
-            print("submit: skipped; successful submission already recorded for this hour (CSV)")
-            try:
-                w = _resolve_wallet_for_logging(root_dir)
-                _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "skipped_window")
-            except Exception:
-                pass
-            return 0
-
-        # Additional blockchain-level duplicate check to prevent EMA errors
-        # This applies even with --force-submit to avoid blockchain rejections
-        intended_env = os.getenv("ALLORA_WALLET_ADDR", "").strip() or None
-        try:
-            topic_info = _run_allorad_json(["q", "emissions", "topic", str(int(topic_id_cfg or 67))]) or {}
-            last_epoch = topic_info.get("topic", {}).get("epoch_last_ended")
-            if last_epoch:
-                # Check if we already have a successful submission for this epoch
-                if _has_submitted_for_nonce(log_csv, int(last_epoch)):
-                    print(f"submit: skipped; already submitted for current epoch {last_epoch} (blockchain protection)")
-                    try:
-                        w = intended_env or _resolve_wallet_for_logging(root_dir)
-                        _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, last_epoch, None, False, 0, "epoch_already_submitted")
-                    except Exception:
-                        pass
-                    return 0
-        except Exception as e:
-            logging.warning(f"Could not check blockchain epoch status: {e}")
-
-        # Lifecycle: gate by Active and Churnable states per Allora Topic Life Cycle
-        lifecycle = _compute_lifecycle_state(int(topic_id_cfg or 67))
-        global _LAST_TOPIC_ACTIVE_STATE
-        current_active = bool(lifecycle.get("is_active", False))
-        is_rewardable = bool(lifecycle.get("is_rewardable", False))
-        inactive_reasons = lifecycle.get("inactive_reasons") or []
-        churn_reasons = lifecycle.get("churn_reasons") or []
-        activity_snapshot = lifecycle.get("activity_snapshot") or {}
-
-        reps_raw = activity_snapshot.get("reputers_count")
-        try:
-            reputers_count = int(float(reps_raw)) if reps_raw is not None else None
-        except (TypeError, ValueError):
-            reputers_count = None
-        delegated_stake_raw = activity_snapshot.get("delegated_stake")
-        try:
-            delegated_stake_val = float(delegated_stake_raw) if delegated_stake_raw is not None else None
-        except (TypeError, ValueError):
-            delegated_stake_val = None
-        min_delegate_raw = activity_snapshot.get("min_delegated_stake")
-        try:
-            min_delegate_val = float(min_delegate_raw) if min_delegate_raw is not None else None
-        except (TypeError, ValueError):
-            min_delegate_val = None
-        unfulfilled_raw = lifecycle.get("unfulfilled")
-        try:
-            unfulfilled_int = int(float(unfulfilled_raw)) if unfulfilled_raw is not None else None
-        except (TypeError, ValueError):
-            unfulfilled_int = None
-
-        lifecycle_report = (
-            "Lifecycle diagnostics:\n"
-            f"  is_active={current_active}\n"
-            f"  is_rewardable={is_rewardable}\n"
-            f"  inactive_reasons={inactive_reasons}\n"
-            f"  churn_reasons={churn_reasons}\n"
-            f"  reputers_count={reputers_count}\n"
-            f"  delegated_stake={delegated_stake_val}\n"
-            f"  min_delegated_stake={min_delegate_val}\n"
-            f"  unfulfilled={unfulfilled_int}\n"
-            f"  activity_snapshot={activity_snapshot}"
-        )
-        print(lifecycle_report)
-        logging.info(lifecycle_report)
-
-        previous_active = _LAST_TOPIC_ACTIVE_STATE
-        if current_active and previous_active is not True:
-            msg_active = "Topic now active — submitting"
-            print(msg_active)
-            logging.info(msg_active)
-        _LAST_TOPIC_ACTIVE_STATE = current_active
-        # Also enforce topic-creation parameter compatibility and funding before submission
-        topic_validation = _validate_topic_creation_and_funding(int(topic_id_cfg or 67), EXPECTED_TOPIC_67)
-        if not bool(topic_validation.get("funded", False)):
-            print("submit: topic not funded; call fund-topic first; skipping submission")
-            try:
-                w = intended_env or _resolve_wallet_for_logging(root_dir)
-                _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "topic_not_funded", pre_log10_loss)
-            except Exception:
-                pass
-            return 0
-        mism = topic_validation.get("mismatches") or []
-        if mism:
-            # Non-fatal: require at least loss_method/p_norm/allow_negative to be aligned; if not, skip
-            def _has_key(prefix: str) -> bool:
-                return any((isinstance(x, str) and x.startswith(prefix)) for x in mism)
-            if _has_key("loss_method:") or _has_key("p_norm:") or _has_key("allow_negative:"):
-                print(f"submit: topic params mismatch detected (critical): {mism}; skipping submission")
-                try:
-                    w = intended_env or _resolve_wallet_for_logging(root_dir)
-                    _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "topic_params_mismatch", pre_log10_loss)
-                except Exception:
-                    pass
-                return 0
-        # Persist lifecycle snapshot for auditability
-        try:
-            audit_dir = os.path.join(root_dir, "data", "artifacts", "logs")
-            os.makedirs(audit_dir, exist_ok=True)
-            ts_str = pd.Timestamp.now(tz="UTC").strftime("%Y%m%dT%H%M%SZ")
-            with open(os.path.join(audit_dir, f"lifecycle-{ts_str}.json"), "w", encoding="utf-8") as lf:
-                json.dump(lifecycle, lf, indent=2)
-        except Exception:
-            pass
-        # Check Active (funding+stake+reputers) and rewardability/nonce hygiene
-        reps_for_skip = reputers_count
-        unfulfilled_for_skip = unfulfilled_int
-        stake_for_skip = delegated_stake_val
-        min_stake_for_skip = min_delegate_val
-        should_skip = (
-            not current_active
-            or not is_rewardable
-            or reps_for_skip is None
-            or reps_for_skip < 1
-            or (unfulfilled_for_skip is not None and unfulfilled_for_skip > 0)
-            or stake_for_skip is None
-            or (
-                min_stake_for_skip is not None
-                and stake_for_skip is not None
-                and stake_for_skip < min_stake_for_skip
-            )
-        )
-        if not args.force_submit and should_skip:
-            snapshot = activity_snapshot
-            eff = snapshot.get("effective_revenue")
-            stk = snapshot.get("delegated_stake")
-            reps = snapshot.get("reputers_count")
-            min_req = snapshot.get("min_delegated_stake")
-            reason_list = [str(r) for r in inactive_reasons if r]
-            if (reps_for_skip is None or reps_for_skip < 1) and "reputers missing" not in reason_list:
-                reason_list.append("reputers missing")
-            if unfulfilled_for_skip is not None and unfulfilled_for_skip > 0:
-                reason_list.append(f"unfulfilled_nonces:{unfulfilled_for_skip}")
-            if (stake_for_skip is None) and "stake unavailable" not in reason_list:
-                reason_list.append("stake unavailable")
-            if (
-                stake_for_skip is not None
-                and min_stake_for_skip is not None
-                and stake_for_skip < min_stake_for_skip
-                and "stake below minimum requirement" not in reason_list
-            ):
-                reason_list.append("stake below minimum requirement")
-            if not is_rewardable and "not_rewardable" not in reason_list:
-                reason_list.append("not_rewardable")
-            reason_str = ", ".join(reason_list) if reason_list else "unknown"
-            skip_msg = (
-                "Submission skipped: topic is not rewardable or active due to: "
-                f"{reason_str}"
-            )
-            print(skip_msg)
-            logging.warning(skip_msg)
-            wait_msg = (
-                "Waiting for topic to activate: "
-                f"effective_revenue={eff} delegated_stake={stk} reputers_count={reps} "
-                f"min_required_stake={min_req} unfulfilled={unfulfilled_for_skip}; Will retry next loop."
-            )
-            print(wait_msg)
-            logging.info(wait_msg)
-            try:
-                detailed_status = "skipped_topic_not_ready"
-                try:
-                    wallet_for_log = intended_env or _resolve_wallet_for_logging(root_dir)
-                except Exception:
-                    wallet_for_log = intended_env
-                _log_submission(
-                    root_dir,
-                    ws_now,
-                    int(topic_id_cfg or 67),
-                    live_value,
-                    wallet_for_log,
-                    None,
-                    None,
-                    False,
-                    0,
-                    detailed_status,
-                    pre_log10_loss,
-                )
-            except Exception:
-                pass
-            return 0
-        # Check Churnable (epoch elapsed and weight rank acceptable)
-        if not args.force_submit and not lifecycle.get("is_churnable", False):
-            reasons = lifecycle.get("churn_reasons") or []
-            print(f"submit: topic Active but not Churnable; reasons={reasons}; skipping submission")
-            try:
-                w = intended_env or _resolve_wallet_for_logging(root_dir)
-                status = "active_not_churnable:" + ",".join(reasons) if isinstance(reasons, list) else "active_not_churnable"
-                _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, status, pre_log10_loss)
-            except Exception:
-                pass
-            return 0
-
-        # Submit via client using XGB-only policy to ensure non-null forecast
-        _env_wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
-        if _env_wallet and not _env_wallet.endswith("6vma"):
-            print(f"Warning: ALLORA_WALLET_ADDR does not end with '6vma' (got ...{_env_wallet[-4:]}); ensure correct worker wallet is configured.", file=sys.stderr)
-        helper_result = _submit_via_external_helper(
-            int(topic_id_cfg or 67),
-            float(live_value),
-            root_dir,
-            pre_log10_loss,
-            int(args.submit_timeout),
-        )
-        if helper_result is not None:
-            helper_rc, helper_success = helper_result
-            if helper_success:
-                try:
-                    _update_window_lock(root_dir, cadence_s, intended_env)
-                except Exception:
-                    pass
-                try:
-                    _post_submit_backfill(root_dir, tail=20, attempts=3, delay_s=2.0)
-                except Exception:
-                    pass
-                return helper_rc
-            else:
-                print("submit(helper): external helper failed, falling back to direct client submission", file=sys.stderr)
-
-        api_key = _require_api_key()
-        # Prefer client-based submit to guarantee forecast, fallback to SDK worker if client path fails
-        rc_client = asyncio.run(_submit_with_client_xgb(int(topic_id_cfg or 67), float(live_value), root_dir, pre_log10_loss, args.force_submit))
-        rc = rc_client
-        if rc_client != 0:
-            # Always attempt SDK fallback when client path fails; unfulfilled nonces query can be stale
-            print("Client-based xgb-only submit failed; attempting SDK worker fallback (forecast may be null)", file=sys.stderr)
-            rc = asyncio.run(_submit_with_sdk(int(topic_id_cfg or 67), float(live_value), api_key, int(args.submit_timeout), int(args.submit_retries), root_dir, pre_log10_loss))
-        if rc == 0:
-            try:
-                _update_window_lock(root_dir, cadence_s, intended_env)
-            except Exception:
-                pass
-            # Best-effort score/reward backfill for recent rows
-            try:
-                _post_submit_backfill(root_dir, tail=20, attempts=3, delay_s=2.0)
-            except Exception:
-                pass
-        # After submission, normalize/dedupe once more in case new rows were added
-        try:
-            ensure_submission_log_schema(log_csv)
-            normalize_submission_log_file(log_csv)
-            dedupe_submission_log_file(log_csv)
-        except (OSError, IOError, ValueError, RuntimeError):
-            pass
-        return rc
 
     return 0
 
@@ -4141,10 +2984,6 @@ def main() -> int:
     parser.add_argument("--end-utc", default=None, help="End datetime in UTC (ISO format)")
     parser.add_argument("--as-of", default=None, help="As-of datetime in UTC (ISO format)")
     parser.add_argument("--as-of-now", action="store_true", help="Use current UTC time as as_of")
-    parser.add_argument("--submit", action="store_true", help="Submit the prediction after training")
-    parser.add_argument("--submit-timeout", type=int, default=30, help="Timeout for submission in seconds")
-    parser.add_argument("--submit-retries", type=int, default=3, help="Number of retries for submission")
-    parser.add_argument("--force-submit", action="store_true", help="Force submission even if guards are active")
     parser.add_argument("--loop", action="store_true", help="Continuously run training/submission cycles based on cadence")
     parser.add_argument("--once", action="store_true", help="Run exactly one iteration even if config requests loop")
     parser.add_argument("--timeout", type=int, default=0, help="Loop runtime limit in seconds (0 runs indefinitely)")

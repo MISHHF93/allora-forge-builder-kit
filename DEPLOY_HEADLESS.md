@@ -47,21 +47,22 @@ crontab -e
 Add lines (adjust paths and python path if needed):
 ```
 # Submit every 30 minutes
-*/30 * * * * cd /home/ubuntu/allora-forge-builder-kit && ALLORA_CHAIN_ID=allora-testnet-1 ALLORA_RPC_URL=https://allora-rpc.testnet.allora.network /usr/bin/python3 -u submit_prediction.py --mode sdk --topic-id 67 --timeout 240 --source model >> /home/ubuntu/allora-forge-builder-kit/data/cron_submit.log 2>&1
+*/30 * * * * cd /home/ubuntu/allora-forge-builder-kit && ALLORA_CHAIN_ID=allora-testnet-1 ALLORA_RPC_URL=https://allora-rpc.testnet.allora.network /usr/bin/python3 -u submit_prediction.py --topic-id 67 --timeout 240 --retries 3 >> /home/ubuntu/allora-forge-builder-kit/data/cron_submit.log 2>&1
 
 # Retrain daily at 02:05
 5 2 * * * cd /home/ubuntu/allora-forge-builder-kit && /usr/bin/python3 -u train.py >> /home/ubuntu/allora-forge-builder-kit/data/cron_train.log 2>&1
 ```
 
-Alternatively, use the included wrappers:
+To orchestrate training and submission in a single pass, schedule the bundled
+workflow runner instead of the removed shell wrappers:
 ```
-*/30 * * * * /home/ubuntu/allora-forge-builder-kit/scripts/cron_submit.sh
-5 2 * * * /home/ubuntu/allora-forge-builder-kit/scripts/cron_train.sh
+*/30 * * * * cd /home/ubuntu/allora-forge-builder-kit && /usr/bin/python3 -u run_training_and_submission.py >> /home/ubuntu/allora-forge-builder-kit/data/cron_pipeline.log 2>&1
 ```
 
 Logs:
 - `data/cron_submit.log`
 - `data/cron_train.log`
+- `data/cron_pipeline.log`
 
 ## Optional: systemd service
 Create `/etc/systemd/system/allora-submit.service`:
@@ -75,7 +76,7 @@ Type=oneshot
 Environment=ALLORA_CHAIN_ID=allora-testnet-1
 Environment=ALLORA_RPC_URL=https://allora-rpc.testnet.allora.network
 WorkingDirectory=/home/ubuntu/allora-forge-builder-kit
-ExecStart=/usr/bin/python3 -u submit_prediction.py --mode sdk --topic-id 67 --timeout 240 --source model
+ExecStart=/usr/bin/python3 -u submit_prediction.py --topic-id 67 --timeout 240 --retries 3
 
 [Install]
 WantedBy=multi-user.target
