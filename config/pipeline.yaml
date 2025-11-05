@@ -2,46 +2,23 @@
 # Pipeline configuration for Topic 67: 7-day BTC/USD log-return (hourly updates)
 
 data:
-  from_month: "2025-10"
-  non_overlap_hours: 48
+  ticker: "btcusd"
+  target_hours: 168            # 7 days
+  history_buffer_hours: 48
 
 schedule:
-  mode: single               # single | backfill
   cadence: "1h"
   start: "2025-09-16T00:00:00Z"
   end: "2025-12-15T23:00:00Z"
-
-features:
-  use_eth: true
-  use_external: false
-  external_files: []         # e.g., ["macro_fred.csv", "onchain_glassnode.csv"]
-  rsi_period: 14
-  macd_fast: 12
-  macd_slow: 26
-  macd_signal: 9
-  bb_window: 20
-  bb_n_std: 2.0
-
-model:
-  base_learners: ["xgb"]
-  meta_learner: null
-  optuna_trials: 0           # set >0 to enable tuning
-  cv_folds: 5
-  cv_scheme: "expanding"
-  stratify_by_vol: true
-  random_seed: 42
-
-regularization:
-  dropout: 0.0
-  l1: 0.0
-  l2: 0.3
-
-deep:
-  enabled: false
-  max_epochs: 20
-  batch_size: 64
+  train_span_hours: 672        # 28 days of history
+  validation_span_hours: 168   # 7 days
+  test_span_hours: 24          # final day used for evaluation
 
 submission:
   topic_id: 67
   artifact_path: "data/artifacts/predictions.json"
+  metrics_path: "data/artifacts/metrics.json"
+  model_path: "data/artifacts/model.joblib"
+  log_path: "submission_log.csv"
   timeout_seconds: 120
+  retries: 2
