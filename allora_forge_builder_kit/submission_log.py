@@ -243,13 +243,60 @@ def dedupe_submission_log_file(path: str) -> None:
 
 
 def log_submission_row(path: str, row: Dict[str, Any]) -> None:
-    """Append a single row in canonical order to the CSV, creating the file if needed, with basic lock."""
+    """Write a submission row, replacing any existing entry for the same epoch/topic."""
+
     ensure_submission_log_schema(path)
     ordered = [_normalize_cell(row.get(k)) for k in CANONICAL_SUBMISSION_HEADER]
-    # Acquire simple lock to serialize concurrent writers
+    key_indices = (
+        CANONICAL_SUBMISSION_HEADER.index("timestamp_utc"),
+        CANONICAL_SUBMISSION_HEADER.index("topic_id"),
+    )
+    key = tuple(ordered[idx] for idx in key_indices)
+
     fd = _acquire_lock(path, timeout_s=5.0)
     try:
-        with open(path, "a", newline="", encoding="utf-8") as fh:
-            csv.writer(fh).writerow(ordered)
+        try:
+            with open(path, "r", newline="", encoding="utf-8") as fh:
+                reader = list(csv.reader(fh))
+        except FileNotFoundError:
+            reader = []
+        except Exception:
+            reader = []
+
+        if not reader:
+            current_rows: List[List[str]] = [CANONICAL_SUBMISSION_HEADER]
+        else:
+            header = reader[0]
+            current_rows = [CANONICAL_SUBMISSION_HEADER]
+            for existing in reader[1:]:
+                if existing == CANONICAL_SUBMISSION_HEADER:
+                    continue
+                current_rows.append(_normalize_row_fixed(existing))
+
+        updated_body: List[List[str]] = []
+        replaced = False
+        for existing in current_rows[1:]:
+            try:
+                existing_key = tuple(existing[idx] for idx in key_indices)
+            except Exception:
+                existing_key = None
+            if existing_key == key:
+                if not replaced:
+                    updated_body.append(ordered)
+                    replaced = True
+                else:
+                    continue
+            else:
+                updated_body.append(existing)
+
+        if not replaced:
+            updated_body.append(ordered)
+
+        _atomic_write(
+            path,
+            lambda fh: csv.writer(fh).writerows(
+                [CANONICAL_SUBMISSION_HEADER] + updated_body
+            ),
+        )
     finally:
         _release_lock(path, fd)
