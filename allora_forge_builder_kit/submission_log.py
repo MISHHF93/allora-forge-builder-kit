@@ -5,6 +5,7 @@ import os
 from typing import Any, Dict, Iterable, List, Callable, Optional
 import re
 import time
+import numpy as np
 
 def _lock_path(path: str) -> str:
     return f"{path}.lock"
@@ -84,6 +85,32 @@ def _normalize_cell(v: Any) -> str:
     low = s.lower()
     if low in ("nan", "inf", "+inf", "infinity", "+infinity", "-inf", "-infinity"):
         return "null"
+    
+    # For numeric values, ensure consistent formatting
+    try:
+        # Check if it's an integer first
+        if '.' not in s and 'e' not in low:
+            int_val = int(s)
+            return str(int_val)  # Return as integer string
+        
+        float_val = float(s)
+        if np.isfinite(float_val):
+            # Check if it's actually an integer value
+            if float_val.is_integer():
+                return str(int(float_val))
+            # Format with appropriate precision based on magnitude
+            elif abs(float_val) < 1e-10:
+                return "0"
+            elif abs(float_val) >= 1e6:
+                return f"{float_val:.6e}"  # Scientific notation for very large numbers
+            elif abs(float_val) >= 1:
+                return f"{float_val:.6f}".rstrip('0').rstrip('.')  # Remove trailing zeros
+            else:
+                return f"{float_val:.12f}".rstrip('0').rstrip('.')  # Higher precision for small numbers
+        return "null"
+    except (ValueError, TypeError):
+        pass
+    
     return s
 
 

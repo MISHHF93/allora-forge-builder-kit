@@ -474,6 +474,30 @@ def _log_submission(
     csv_path = os.path.join(root_dir, "submission_log.csv")
     ensure_submission_log_schema(csv_path)
     normalize_submission_log_file(csv_path)
+    
+    # Check for duplicate epoch to prevent duplicate log lines
+    timestamp_str = window_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    def _check_existing_entry() -> bool:
+        """Check if this epoch already has a successful entry logged."""
+        try:
+            if not os.path.exists(csv_path):
+                return False
+            with open(csv_path, "r", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                for row_data in reader:
+                    if (row_data.get("timestamp_utc") == timestamp_str and 
+                        row_data.get("topic_id") == str(topic_id) and
+                        row_data.get("success", "").lower() == "true"):
+                        return True
+            return False
+        except Exception:
+            return False
+    
+    # Skip logging if we already have a successful entry for this epoch
+    if success and _check_existing_entry():
+        return
+    
     try:
         # Write a single row in canonical order via dict API
         # Helper to allow a string like "pending" for reward while keeping numerics numeric
@@ -498,18 +522,39 @@ def _log_submission(
                     return s
             return None
 
+        # Format numeric values with consistent precision
+        def _format_numeric(val: Any, precision: int = 6) -> Any:
+            if val is None:
+                return None
+            try:
+                float_val = float(val)
+                if np.isfinite(float_val):
+                    return round(float_val, precision)
+                return None
+            except (ValueError, TypeError):
+                return val  # Return as-is for non-numeric values like "pending"
+
+        def _format_integer(val: Any) -> Any:
+            """Format integers without decimal places or scientific notation."""
+            if val is None:
+                return None
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                return None
+
         row: Dict[str, Any] = {
             "timestamp_utc": window_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "topic_id": int(topic_id),
-            "value": float(value) if value is not None else None,
+            "value": _format_numeric(value, 12),  # High precision for prediction values
             "wallet": wallet,
-            "nonce": int(nonce) if isinstance(nonce, int) else None,
+            "nonce": _format_integer(nonce),  # Integer formatting for nonce
             "tx_hash": tx_hash,
             "success": bool(success),
             "exit_code": int(exit_code),
             "status": str(status),
-            "log10_loss": float(log10_loss) if (log10_loss is not None) else None,
-            "score": float(score) if (score is not None) else None,
+            "log10_loss": _format_numeric(log10_loss, 10),  # High precision for loss
+            "score": _format_numeric(score, 8),  # Standard precision for scores
             "reward": _num_or_str(reward),
         }
         log_submission_row(csv_path, row)
@@ -1954,13 +1999,27 @@ async def _submit_with_sdk(topic_id: int, value: float, api_key: str, timeout_s:
                                         except (OSError, IOError, ValueError, TypeError):
                                             pass
                                     ws = _window_start_utc(cadence_s=cadence_s)
-                                    # Populate EMA score and reward if not already provided by SDK
+                                    # Populate EMA score and reward with enhanced retry logic
                                     score_final = last_score
                                     if score_final is None:
-                                        score_final = _query_ema_score(topic_id, wallet_str)
+                                        # Try multiple attempts with increasing delays for eventual consistency
+                                        for attempt in range(3):
+                                            score_final = _query_ema_score(topic_id, wallet_str, retries=2, delay_s=1.0 + attempt)
+                                            if score_final is not None:
+                                                break
+                                            time.sleep(0.5)  # Brief pause between attempts
+                                    
                                     reward_final = last_reward
                                     if reward_final is None:
-                                        reward_final = _query_reward_for_tx(wallet_str, str(t)) or "pending"
+                                        # Enhanced reward retrieval with retry logic
+                                        for attempt in range(3):
+                                            reward_final = _query_reward_for_tx(wallet_str, str(t), retries=2, delay_s=1.0 + attempt)
+                                            if reward_final is not None:
+                                                break
+                                            time.sleep(0.5)  # Brief pause between attempts
+                                        # If still None, mark as pending for later refresh
+                                        if reward_final is None:
+                                            reward_final = "pending"
                                     _log_submission(root_dir, ws, topic_id, value, wallet_str, int(n) if isinstance(n, int) else last_nonce, str(t), True, 0, last_status or "submitted", last_loss if last_loss is not None else pre_log10_loss, score_final, reward_final)
                                     return 0
                             except (OSError, IOError, ValueError, TypeError, RuntimeError):
@@ -2030,13 +2089,24 @@ async def _submit_with_sdk(topic_id: int, value: float, api_key: str, timeout_s:
                             return 3
                         if tx:
                             ws = _window_start_utc(cadence_s=cadence_s)
-                            # If SDK didn't include a score/reward, try querying the chain
+                            # Enhanced score and reward retrieval with retry logic
                             score_final2 = sc if sc is not None else last_score
                             if score_final2 is None:
-                                score_final2 = _query_ema_score(topic_id, wallet_str)
+                                for attempt in range(3):
+                                    score_final2 = _query_ema_score(topic_id, wallet_str, retries=2, delay_s=1.0 + attempt)
+                                    if score_final2 is not None:
+                                        break
+                                    time.sleep(0.5)
+                            
                             reward_final2: Any = rew if rew is not None else last_reward
                             if reward_final2 is None:
-                                reward_final2 = _query_reward_for_tx(wallet_str, str(tx)) or "pending"
+                                for attempt in range(3):
+                                    reward_final2 = _query_reward_for_tx(wallet_str, str(tx), retries=2, delay_s=1.0 + attempt)
+                                    if reward_final2 is not None:
+                                        break
+                                    time.sleep(0.5)
+                                if reward_final2 is None:
+                                    reward_final2 = "pending"
                             _log_submission(root_dir, ws, topic_id, value, wallet_str, int(nonce) if nonce is not None else last_nonce, str(tx), True, 0, status or last_status or "submitted", (loss if loss is not None else (last_loss if last_loss is not None else pre_log10_loss)), score_final2, reward_final2)
                             return 0
                         else:
@@ -3429,6 +3499,60 @@ def run_pipeline(args, cfg, root_dir) -> int:
     X_val = _clip_outliers(X_val, ["logret_1h"]) if not X_val.empty and "logret_1h" in X_val.columns else X_val
     X_test = _clip_outliers(X_test, ["logret_1h"]) if "logret_1h" in X_test.columns else X_test
 
+    # 4.5) Feature deduplication: remove duplicate columns to prevent data leakage and overfitting
+    def _deduplicate_features(df: pd.DataFrame, name: str) -> pd.DataFrame:
+        """Remove duplicate columns by name and content, ensuring feature integrity."""
+        if df.empty:
+            return df
+        
+        original_count = len(df.columns)
+        
+        # Step 1: Remove exact column name duplicates (keep first occurrence)
+        df_deduped = df.loc[:, ~df.columns.duplicated(keep='first')]
+        name_dupes_removed = original_count - len(df_deduped.columns)
+        
+        # Step 2: Remove columns with identical content but different names
+        # Use a more efficient approach for large datasets by comparing column hashes
+        cols_to_keep = []
+        content_signatures = {}
+        
+        for col in df_deduped.columns:
+            # Create a content signature using hash of non-null values
+            try:
+                col_data = df_deduped[col].dropna()
+                if len(col_data) > 0:
+                    # Use a robust hash that handles floating point precision
+                    content_hash = hash(tuple(np.round(col_data.astype(float), 8).values)) if col_data.dtype.kind in 'biufc' else hash(tuple(col_data.values))
+                else:
+                    content_hash = hash(tuple())  # Empty column signature
+                
+                # Check if we've seen this content before
+                if content_hash not in content_signatures:
+                    content_signatures[content_hash] = col
+                    cols_to_keep.append(col)
+                else:
+                    print(f"    Dropping content duplicate: '{col}' (identical to '{content_signatures[content_hash]}')")
+            except (TypeError, ValueError, OverflowError):
+                # If hashing fails, keep the column to be safe
+                cols_to_keep.append(col)
+        
+        df_final = df_deduped[cols_to_keep]
+        content_dupes_removed = len(df_deduped.columns) - len(df_final.columns)
+        total_removed = name_dupes_removed + content_dupes_removed
+        
+        if total_removed > 0:
+            print(f"  {name}: Removed {total_removed} duplicate features ({name_dupes_removed} name dupes, {content_dupes_removed} content dupes)")
+            print(f"  {name}: {original_count} → {len(df_final.columns)} features after deduplication")
+        else:
+            print(f"  {name}: No duplicate features detected ({original_count} unique features)")
+        
+        return df_final
+
+    print("🔍 Checking for duplicate features across all splits...")
+    X_train = _deduplicate_features(X_train, "X_train")
+    X_val = _deduplicate_features(X_val, "X_val") if not X_val.empty else X_val
+    X_test = _deduplicate_features(X_test, "X_test") if not X_test.empty else X_test
+
     # 5) Feature selection: ensure aligned numeric columns across splits with debug logs
     def _print_cols(df: pd.DataFrame, name: str) -> None:
         """Log a truncated list of column names to avoid gigantic stdout lines."""
@@ -3485,6 +3609,13 @@ def run_pipeline(args, cfg, root_dir) -> int:
         _print_cols(X_train, "X_train[fallback]")
         _print_cols(X_val, "X_val[fallback]")
         _print_cols(X_test, "X_test[fallback]")
+        
+        # Apply deduplication to fallback splits as well
+        print("🔍 Checking for duplicate features in fallback splits...")
+        X_train = _deduplicate_features(X_train, "X_train[fallback]")
+        X_val = _deduplicate_features(X_val, "X_val[fallback]") if not X_val.empty else X_val
+        X_test = _deduplicate_features(X_test, "X_test[fallback]") if not X_test.empty else X_test
+        
         num_train = X_train.select_dtypes(include=["number"]).columns.tolist()
         num_val = X_val.select_dtypes(include=["number"]).columns.tolist() if not X_val.empty else num_train
         num_test = X_test.select_dtypes(include=["number"]).columns.tolist() if not X_test.empty else num_train
@@ -3493,6 +3624,15 @@ def run_pipeline(args, cfg, root_dir) -> int:
 
     if not feature_cols:
         raise RuntimeError("No common numeric feature columns across train/val/test after fallback. Cannot train model.")
+
+    # Final feature integrity verification
+    print(f"✅ Feature deduplication complete: {len(feature_cols)} unique features verified for model training")
+    print(f"📊 Final feature set ranges from '{feature_cols[0]}' to '{feature_cols[-1]}'" if feature_cols else "📊 No features available")
+    
+    # Verify no duplicate column names in the final feature set
+    if len(feature_cols) != len(set(feature_cols)):
+        duplicates = [col for col in set(feature_cols) if feature_cols.count(col) > 1]
+        raise RuntimeError(f"Critical error: Duplicate feature names detected in final set: {duplicates}")
 
     # 6) Train base learner (XGBoost-only)
 
