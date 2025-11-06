@@ -45,15 +45,33 @@ async def check():
         topics = await client.get_all_topics()
         topic_67 = next((t for t in topics if t.topic_id == 67), None)
         if topic_67:
-            print(f'   ✅ Topic 67: ACTIVE ({topic_67.worker_count} workers)')
-            print(f'   💰 Staked: {topic_67.total_staked_allo:.1f} ALLO')
-            print(f'   🎁 Emissions: {topic_67.total_emissions_allo:.3f} ALLO')
+            try:
+                worker_count = int(topic_67.worker_count)
+                print(f'   ✅ Topic 67: ACTIVE ({worker_count} workers)')
+            except (ValueError, TypeError):
+                print(f'   ✅ Topic 67: ACTIVE ({topic_67.worker_count} workers)')
+            
+            try:
+                staked_val = float(topic_67.total_staked_allo)
+                print(f'   💰 Staked: {staked_val:.1f} ALLO')
+            except (ValueError, TypeError):
+                print(f'   💰 Staked: {topic_67.total_staked_allo} ALLO')
+            
+            try:
+                emissions_val = float(topic_67.total_emissions_allo)
+                print(f'   🎁 Emissions: {emissions_val:.3f} ALLO')
+            except (ValueError, TypeError):
+                print(f'   🎁 Emissions: {topic_67.total_emissions_allo} ALLO')
         else:
             print('   ❌ Topic 67 not found')
             
         inference = await client.get_inference_by_topic_id(67)
         if inference:
-            print(f'   📈 Latest inference: {inference.inference_data.network_inference_normalized:.6f}')
+            try:
+                normalized_val = float(inference.inference_data.network_inference_normalized)
+                print(f'   📈 Latest inference: {normalized_val:.6f}')
+            except (ValueError, TypeError):
+                print(f'   📈 Latest inference: {inference.inference_data.network_inference_normalized}')
         else:
             print('   ❌ No inference data')
     except Exception as e:
