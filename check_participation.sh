@@ -20,10 +20,13 @@ fi
 # Check monitoring status
 echo ""
 echo "🤖 **Automated System Status:**"
-if pgrep -f "continuous_monitor" > /dev/null; then
-    echo "   ✅ Continuous monitoring: ACTIVE"
+MONITOR_PID_FILE="data/artifacts/logs/continuous_monitor.pid"
+if [ -f "$MONITOR_PID_FILE" ] && pgrep -f "continuous_monitor" > /dev/null; then
+    MONITOR_PID=$(cat "$MONITOR_PID_FILE" 2>/dev/null || echo "unknown")
+    echo "   ✅ Continuous monitoring: ACTIVE (PID: $MONITOR_PID)"
 else
     echo "   ❌ Continuous monitoring: INACTIVE"
+    echo "      Run: ./start_monitoring.sh"
 fi
 
 if crontab -l | grep -q "run_pipeline.sh"; then
