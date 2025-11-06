@@ -19,6 +19,6 @@ submission:
   artifact_path: "data/artifacts/predictions.json"
   metrics_path: "data/artifacts/metrics.json"
   model_path: "data/artifacts/model.joblib"
-  log_path: "submission_log.csv"
+  log_path: "data/artifacts/logs/submission_log.csv"
   timeout_seconds: 120
   retries: 2

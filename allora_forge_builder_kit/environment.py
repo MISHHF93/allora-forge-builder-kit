@@ -37,6 +37,16 @@ def load_environment(root: Path, override: bool = False) -> None:
     if env_path.exists():
         load_dotenv(env_path, override=override)
 
+    # Load mnemonic from .allora_key if present
+    allora_key_path = root / ".allora_key"
+    if allora_key_path.exists():
+        try:
+            mnemonic = allora_key_path.read_text(encoding="utf-8").strip()
+            if mnemonic and not os.getenv("ALLORA_MNEMONIC"):
+                os.environ["ALLORA_MNEMONIC"] = mnemonic
+        except OSError:
+            pass  # Ignore file read errors
+
     # Normalise builder specific variable names for the SDK
     _promote_env("ALLORA_API_KEY", "ALLORA_API_KEY")
     _promote_env("ALLORA_WALLET_ADDR", "ALLORA_WALLET_ADDR")

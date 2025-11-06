@@ -29,16 +29,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     train_parser = subparsers.add_parser("train", help="Run feature generation and training")
     train_parser.add_argument("--when", help="Override inference timestamp (ISO8601)")
-    train_parser.add_argument("--submit", action="store_true", help="Submit immediately after training")
+    train_parser.add_argument("--when-train", help="Override inference timestamp (ISO8601) for training")
+    train_parser.add_argument("--submit", action="store_true", help="Submit prediction after training")
 
     submit_parser = subparsers.add_parser("submit", help="Submit an existing prediction artifact")
     submit_parser.add_argument("--artifact", type=Path, help="Path to prediction artifact")
-    submit_parser.add_argument("--topic-id", type=int, help="Override topic id")
+    submit_parser.add_argument("--topic-id", type=int, help="Override topic ID")
     submit_parser.add_argument("--timeout", type=int, help="Submission timeout in seconds")
-    submit_parser.add_argument("--retries", type=int, help="Maximum submission retries")
+    submit_parser.add_argument("--retries", type=int, help="Number of submission retries")
 
-    tas_parser = subparsers.add_parser("train-and-submit", help="Run training followed by submission")
-    tas_parser.add_argument("--when", help="Override inference timestamp (ISO8601)")
+    train_and_submit_parser = subparsers.add_parser("train-and-submit", help="Run training followed by submission")
+    train_and_submit_parser.add_argument("--when", help="Override inference timestamp (ISO8601)")
 
     return parser
 

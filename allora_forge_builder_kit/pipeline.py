@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import yaml
+import hashlib
 
 from .alpha_features import build_alpha_features
 from .environment import load_environment, require_api_key
@@ -100,14 +102,17 @@ class Pipeline:
         self.train_logger.info("Training for inference window ending %s", windows.inference_time)
 
         series = self._load_hourly_series(windows)
-        features = build_alpha_features(series["close"])  # type: ignore[arg-type]
-        features = features.fillna(method="ffill").dropna()
-        features = self._deduplicate_features(features)
-
+        
+        # Use the full feature set from alpha_features
+        features = build_alpha_features(series["close"])
+        
         # Add simple volume feature for additional signal
         if "volume" in series:
             volume_hourly = series["volume"].resample("1h").sum().reindex(features.index).fillna(0.0)
             features["volume_log"] = np.log1p(volume_hourly)
+            
+        features = features.ffill().dropna()
+        features = self._deduplicate_features(features)
 
         target = np.log(series["close"].shift(-self.config.target_hours) / series["close"])
         frame = features.join(target.rename("target"), how="left")
@@ -117,9 +122,13 @@ class Pipeline:
         if features.empty:
             raise RuntimeError("No feature rows available prior to inference time.")
 
+        # Align with the competition schedule
         train_df = self._slice(frame, windows.train_start, windows.train_end)
         val_df = self._slice(frame, windows.validation_start, windows.validation_end)
-        test_df = self._slice(frame, windows.test_start, windows.test_end)
+        
+        # The test set is the single inference row
+        inference_row, inference_time = self._select_inference_row(features, windows.inference_time)
+        test_df = pd.DataFrame([inference_row])
 
         self.train_logger.info(
             "Samples - train: %s validation: %s test: %s",
@@ -136,7 +145,6 @@ class Pipeline:
 
         metrics = self._evaluate(model, train_df, val_df, test_df)
 
-        inference_row, inference_time = self._select_inference_row(features, windows.inference_time)
         prediction_value = float(model.predict(inference_row.values.reshape(1, -1))[0])
 
         self._write_artifacts(prediction_value, inference_time, windows, metrics, model)
@@ -149,7 +157,7 @@ class Pipeline:
             artifact_path=self.config.artifact_path,
         )
 
-    def run_submission(self, artifact_path: Optional[Path] = None, topic_id: Optional[int] = None, timeout: Optional[int] = None, retries: Optional[int] = None) -> SubmissionResult:
+    def run_submission(self, artifact_path: Optional[Path] = None, topic_id: Optional[int] = None, timeout: Optional[int] = None, retries: Optional[int] = None, training_metrics: Optional[Dict[str, float]] = None, inference_time: Optional[datetime] = None) -> SubmissionResult:
         path = Path(artifact_path or self.config.artifact_path)
         data = json.loads(path.read_text(encoding="utf-8"))
         value = float(data["value"])
@@ -163,12 +171,67 @@ class Pipeline:
             log_path=self.config.submission_log,
             repo_root=self.root,
             api_key=api_key,
+            training_metrics=training_metrics,
         )
+
+        # Check if already submitted for this inference window
+        current_hour = inference_time or datetime.now(timezone.utc)
+        if self._is_already_submitted_for_hour(self.config.submission_log, topic, current_hour):
+            self.train_logger.info("Skipping submission - already submitted for this hour (%s)", current_hour.replace(minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z"))
+            # Log the skip
+            timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            wallet = os.getenv("ALLORA_WALLET_ADDR") or None
+            from .submission_log import log_submission_row
+            log_submission_row(
+                str(cfg.log_path),
+                {
+                    "timestamp_utc": timestamp,
+                    "topic_id": topic,
+                    "value": value,
+                    "wallet": wallet,
+                    "nonce": None,
+                    "tx_hash": None,
+                    "success": False,
+                    "exit_code": 0,
+                    "status": "already_submitted_locally",
+                    "log10_loss": cfg.training_metrics.get("val_log10_loss") if cfg.training_metrics else None,
+                    "score": cfg.training_metrics.get("val_mae") if cfg.training_metrics else None,
+                    "reward": "pending",
+                },
+            )
+            return SubmissionResult(False, 0, "already_submitted_locally", None, None)
+
         return asyncio.run(submit_prediction(value, cfg))
 
+    def _is_already_submitted_for_hour(self, log_path: Path, topic_id: int, current_hour: datetime) -> bool:
+        """Check if there's already a successful submission for this topic and hour."""
+        if not log_path.exists():
+            return False
+        try:
+            import csv
+            with open(log_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                target_hour = current_hour.replace(minute=0, second=0, microsecond=0)
+                for row in reader:
+                    if (int(row.get("topic_id", 0)) == topic_id and 
+                        row.get("success") == "true"):
+                        try:
+                            row_ts = datetime.fromisoformat(row["timestamp_utc"].replace("Z", "+00:00"))
+                            row_ts = row_ts.replace(tzinfo=None)  # Make naive for comparison
+                            row_hour = row_ts.replace(minute=0, second=0, microsecond=0)
+                            if row_hour == target_hour:
+                                return True
+                        except (ValueError, KeyError):
+                            continue
+        except Exception:
+            # If can't read log, assume not submitted to be safe
+            pass
+        return False
+
     def train_and_submit(self, when: Optional[datetime] = None) -> SubmissionResult:
-        self.run_training(when)
-        return self.run_submission(self.config.artifact_path, self.config.topic_id)
+        result = self.run_training(when)
+        inference_time = result.prediction_time
+        return self.run_submission(self.config.artifact_path, self.config.topic_id, training_metrics=result.metrics, inference_time=inference_time)
 
     def _load_hourly_series(self, windows: WindowSet) -> pd.DataFrame:
         api_key = require_api_key()
@@ -226,16 +289,32 @@ class Pipeline:
 
     def _evaluate(self, model: GradientBoostingRegressor, train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame) -> Dict[str, float]:
         metrics: Dict[str, float] = {}
-        for label, df in (("train", train_df), ("validation", val_df), ("test", test_df)):
-            if df.empty:
-                continue
-            preds = model.predict(df.drop(columns=["target"]).values)
-            y_true = df["target"].values
-            mse = mean_squared_error(y_true, preds)
-            mae = mean_absolute_error(y_true, preds)
-            metrics[f"{label}_mae"] = float(mae)
-            metrics[f"{label}_mse"] = float(mse)
-            metrics[f"{label}_log10_loss"] = float(np.log10(mse)) if mse > 0 else float("-inf")
+        
+        # Evaluate on training data
+        if not train_df.empty:
+            train_preds = model.predict(train_df.drop(columns=["target"]).values)
+            train_y_true = train_df["target"].values
+            train_mse = mean_squared_error(train_y_true, train_preds)
+            train_mae = mean_absolute_error(train_y_true, train_preds)
+            metrics["train_mae"] = float(train_mae)
+            metrics["train_mse"] = float(train_mse)
+            metrics["train_log10_loss"] = float(np.log10(train_mse)) if train_mse > 0 else float("-inf")
+
+        # Evaluate on validation data
+        if not val_df.empty:
+            val_preds = model.predict(val_df.drop(columns=["target"]).values)
+            val_y_true = val_df["target"].values
+            val_mse = mean_squared_error(val_y_true, val_preds)
+            val_mae = mean_absolute_error(val_y_true, val_preds)
+            metrics["val_mae"] = float(val_mae)
+            metrics["val_mse"] = float(val_mse)
+            metrics["val_log10_loss"] = float(np.log10(val_mse)) if val_mse > 0 else float("-inf")
+            
+        # On test data, we only predict, no evaluation as target is unknown
+        if not test_df.empty:
+            test_preds = model.predict(test_df.drop(columns=["target"], errors='ignore').values)
+            metrics["test_prediction"] = float(test_preds[0])
+            
         return metrics
 
     def _write_artifacts(self, prediction_value: float, inference_time: datetime, windows: WindowSet, metrics: Dict[str, float], model: GradientBoostingRegressor) -> None:
@@ -281,7 +360,7 @@ class Pipeline:
                 dup_names,
             )
 
-        # Drop columns that are perfectly correlated due to identical values
+        # Drop columns that are perfectly identical (exact match)
         if not features.empty:
             before_redundant = features.shape[1]
             transposed = features.T.drop_duplicates(keep="last")
@@ -291,6 +370,57 @@ class Pipeline:
                 self.train_logger.warning(
                     "Redundant feature vectors detected; removed %d columns due to identical values.",
                     redundant_removed,
+                )
+
+        # Detect near-duplicate columns (numerically equivalent up to tolerance).
+        # Use a cheap hash on rounded values to group candidates, then verify with np.allclose.
+        if features.shape[1] > 1:
+            before_near = features.shape[1]
+            numeric_cols = features.select_dtypes(include=[np.number]).columns.tolist()
+            seen = set()
+            to_drop = []
+            # Build fingerprints
+            fingerprints: Dict[str, list] = {}
+            for col in numeric_cols:
+                vals = features[col].to_numpy()
+                # Replace nan with a sentinel and round to 9 decimals for hashing
+                vals_norm = np.nan_to_num(vals, nan=1e20, posinf=1e20, neginf=-1e20)
+                try:
+                    rounded = np.round(vals_norm.astype(float), decimals=9)
+                except Exception:
+                    rounded = vals_norm
+                h = hashlib.md5(rounded.tobytes()).hexdigest()
+                fingerprints.setdefault(h, []).append(col)
+
+            # For each fingerprint group, verify near-duplicates with allclose and drop earlier ones
+            for cols in fingerprints.values():
+                if len(cols) <= 1:
+                    continue
+                # keep last occurrence, drop earlier ones
+                keeper = cols[-1]
+                for candidate in cols[:-1]:
+                    a = features[keeper].to_numpy()
+                    b = features[candidate].to_numpy()
+                    try:
+                        if np.allclose(a, b, rtol=1e-6, atol=1e-9, equal_nan=True):
+                            to_drop.append(candidate)
+                        # else: keep both (they differ in a meaningful way)
+                    except Exception:
+                        # If comparison fails, be conservative and keep
+                        continue
+
+            if to_drop:
+                features = features.drop(columns=to_drop, errors="ignore")
+                self.train_logger.info(
+                    "Removed %d near-duplicate numeric feature columns: %s",
+                    len(to_drop),
+                    to_drop,
+                )
+            near_removed = before_near - features.shape[1]
+            if near_removed > 0 and redundant_removed == 0:
+                # If we removed something here but none earlier, log a warning to draw attention
+                self.train_logger.warning(
+                    "Near-duplicate features removed: %d columns.", near_removed
                 )
 
         if features.columns.duplicated().any():
