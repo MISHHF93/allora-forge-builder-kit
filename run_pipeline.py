@@ -850,7 +850,11 @@ def calculate_next_submission_hour(now: Optional[datetime] = None) -> Tuple[date
 
     last_processed = get_last_processed_hour()
     if last_processed is None:
-        target_hour = competition_first_hour
+        # No submission history - start from recent time where we have data
+        # Market data API has ~30 days of history, so start from 25 days ago
+        max_lookback = now - timedelta(days=25)
+        target_hour = max(competition_first_hour, max_lookback).replace(minute=0, second=0, microsecond=0)
+        print(f"ℹ️  No submission history found, starting from {target_hour.isoformat().replace('+00:00', 'Z')}")
     else:
         target_hour = last_processed + timedelta(hours=1)
 

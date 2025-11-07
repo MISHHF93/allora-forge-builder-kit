@@ -242,8 +242,11 @@ def fetch_market_data(hours_needed: int) -> pd.DataFrame:
 
 
 def train_model(market_data: pd.DataFrame) -> float:
-    """Train model and return latest prediction."""
-    from sklearn.ensemble import GradientBoostingRegressor
+    """Train XGBoost model and return latest prediction."""
+    try:
+        from xgboost import XGBRegressor
+    except ImportError:
+        raise RuntimeError("XGBoost is required. Install with: pip install xgboost")
     from sklearn.metrics import mean_absolute_error
     
     # Calculate log returns
@@ -291,12 +294,14 @@ def train_model(market_data: pd.DataFrame) -> float:
     X_val = val_df[feature_cols]
     y_val = val_df['target_7d']
     
-    # Train model
-    model = GradientBoostingRegressor(
+    # Train XGBoost model
+    model = XGBRegressor(
+        random_state=42,
         n_estimators=100,
-        max_depth=3,
+        max_depth=6,
         learning_rate=0.1,
-        random_state=42
+        objective='reg:squarederror',
+        tree_method='hist'
     )
     model.fit(X_train, y_train)
     
