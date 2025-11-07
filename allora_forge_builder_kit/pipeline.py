@@ -98,64 +98,68 @@ class Pipeline:
         return cls(cfg)
 
     def run_training(self, when: Optional[datetime] = None) -> TrainingResult:
-        windows = self.config.schedule.windows(when)
-        self.train_logger.info("Training for inference window ending %s", windows.inference_time)
+        try:
+            windows = self.config.schedule.windows(when)
+            self.train_logger.info("Training for inference window ending %s", windows.inference_time)
 
-        series = self._load_hourly_series(windows)
-        
-        # Use the full feature set from alpha_features
-        features = build_alpha_features(series["close"])
-        
-        # Add simple volume feature for additional signal
-        if "volume" in series:
-            volume_hourly = series["volume"].resample("1h").sum().reindex(features.index).fillna(0.0)
-            features["volume_log"] = np.log1p(volume_hourly)
+            series = self._load_hourly_series(windows)
             
-        features = features.ffill().dropna()
-        features = self._deduplicate_features(features)
+            # Use the full feature set from alpha_features
+            features = build_alpha_features(series["close"])
+            
+            # Add simple volume feature for additional signal
+            if "volume" in series:
+                volume_hourly = series["volume"].resample("1h").sum().reindex(features.index).fillna(0.0)
+                features["volume_log"] = np.log1p(volume_hourly)
+                
+            features = features.ffill().dropna()
+            features = self._deduplicate_features(features)
 
-        target = np.log(series["close"].shift(-self.config.target_hours) / series["close"])
-        frame = features.join(target.rename("target"), how="left")
-        cutoff = windows.inference_time.astimezone(timezone.utc).replace(tzinfo=None)
-        features = features.loc[features.index <= cutoff]
-        frame = frame.loc[frame.index <= cutoff]
-        if features.empty:
-            raise RuntimeError("No feature rows available prior to inference time.")
+            target = np.log(series["close"].shift(-self.config.target_hours) / series["close"])
+            frame = features.join(target.rename("target"), how="left")
+            cutoff = windows.inference_time.astimezone(timezone.utc).replace(tzinfo=None)
+            features = features.loc[features.index <= cutoff]
+            frame = frame.loc[frame.index <= cutoff]
+            if features.empty:
+                raise RuntimeError("No feature rows available prior to inference time.")
 
-        # Align with the competition schedule
-        train_df = self._slice(frame, windows.train_start, windows.train_end)
-        val_df = self._slice(frame, windows.validation_start, windows.validation_end)
-        
-        # The test set is the single inference row
-        inference_row, inference_time = self._select_inference_row(features, windows.inference_time)
-        test_df = pd.DataFrame([inference_row])
+            # Align with the competition schedule
+            train_df = self._slice(frame, windows.train_start, windows.train_end)
+            val_df = self._slice(frame, windows.validation_start, windows.validation_end)
+            
+            # The test set is the single inference row
+            inference_row, inference_time = self._select_inference_row(features, windows.inference_time)
+            test_df = pd.DataFrame([inference_row])
 
-        self.train_logger.info(
-            "Samples - train: %s validation: %s test: %s",
-            len(train_df),
-            len(val_df),
-            len(test_df),
-        )
+            self.train_logger.info(
+                "Samples - train: %s validation: %s test: %s",
+                len(train_df),
+                len(val_df),
+                len(test_df),
+            )
 
-        if train_df.empty:
-            raise RuntimeError("Training window produced no samples. Check data availability.")
+            if train_df.empty:
+                raise RuntimeError("Training window produced no samples. Check data availability.")
 
-        model = GradientBoostingRegressor(random_state=42)
-        model.fit(train_df.drop(columns=["target"]).values, train_df["target"].values)
+            model = GradientBoostingRegressor(random_state=42)
+            model.fit(train_df.drop(columns=["target"]).values, train_df["target"].values)
 
-        metrics = self._evaluate(model, train_df, val_df, test_df)
+            metrics = self._evaluate(model, train_df, val_df, test_df)
 
-        prediction_value = float(model.predict(inference_row.values.reshape(1, -1))[0])
+            prediction_value = float(model.predict(inference_row.values.reshape(1, -1))[0])
 
-        self._write_artifacts(prediction_value, inference_time, windows, metrics, model)
+            self._write_artifacts(prediction_value, inference_time, windows, metrics, model)
 
-        return TrainingResult(
-            prediction_time=inference_time,
-            prediction_value=prediction_value,
-            windows=windows,
-            metrics=metrics,
-            artifact_path=self.config.artifact_path,
-        )
+            return TrainingResult(
+                prediction_time=inference_time,
+                prediction_value=prediction_value,
+                windows=windows,
+                metrics=metrics,
+                artifact_path=self.config.artifact_path,
+            )
+        except Exception as e:
+            self.train_logger.error("Training failed: %s", str(e))
+            raise
 
     def run_submission(self, artifact_path: Optional[Path] = None, topic_id: Optional[int] = None, timeout: Optional[int] = None, retries: Optional[int] = None, training_metrics: Optional[Dict[str, float]] = None, inference_time: Optional[datetime] = None) -> SubmissionResult:
         path = Path(artifact_path or self.config.artifact_path)
@@ -229,9 +233,43 @@ class Pipeline:
         return False
 
     def train_and_submit(self, when: Optional[datetime] = None) -> SubmissionResult:
-        result = self.run_training(when)
-        inference_time = result.prediction_time
-        return self.run_submission(self.config.artifact_path, self.config.topic_id, training_metrics=result.metrics, inference_time=inference_time)
+        try:
+            result = self.run_training(when)
+            inference_time = result.prediction_time
+            return self.run_submission(self.config.artifact_path, self.config.topic_id, training_metrics=result.metrics, inference_time=inference_time)
+        except Exception as e:
+            # Log the failure and return a failure result
+            import traceback
+            error_msg = f"Pipeline failed: {str(e)}"
+            self.train_logger.error(error_msg)
+            self.train_logger.error("Traceback: %s", traceback.format_exc())
+            
+            # Try to log the failure to the submission log
+            try:
+                timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                wallet = os.getenv("ALLORA_WALLET_ADDR") or None
+                from .submission_log import log_submission_row
+                log_submission_row(
+                    str(self.config.submission_log),
+                    {
+                        "timestamp_utc": timestamp,
+                        "topic_id": self.config.topic_id,
+                        "value": None,
+                        "wallet": wallet,
+                        "nonce": None,
+                        "tx_hash": None,
+                        "success": False,
+                        "exit_code": 1,
+                        "status": f"pipeline_error: {error_msg}",
+                        "log10_loss": None,
+                        "score": None,
+                        "reward": None,
+                    },
+                )
+            except Exception:
+                pass  # If logging fails, just continue
+            
+            return SubmissionResult(False, 1, f"pipeline_error: {error_msg}", None, None)
 
     def _load_hourly_series(self, windows: WindowSet) -> pd.DataFrame:
         api_key = require_api_key()
@@ -298,7 +336,8 @@ class Pipeline:
             train_mae = mean_absolute_error(train_y_true, train_preds)
             metrics["train_mae"] = float(train_mae)
             metrics["train_mse"] = float(train_mse)
-            metrics["train_log10_loss"] = float(np.log10(train_mse)) if train_mse > 0 else float("-inf")
+            # Use MAE for log10_loss as per competition requirements (loss between prediction and ground truth)
+            metrics["train_log10_loss"] = float(np.log10(max(train_mae, 1e-12)))  # Avoid log(0)
 
         # Evaluate on validation data
         if not val_df.empty:
@@ -308,7 +347,8 @@ class Pipeline:
             val_mae = mean_absolute_error(val_y_true, val_preds)
             metrics["val_mae"] = float(val_mae)
             metrics["val_mse"] = float(val_mse)
-            metrics["val_log10_loss"] = float(np.log10(val_mse)) if val_mse > 0 else float("-inf")
+            # Use MAE for log10_loss as per competition requirements (loss between prediction and ground truth)
+            metrics["val_log10_loss"] = float(np.log10(max(val_mae, 1e-12)))  # Avoid log(0)
             
         # On test data, we only predict, no evaluation as target is unknown
         if not test_df.empty:

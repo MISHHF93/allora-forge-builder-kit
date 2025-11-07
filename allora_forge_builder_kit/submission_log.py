@@ -245,6 +245,7 @@ def dedupe_submission_log_file(path: str) -> None:
 def log_submission_row(path: str, row: Dict[str, Any]) -> None:
     """Write a submission row, replacing any existing entry for the same epoch/topic."""
 
+    rotate_submission_log(path)
     ensure_submission_log_schema(path)
     ordered = [_normalize_cell(row.get(k)) for k in CANONICAL_SUBMISSION_HEADER]
     key_indices = (
@@ -300,3 +301,31 @@ def log_submission_row(path: str, row: Dict[str, Any]) -> None:
         )
     finally:
         _release_lock(path, fd)
+
+def rotate_submission_log(path: str, max_size_mb: float = 10.0, max_age_days: int = 7) -> None:
+    """Rotate the submission log if it exceeds size or age limits.
+    
+    Creates timestamped backup files like submission_log.csv.2025-11-06T120000Z
+    """
+    if not os.path.exists(path):
+        return
+    
+    # Check size
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    if size_mb < max_size_mb:
+        # Check age
+        mtime = os.path.getmtime(path)
+        age_days = (time.time() - mtime) / (24 * 3600)
+        if age_days < max_age_days:
+            return
+    
+    # Rotate
+    timestamp = time.strftime("%Y-%m-%dT%H%M%SZ", time.gmtime())
+    backup_path = f"{path}.{timestamp}"
+    try:
+        os.rename(path, backup_path)
+        # Create new empty log with header
+        ensure_submission_log_schema(path)
+    except Exception:
+        # If rotation fails, continue without rotating
+        pass

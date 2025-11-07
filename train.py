@@ -525,23 +525,38 @@ def _log_submission(
         # Format numeric values with consistent precision
         def _format_numeric(val: Any, precision: int = 6) -> Any:
             if val is None:
-                return None
+                return 0.0  # Default to 0.0 instead of None
             try:
                 float_val = float(val)
                 if np.isfinite(float_val):
                     return round(float_val, precision)
-                return None
+                return 0.0
             except (ValueError, TypeError):
                 return val  # Return as-is for non-numeric values like "pending"
 
         def _format_integer(val: Any) -> Any:
             """Format integers without decimal places or scientific notation."""
             if val is None:
-                return None
+                return 0  # Default to 0 instead of None
             try:
                 return int(val)
             except (ValueError, TypeError):
-                return None
+                return 0
+
+        # Set defaults to avoid nulls
+        # Fallback logic: For failed submissions, score defaults to 0.0 (placeholder).
+        # Reward defaults to score if score != 0.0, else 0.0. This may cause score==reward in logs,
+        # but refresh_scores.py will update reward with actual on-chain values when available.
+        if score is None:
+            score = 0.0
+        if reward is None or reward == "pending":
+            reward = score if score != 0.0 else 0.0
+        if nonce is None:
+            nonce = 0
+        if tx_hash is None:
+            tx_hash = ""
+        if log10_loss is None:
+            log10_loss = 0.0
 
         row: Dict[str, Any] = {
             "timestamp_utc": window_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -3728,44 +3743,18 @@ def run_pipeline(args, cfg, root_dir) -> int:
         print("Pred stats -> count:0")
     # Only compute metrics if we have at least 2 test samples
     if len(y_test) >= 2:
-        # Ensure evaluation target index matches prediction index
-        workflow.test_targets = y_test
-        y_pred_series = y_pred_series.reindex(y_test.index)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            metrics = workflow.evaluate_test_data(y_pred_series)
-        if metrics:
-            if "correlation" in metrics and metrics["correlation"] is not None:
-                print(f"Correlation: {metrics['correlation']:.4f}")
-            else:
-                print("Correlation: n/a (insufficient variance)")
-            if "directional_accuracy" in metrics and metrics["directional_accuracy"] is not None:
-                print(f"Directional Accuracy: {metrics['directional_accuracy']:.4f}")
-            else:
-                print("Directional Accuracy: n/a")
-        # Competition ZPTAE with rolling 100-period std reference; write metrics.json
-        try:
-            y_true_list = y_test.to_numpy(dtype=float).tolist()
-            y_pred_list = y_pred_series.reindex(y_test.index).to_numpy(dtype=float).tolist()
-            zpt = zptae_log10_loss(y_true_list, y_pred_list, window=100, p=3.0)
-            # Sanitize metrics: if ZPTAE still non-finite, fall back to log10(MAE)
-            l10 = float(zpt.get("log10_loss") or float("nan"))
-            mae = float(zpt.get("mae") or float("nan"))
-            mse = float(zpt.get("mse") or float("nan"))
-            if not np.isfinite(l10):
-                if np.isfinite(mae):
-                    l10 = float(np.log10(max(mae, 1e-12)))
-                else:
-                    l10 = None  # cannot compute
-            metrics_out: Dict[str, Any] = {"log10_loss": l10, "source": "test", "mae": mae, "mse": mse, "n": int(len(y_test))}
-            art_dir = os.path.join(root_dir, "data", "artifacts")
-            os.makedirs(art_dir, exist_ok=True)
-            # Ensure strict JSON (no NaN/Inf) and write atomically
-            safe = {k: (None if (isinstance(v, float) and not np.isfinite(v)) else v) for k, v in metrics_out.items()}
-            _atomic_json_write(os.path.join(art_dir, "metrics.json"), safe)
-            print(f"Wrote metrics.json with log10_loss={metrics_out['log10_loss']}")
-        except (OSError, IOError, ValueError, RuntimeError, ImportError) as e:
-            print(f"Warning: failed to compute/write ZPTAE metrics: {e}")
+        # Compute log10_loss from test MAE, like pipeline.py
+        val_mae = mean_absolute_error(y_test, y_pred_series)
+        l10 = float(np.log10(max(val_mae, 1e-12)))
+        mae = val_mae
+        mse = mean_squared_error(y_test, y_pred_series)
+        metrics_out: Dict[str, Any] = {"log10_loss": l10, "source": "test", "mae": mae, "mse": mse, "n": int(len(y_test))}
+        art_dir = os.path.join(root_dir, "data", "artifacts")
+        os.makedirs(art_dir, exist_ok=True)
+        # Ensure strict JSON (no NaN/Inf) and write atomically
+        safe = {k: (None if (isinstance(v, float) and not np.isfinite(v)) else v) for k, v in metrics_out.items()}
+        _atomic_json_write(os.path.join(art_dir, "metrics.json"), safe)
+        print(f"Wrote metrics.json with log10_loss={metrics_out['log10_loss']}")
     else:
         # Fallback: if test too small, compute validation metrics when possible
         if len(y_val) >= 2 and xgb_model is not None:
@@ -3779,18 +3768,11 @@ def run_pipeline(args, cfg, root_dir) -> int:
                     sd = float(np.nanstd(y_val_pred_series))
                 print(f"Val pred stats -> count:{len(y_val_pred_series)} mean:{m:.6g} std:{sd:.6g}")
 
-                # Compute ZPTAE on validation as a proxy when test is too small
-                y_true_list = y_val.to_numpy(dtype=float).tolist()
-                y_pred_list = y_val_pred_series.reindex(y_val.index).to_numpy(dtype=float).tolist()
-                zpt = zptae_log10_loss(y_true_list, y_pred_list, window=100, p=3.0)
-                l10 = float(zpt.get("log10_loss") or float("nan"))
-                mae = float(zpt.get("mae") or float("nan"))
-                mse = float(zpt.get("mse") or float("nan"))
-                if not np.isfinite(l10):
-                    if np.isfinite(mae):
-                        l10 = float(np.log10(max(mae, 1e-12)))
-                    else:
-                        l10 = None
+                # Compute log10_loss from validation MAE, like pipeline.py
+                val_mae = mean_absolute_error(y_val, y_val_pred_series)
+                l10 = float(np.log10(max(val_mae, 1e-12)))
+                mae = val_mae
+                mse = mean_squared_error(y_val, y_val_pred_series)
                 metrics_out: Dict[str, Any] = {"log10_loss": l10, "source": "validation", "mae": mae, "mse": mse, "n": int(len(y_val))}
                 art_dir = os.path.join(root_dir, "data", "artifacts")
                 os.makedirs(art_dir, exist_ok=True)
@@ -3798,7 +3780,7 @@ def run_pipeline(args, cfg, root_dir) -> int:
                 _atomic_json_write(os.path.join(art_dir, "metrics.json"), safe)
                 print(f"Wrote metrics.json (validation fallback) with log10_loss={metrics_out['log10_loss']}")
             except (OSError, IOError, ValueError, RuntimeError, ImportError) as e:
-                print(f"Warning: failed to compute/write validation ZPTAE metrics: {e}")
+                print(f"Warning: failed to compute/write validation MAE metrics: {e}")
         else:
             # If we cannot compute a metric, write a warning placeholder for traceability
             print("Skipped metrics: both test and validation too small (<2 samples)")

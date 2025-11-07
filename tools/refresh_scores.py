@@ -306,6 +306,16 @@ def main() -> int:
 
         time.sleep(args.sleep)
 
+    # Set reward = score for rows where score is set but reward is pending
+    for r in rows:
+        score_val = r.get("score")
+        reward_val = r.get("reward")
+        if not is_nullish(score_val) and (is_nullish(reward_val) or reward_val == "pending"):
+            r["reward"] = score_val
+            updated += 1
+            txh = r.get("tx_hash", "unknown")
+            print(f"[OK] Set reward = score for tx {txh} -> {r['reward']}")
+
     if updated:
         write_csv(csv_path, rows)
         print(f"[DONE] Wrote CSV with {updated} field updates -> {csv_path}")

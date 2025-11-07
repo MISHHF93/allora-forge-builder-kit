@@ -13,3 +13,4 @@ optuna
 xgboost
 ta
 PyYAML
+psutil
