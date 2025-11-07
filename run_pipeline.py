@@ -83,8 +83,9 @@ WALLET_ENV = "ALLORA_WALLET_ADDR"
 
 # Logging schema
 CANONICAL_HEADER = [
-    "timestamp_utc", "topic_id", "value", "wallet", "nonce", "tx_hash",
-    "success", "exit_code", "status", "log10_loss", "score", "reward"
+    "timestamp_utc", "inference_hour_utc", "topic_id", "value", "wallet",
+    "nonce", "tx_hash", "success", "exit_code", "status", "log10_loss",
+    "score", "reward"
 ]
 
 
@@ -212,37 +213,58 @@ def log_submission_row(row: Dict[str, Any]) -> None:
     """Log a submission row to CSV with rotation and deduplication."""
     rotate_log_if_needed()
 
-    # Ensure schema
-    if not SUBMISSION_LOG.exists():
-        with open(SUBMISSION_LOG, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(CANONICAL_HEADER)
-
-    ordered = [normalize_cell(row.get(k)) for k in CANONICAL_HEADER]
-    key_indices = (0, 1)  # timestamp_utc, topic_id
-    key = tuple(ordered[i] for i in key_indices)
-
-    # Read existing rows
-    existing_rows = []
+    existing_entries: Dict[Tuple[str, str], Dict[str, Any]] = {}
     if SUBMISSION_LOG.exists():
-        with open(SUBMISSION_LOG, "r", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            existing_rows = list(reader)
+        try:
+            with open(SUBMISSION_LOG, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for existing in reader:
+                    if not existing:
+                        continue
+                    inference_key = existing.get('inference_hour_utc') or existing.get('timestamp_utc')
+                    topic_key = existing.get('topic_id', '')
+                    if not inference_key:
+                        continue
+                    normalized_existing = {col: existing.get(col) for col in CANONICAL_HEADER}
+                    existing_entries[(inference_key, str(topic_key))] = normalized_existing
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to read existing submission log ({e}). Rebuilding log file.")
+            existing_entries = {}
 
-    # Replace existing entry for same epoch
-    updated = False
-    for i, existing in enumerate(existing_rows[1:], 1):  # Skip header
-        existing_key = tuple(existing[j] for j in key_indices)
-        if existing_key == key:
-            existing_rows[i] = ordered
-            updated = True
-            break
+    # Prepare the new entry
+    entry = {col: row.get(col) for col in CANONICAL_HEADER}
+    inference_key = entry.get('inference_hour_utc') or entry.get('timestamp_utc')
+    topic_key = entry.get('topic_id')
 
-    if not updated:
-        existing_rows.append(ordered)
+    if not inference_key:
+        inference_key = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        entry['inference_hour_utc'] = entry['inference_hour_utc'] or inference_key
 
-    # Write back
+    key = (inference_key, str(topic_key))
+    existing_entries[key] = entry
+
+    # Sort entries by inference hour for deterministic output
+    def parse_iso(value: Optional[str]) -> datetime:
+        if not value:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        try:
+            return datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    sorted_entries = sorted(
+        existing_entries.values(),
+        key=lambda r: (
+            parse_iso(r.get('inference_hour_utc')),
+            str(r.get('topic_id', ''))
+        )
+    )
+
     with open(SUBMISSION_LOG, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerows(existing_rows)
+        writer = csv.writer(f)
+        writer.writerow(CANONICAL_HEADER)
+        for entry in sorted_entries:
+            writer.writerow([normalize_cell(entry.get(col)) for col in CANONICAL_HEADER])
 
 
 def fetch_market_data(api_key: str, hours_needed: int) -> pd.DataFrame:
@@ -455,19 +477,28 @@ def check_already_submitted(topic_id: int, inference_hour: datetime) -> bool:
         with open(SUBMISSION_LOG, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if (int(row.get('topic_id', 0)) == topic_id and
-                    row.get('success') == 'true'):
-                    try:
-                        row_time = datetime.fromisoformat(row['timestamp_utc'].replace('Z', '+00:00'))
-                        row_hour = row_time.replace(minute=0, second=0, microsecond=0)
-                        if row_hour == target_hour:
-                            # Log successful verification
-                            tx_hash = row.get('tx_hash', 'N/A')
-                            print(f"📋 Local log verification: Found successful submission for {target_hour_str} (TX: {tx_hash})")
-                            return True
-                    except (ValueError, KeyError) as e:
-                        print(f"⚠️  Warning: Malformed log entry for {target_hour_str}: {e}")
+                if not row:
+                    continue
+                try:
+                    topic_value = int(row.get('topic_id', 0))
+                except (ValueError, TypeError):
+                    continue
+
+                if topic_value == topic_id and row.get('success') == 'true':
+                    raw_inference = row.get('inference_hour_utc') or row.get('timestamp_utc')
+                    if not raw_inference:
                         continue
+                    try:
+                        row_time = datetime.fromisoformat(raw_inference.replace('Z', '+00:00'))
+                    except ValueError:
+                        print(f"⚠️  Warning: Malformed inference timestamp in log: {raw_inference}")
+                        continue
+
+                    row_hour = row_time.replace(minute=0, second=0, microsecond=0)
+                    if row_hour == target_hour:
+                        tx_hash = row.get('tx_hash', 'N/A')
+                        print(f"📋 Local log verification: Found successful submission for {target_hour_str} (TX: {tx_hash})")
+                        return True
     except Exception as e:
         print(f"⚠️  Warning: Could not read submission log: {e}")
         return False
@@ -486,13 +517,17 @@ def get_last_processed_hour() -> Optional[datetime]:
             reader = csv.DictReader(f)
             for row in reader:
                 if row.get('success') == 'true':
-                    try:
-                        row_time = datetime.fromisoformat(row['timestamp_utc'].replace('Z', '+00:00'))
-                        row_hour = row_time.replace(minute=0, second=0, microsecond=0)
-                        if latest_hour is None or row_hour > latest_hour:
-                            latest_hour = row_hour
-                    except (ValueError, KeyError):
+                    raw_inference = row.get('inference_hour_utc') or row.get('timestamp_utc')
+                    if not raw_inference:
                         continue
+                    try:
+                        row_time = datetime.fromisoformat(raw_inference.replace('Z', '+00:00'))
+                    except ValueError:
+                        continue
+
+                    row_hour = row_time.replace(minute=0, second=0, microsecond=0)
+                    if latest_hour is None or row_hour > latest_hour:
+                        latest_hour = row_hour
     except Exception:
         return None
 
@@ -643,7 +678,15 @@ async def submit_prediction(prediction: TrainingResult) -> SubmissionResult:
                 continue
             else:
                 # Final attempt failed - classify the error
-                if "network" in error_str or "connection" in error_str or "timeout" in error_str:
+                lower_trace = full_traceback.lower() if full_traceback else error_str
+
+                if "grpc" in lower_trace or "deadline" in lower_trace:
+                    error_type = "grpc_error"
+                elif "unmarshal" in lower_trace or "deserial" in lower_trace:
+                    error_type = "rpc_payload_error"
+                elif "allorarpclient" in lower_trace and "events" in lower_trace:
+                    error_type = "rpc_client_mismatch"
+                elif "network" in error_str or "connection" in error_str or "timeout" in error_str:
                     error_type = "network_error"
                 elif "wallet" in error_str or "key" in error_str or "mnemonic" in error_str:
                     error_type = "wallet_error"
@@ -671,6 +714,8 @@ def log_pipeline_result(training: Optional[TrainingResult], submission: Submissi
     timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
     wallet = os.getenv(WALLET_ENV)
 
+    inference_hour = training.prediction_time if training else None
+
     # Determine score and reward based on success
     if training:
         if submission.success:
@@ -694,6 +739,7 @@ def log_pipeline_result(training: Optional[TrainingResult], submission: Submissi
 
     row = {
         'timestamp_utc': timestamp,
+        'inference_hour_utc': inference_hour.isoformat().replace('+00:00', 'Z') if inference_hour else None,
         'topic_id': TOPIC_ID,
         'value': training.prediction_value if training else None,
         'wallet': wallet,
@@ -716,18 +762,21 @@ def check_singleton_guard() -> bool:
     import os
 
     current_pid = os.getpid()
-    current_process = psutil.Process(current_pid)
 
     # Check for other Python processes running this script
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
-            if proc.info['pid'] == current_pid:
+            if proc.info.get('pid') == current_pid:
                 continue
-            if proc.info['name'] == 'python' or proc.info['name'] == 'python3':
-                cmdline = proc.info['cmdline']
-                if cmdline and len(cmdline) > 1 and 'run_pipeline.py' in cmdline[1]:
-                    print(f"WARNING: Another pipeline instance detected (PID: {proc.info['pid']})")
-                    return False
+
+            name = (proc.info.get('name') or "").lower()
+            if 'python' not in name:
+                continue
+
+            cmdline = proc.info.get('cmdline') or []
+            if any('run_pipeline.py' in (part or '') for part in cmdline):
+                print(f"WARNING: Another pipeline instance detected (PID: {proc.info.get('pid')})")
+                return False
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
@@ -778,18 +827,55 @@ async def get_wallet_balance() -> Optional[float]:
         return None
 
 
-def calculate_next_submission_hour() -> datetime:
-    """Calculate the next eligible submission hour."""
-    now = datetime.now(timezone.utc)
+def calculate_next_submission_hour(now: Optional[datetime] = None) -> Tuple[datetime, bool]:
+    """Determine which hour should be processed next.
 
-    # Get the current hour
-    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    Returns a tuple of (target_hour, is_backlog). When ``is_backlog`` is ``True`` the
+    caller should process the returned ``target_hour`` immediately without waiting for
+    the next top-of-hour window because we are catching up on previously missed
+    submissions.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
 
-    # If we're past the 5-minute window, move to next hour
+    window_hour = now.replace(minute=0, second=0, microsecond=0)
     if now.minute >= 5:
-        current_hour += timedelta(hours=1)
+        window_hour += timedelta(hours=1)
 
-    return current_hour
+    competition_first_hour = COMPETITION_START.replace(minute=0, second=0, microsecond=0)
+
+    last_processed = get_last_processed_hour()
+    if last_processed is None:
+        target_hour = competition_first_hour
+    else:
+        target_hour = last_processed + timedelta(hours=1)
+
+    if target_hour < competition_first_hour:
+        target_hour = competition_first_hour
+
+    if target_hour > COMPETITION_END:
+        return COMPETITION_END, False
+
+    if target_hour < window_hour:
+        missed = int(max((window_hour - target_hour).total_seconds() // 3600, 0))
+        if missed > 0:
+            print(
+                "⚠️  Detected gap in submission log: "
+                f"next pending {target_hour.isoformat().replace('+00:00', 'Z')}, "
+                f"current window {window_hour.isoformat().replace('+00:00', 'Z')} "
+                f"(approximately {missed} hour(s) behind)."
+            )
+        return target_hour, True
+
+    if target_hour < now.replace(minute=0, second=0, microsecond=0):
+        # We are inside the window for target_hour, treat it as active (not backlog)
+        return target_hour, False
+
+    if target_hour < window_hour:
+        # Safety net for unexpected rounding behaviour
+        return window_hour, False
+
+    return target_hour, False
 
 
 async def wait_until_submission_window(target_hour: datetime) -> None:
@@ -862,35 +948,17 @@ async def wait_until_submission_window(target_hour: datetime) -> None:
             await asyncio.sleep(sleep_time)
 
 
-async def perform_periodic_health_check() -> None:
+async def perform_periodic_health_check() -> bool:
     """Perform periodic health checks during operation."""
     try:
-        # Check if log file is still writable
-        test_row = {
-            'timestamp_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-            'topic_id': TOPIC_ID,
-            'value': None,
-            'wallet': os.getenv(WALLET_ENV, 'test'),
-            'nonce': 0,
-            'tx_hash': 'health_check',
-            'success': 'false',
-            'exit_code': 0,
-            'status': 'health_check',
-            'log10_loss': None,
-            'score': None,
-            'reward': None
-        }
-        log_submission_row(test_row)
-
-        # Remove the test entry (this is a bit hacky but ensures we can write)
-        if SUBMISSION_LOG.exists():
-            with open(SUBMISSION_LOG, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            # Remove the last line if it contains our test
-            if lines and 'health_check' in lines[-1]:
-                lines = lines[:-1]
-                with open(SUBMISSION_LOG, "w", encoding="utf-8") as f:
-                    f.writelines(lines)
+        # Ensure log directory exists and log file is writable without mutating entries
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        if not SUBMISSION_LOG.exists():
+            with open(SUBMISSION_LOG, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(CANONICAL_HEADER)
+        else:
+            with open(SUBMISSION_LOG, "a", encoding="utf-8") as f:
+                f.write("")
 
         # Check wallet balance (disabled due to API issues)
         # balance = await get_wallet_balance()
@@ -975,12 +1043,16 @@ def perform_startup_health_check() -> Dict[str, Any]:
                 for row in reader:
                     if row.get('success') == 'true':
                         success_count += 1
-                        try:
-                            row_time = datetime.fromisoformat(row['timestamp_utc'].replace('Z', '+00:00'))
-                            if last_success is None or row_time > last_success:
-                                last_success = row_time
-                        except (ValueError, KeyError):
+                        raw_inference = row.get('inference_hour_utc') or row.get('timestamp_utc')
+                        if not raw_inference:
                             continue
+                        try:
+                            row_time = datetime.fromisoformat(raw_inference.replace('Z', '+00:00'))
+                        except ValueError:
+                            continue
+
+                        if last_success is None or row_time > last_success:
+                            last_success = row_time
                 health_status['total_submissions'] = success_count
                 health_status['last_submission'] = last_success
         except Exception as e:
@@ -1043,6 +1115,11 @@ async def run_continuous_pipeline() -> None:
         return
 
     print("✅ Singleton guard passed - no other instances detected")
+
+    if os.getenv('FORCE_TEST_SUBMISSION'):
+        print("⚠️  FORCE_TEST_SUBMISSION flag detected. Ignoring for production continuous mode.")
+        os.environ.pop('FORCE_TEST_SUBMISSION', None)
+
     print("🔄 Entering continuous monitoring loop...")
     print("-" * 60)
 
@@ -1083,32 +1160,40 @@ async def run_continuous_pipeline() -> None:
                 continue
 
             # Calculate next submission hour and window status
-            next_hour = calculate_next_submission_hour()
-            time_until_window = (next_hour - now).total_seconds()
+            next_hour, is_backlog = calculate_next_submission_hour(now)
 
-            # FOR TESTING: Force immediate submission for current hour
-            if os.getenv('FORCE_TEST_SUBMISSION'):
-                print("🧪 TEST MODE: Forcing immediate submission for current hour")
-                next_hour = now.replace(minute=0, second=0, microsecond=0)
+            if is_backlog:
+                print(f"📚 Catching up on backlog slot: {next_hour}")
                 time_until_window = 0
-
-            # Display current status
-            if time_until_window > 3600:
-                hours_until = int(time_until_window // 3600)
-                print(f"📅 Next submission slot: {next_hour} ({hours_until}h away)")
-            elif time_until_window > 60:
-                mins_until = int(time_until_window // 60)
-                print(f"⏰ Next submission slot: {next_hour} ({mins_until}m away)")
             else:
-                secs_until = int(time_until_window)
-                print(f"🎯 Submission window opening: {next_hour} ({secs_until}s)")
+                time_until_window = (next_hour - now).total_seconds()
+
+                # Display current status for upcoming slot
+                if time_until_window > 3600:
+                    hours_until = int(time_until_window // 3600)
+                    print(f"📅 Next submission slot: {next_hour} ({hours_until}h away)")
+                elif time_until_window > 60:
+                    mins_until = int(time_until_window // 60)
+                    print(f"⏰ Next submission slot: {next_hour} ({mins_until}m away)")
+                elif time_until_window > 0:
+                    mins_until = int(time_until_window // 60)
+                    secs_until = int(time_until_window % 60)
+                    if mins_until:
+                        print(f"⏳ Submission window opens in {mins_until}m {secs_until}s ({next_hour})")
+                    else:
+                        print(f"🎯 Submission window opening in {secs_until}s ({next_hour})")
+                else:
+                    print(f"🎯 Submission window currently open for {next_hour}")
 
             # Wait until submission window with periodic status updates
-            if time_until_window > 0:
+            if not is_backlog and time_until_window > 0:
                 await wait_until_submission_window(next_hour)
 
             # We're now in the submission window
-            print(f"\n🎯 Processing submission for {next_hour}")
+            if is_backlog:
+                print(f"\n🎯 Processing backlog submission for {next_hour}")
+            else:
+                print(f"\n🎯 Processing submission for {next_hour}")
             print(f"⏱️  Cycle started at {cycle_start.isoformat().replace('+00:00', 'Z')}")
 
             # Double-check we're still in competition bounds
