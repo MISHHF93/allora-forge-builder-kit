@@ -177,7 +177,11 @@ def _load_pipeline_config(root_dir: str) -> Dict[str, Any]:
 
 CHAIN_ID = os.getenv("ALLORA_CHAIN_ID", "allora-testnet-1")
 DEFAULT_TOPIC_ID = 67
-DEFAULT_RPC = os.getenv("ALLORA_RPC_URL") or os.getenv("ALLORA_NODE") or "https://allora-rpc.testnet.allora.network"
+# Lavender Five Testnet Endpoints
+DEFAULT_RPC = os.getenv("ALLORA_RPC_URL") or os.getenv("ALLORA_NODE") or "https://testnet-rpc.lavenderfive.com:443/allora/"
+DEFAULT_GRPC = os.getenv("ALLORA_GRPC_URL") or "grpc+https://testnet-allora.lavenderfive.com:443"
+DEFAULT_REST = os.getenv("ALLORA_REST_URL") or "https://testnet-rest.lavenderfive.com:443/allora/"
+DEFAULT_WEBSOCKET = os.getenv("ALLORA_WS_URL") or "wss://testnet-rpc.lavenderfive.com:443/allora/websocket"
 
 # Cache expensive topic configuration fetches so repeated lifecycle checks do not
 # overwhelm the node. This is intentionally simple – the configuration is
@@ -188,16 +192,31 @@ _TOPIC_CONFIG_CACHE: Dict[int, Dict[str, Any]] = {}
 def _derive_rest_base_from_rpc(rpc_url: str) -> str:
     """Best-effort derive REST base URL from an RPC URL.
     Known patterns:
-      - https://allora-rpc.testnet.allora.network -> https://allora-api.testnet.allora.network
-      - https://allora-rpc.mainnet.allora.network -> https://allora-api.mainnet.allora.network
+      - Lavender Five Testnet:
+        RPC: https://testnet-rpc.lavenderfive.com:443/allora/
+        REST: https://testnet-rest.lavenderfive.com:443/allora/
+      - Legacy patterns:
+        https://allora-rpc.testnet.allora.network -> https://allora-api.testnet.allora.network
+        https://allora-rpc.mainnet.allora.network -> https://allora-api.mainnet.allora.network
     Fallback: if ALLORA_REST_URL env var is set, return that; else return the input unchanged.
     """
     env_rest = os.getenv("ALLORA_REST_URL", "").strip()
     if env_rest:
         return env_rest.rstrip('/')
+    
+    # Use Lavender Five REST endpoint by default
+    if not rpc_url or rpc_url.strip() == "":
+        return DEFAULT_REST.rstrip('/')
+    
     try:
         u = str(rpc_url or "").strip()
-        # Generic replacements for common hostnames
+        # Handle Lavender Five endpoints
+        if "lavenderfive.com" in u:
+            if "testnet-rpc" in u:
+                return "https://testnet-rest.lavenderfive.com:443/allora/"
+            elif "mainnet-rpc" in u:
+                return "https://mainnet-rest.lavenderfive.com:443/allora/"
+        # Generic replacements for legacy hostnames
         u2 = (
             u.replace("-rpc.", "-api.")
              .replace("rpc.", "api.")
@@ -2343,8 +2362,15 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
         bank_client = CosmosBankV1Beta1RestQueryClient(base_url)
 
         # Network config (fee params, chain id)
+        # Use Lavender Five endpoints for better reliability
         if str(CHAIN_ID) == "allora-testnet-1":
-            net_cfg = AlloraNetworkConfig.testnet()
+            net_cfg = AlloraNetworkConfig(
+                chain_id=str(CHAIN_ID),
+                url=DEFAULT_GRPC,
+                websocket_url=DEFAULT_WEBSOCKET,
+                fee_denom="uallo",
+                fee_minimum_gas_price=10.0,
+            )
         elif str(CHAIN_ID) == "allora-mainnet-1":
             net_cfg = AlloraNetworkConfig.mainnet()
         else:

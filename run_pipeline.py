@@ -75,8 +75,10 @@ PREDICTIONS_JSON = ARTIFACTS_DIR / "predictions.json"
 METRICS_JSON = ARTIFACTS_DIR / "metrics.json"
 MODEL_JOBLIB = ARTIFACTS_DIR / "model.joblib"
 
-# Blockchain configuration
-DEFAULT_RPC = "grpc+https://allora-grpc.testnet.allora.network:443"
+# Blockchain configuration - Lavender Five Testnet
+DEFAULT_RPC = "grpc+https://testnet-allora.lavenderfive.com:443"
+DEFAULT_REST = "https://testnet-rest.lavenderfive.com:443/allora/"
+DEFAULT_WEBSOCKET = "wss://testnet-rpc.lavenderfive.com:443/allora/websocket"
 CHAIN_ID = "allora-testnet-1"
 API_KEY_ENV = "ALLORA_API_KEY"
 WALLET_ENV = "ALLORA_WALLET_ADDR"

@@ -185,9 +185,9 @@ def is_nullish(x: Any) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Refresh pending score/reward in submission_log.csv by querying tx logs")
     ap.add_argument("--csv", default="submission_log.csv", help="Path to CSV (default: submission_log.csv)")
-    ap.add_argument("--rest", default="https://allora-api.testnet.allora.network", help="REST base URL (default: Allora testnet API)")
+    ap.add_argument("--rest", default="https://testnet-rest.lavenderfive.com:443/allora/", help="REST base URL (default: Lavender Five testnet REST)")
     ap.add_argument("--tail", type=int, default=20, help="Only consider last N rows (default: 20); set large to scan all")
-    ap.add_argument("--rpc", default=os.getenv("ALLORA_RPC_URL") or os.getenv("ALLORA_NODE") or "https://allora-rpc.testnet.allora.network", help="RPC URL for CLI queries")
+    ap.add_argument("--rpc", default=os.getenv("ALLORA_RPC_URL") or os.getenv("ALLORA_NODE") or "https://testnet-rpc.lavenderfive.com:443/allora/", help="RPC URL for CLI queries")
     # chain-id isn't required for the emissions query and may not be supported by some builds; omit for robustness
     ap.add_argument("--sleep", type=float, default=0.2, help="Sleep between network calls (seconds)")
     args = ap.parse_args()

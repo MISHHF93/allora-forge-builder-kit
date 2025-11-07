@@ -66,9 +66,10 @@ WORKER_LOG = LOGS_DIR / "worker_continuous.log"
 COMPETITION_START = datetime(2025, 9, 16, 13, 0, 0, tzinfo=timezone.utc)
 COMPETITION_END = datetime(2025, 12, 15, 13, 0, 0, tzinfo=timezone.utc)
 
-# Network configuration
-DEFAULT_RPC = "grpc+https://allora-grpc.testnet.allora.network:443"
-DEFAULT_WS = "wss://allora-rpc.testnet.allora.network/websocket"
+# Network configuration - Lavender Five Testnet
+DEFAULT_RPC = "grpc+https://testnet-allora.lavenderfive.com:443"
+DEFAULT_WS = "wss://testnet-rpc.lavenderfive.com:443/allora/websocket"
+DEFAULT_REST = "https://testnet-rest.lavenderfive.com:443/allora/"
 CHAIN_ID = "allora-testnet-1"
 
 # Logging
