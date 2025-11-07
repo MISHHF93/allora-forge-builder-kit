@@ -273,7 +273,7 @@ def fetch_market_data(api_key: str, hours_needed: int) -> pd.DataFrame:
     """Fetch and process market data."""
     try:
         # Try to use the original workflow
-        from workflow import AlloraMLWorkflow
+        from allora_forge_builder_kit.workflow import AlloraMLWorkflow
         workflow = AlloraMLWorkflow(
             data_api_key=api_key,
             tickers=[TICKER],
@@ -442,7 +442,9 @@ def train_model_for_hour(series: pd.DataFrame, inference_hour: datetime) -> Trai
 
     # Make prediction for the specified inference window
     # Use the latest available data up to inference_hour
-    available_data = features[features.index <= inference_hour]
+    # Ensure timezone-aware comparison
+    inference_ts = pd.Timestamp(inference_hour).tz_localize(None)
+    available_data = features[features.index <= inference_ts]
     if available_data.empty:
         raise RuntimeError(f"No data available for inference hour {inference_hour}")
     

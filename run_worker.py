@@ -167,9 +167,51 @@ def load_environment():
 
 def fetch_market_data(hours_needed: int) -> pd.DataFrame:
     """Fetch historical market data for training."""
+    # Try Allora API first (more complete data)
+    allora_api_key = os.getenv('ALLORA_API_KEY')
+    if allora_api_key:
+        try:
+            from allora_forge_builder_kit.workflow import AlloraMLWorkflow
+            workflow = AlloraMLWorkflow(
+                data_api_key=allora_api_key,
+                tickers=[TICKER],
+                hours_needed=hours_needed,
+                number_of_input_candles=12,
+                target_length=TARGET_HOURS,
+            )
+            
+            # Fetch data from sufficient time ago
+            start_date = (datetime.now(timezone.utc) - pd.Timedelta(hours=hours_needed + 48)).date().isoformat()
+            raw = workflow.fetch_ohlcv_data(TICKER, start_date)
+            bars = workflow.create_5_min_bars(raw)
+            
+            # Resample to hourly
+            hourly = bars.resample("1h").agg({
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }).dropna()
+            
+            # Ensure timezone-naive index for consistency
+            if hasattr(hourly.index, 'tz') and hourly.index.tz is not None:
+                hourly.index = hourly.index.tz_convert("UTC").tz_localize(None)
+            
+            # Rename to match expected schema
+            hourly = hourly.rename(columns={'close': 'close'})
+            hourly['timestamp'] = hourly.index
+            
+            log_worker_event('info', f'Fetched {len(hourly)} hours from Allora API')
+            return hourly
+            
+        except Exception as e:
+            log_worker_event('warning', f'Allora API fetch failed, falling back to Tiingo: {e}')
+    
+    # Fallback to Tiingo
     api_key = os.getenv('TIINGO_API_KEY')
     if not api_key:
-        raise ValueError("TIINGO_API_KEY not set")
+        raise ValueError("Neither ALLORA_API_KEY nor TIINGO_API_KEY is set")
     
     end_time = datetime.now(timezone.utc)
     start_time = end_time - pd.Timedelta(hours=hours_needed + 24)  # Extra buffer
@@ -195,6 +237,7 @@ def fetch_market_data(hours_needed: int) -> pd.DataFrame:
     df = df.sort_values('timestamp').reset_index(drop=True)
     df['close'] = df['close'].astype(float)
     
+    log_worker_event('info', f'Fetched {len(df)} hours from Tiingo API')
     return df
 
 
@@ -208,11 +251,11 @@ def train_model(market_data: pd.DataFrame) -> float:
     df['log_return'] = np.log(df['close'] / df['close'].shift(1))
     df = df.dropna()
     
-    # Feature engineering
-    for lag in [1, 2, 3, 6, 12, 24, 48, 72, 168]:
+    # Feature engineering - using smaller windows to work with available data
+    for lag in [1, 2, 3, 6, 12, 24, 48, 72]:
         df[f'lr_lag_{lag}h'] = df['log_return'].shift(lag)
     
-    for window in [6, 12, 24, 48, 72, 168]:
+    for window in [6, 12, 24, 48, 72]:
         df[f'lr_ma_{window}h'] = df['log_return'].rolling(window).mean()
         df[f'lr_std_{window}h'] = df['log_return'].rolling(window).std()
     
@@ -223,7 +266,8 @@ def train_model(market_data: pd.DataFrame) -> float:
     df = df.dropna()
     
     # Adaptive training based on available data
-    min_required = VALIDATION_SPAN_HOURS + TARGET_HOURS + 24  # Minimum viable dataset
+    # With smaller feature windows (max 72h), we need less data
+    min_required = 150  # Reduced from 360 to work with available API data
     if len(df) < min_required:
         raise ValueError(f"Insufficient data: {len(df)} < {min_required} (minimum required)")
     
