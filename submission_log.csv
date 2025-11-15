@@ -1,3 +1,4 @@
 timestamp_utc,topic_id,value,wallet,nonce,tx_hash,success,exit_code,status,log10_loss,score,reward
 2025-11-07T04:00:00Z,67,0.029150009155,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,0,active_not_churnable:missing_epoch_or_last_update,-1.129586,0,0
 2025-11-07T05:00:00Z,67,0.029150009155,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,0,skipped_topic_not_ready,-1.129586,0,0
+2025-11-15T20:00:00Z,67,-0.054082192481,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6532075,D6FABD903093102DB75A686EBD45C1F25490C6ABFF1C59031F7F45763B60A23C,true,0,submitted,-1.303405,0,0
