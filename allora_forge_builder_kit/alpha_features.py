@@ -173,13 +173,33 @@ def build_alpha_features(
             feats[f"{name}_corr24"] = rolling_corr(logret, series_ret, window=24)
             feats[f"{name}_corr168"] = rolling_corr(logret, series_ret, window=168)
 
-    # Basic cleaning on numeric columns
+    # Basic cleaning on numeric columns with noise injection to prevent exact duplicates
     num_cols = feats.select_dtypes(include=[np.number]).columns
     if len(num_cols) > 0:
         arr = feats.loc[:, num_cols].to_numpy(dtype=float, copy=True)
         arr[~np.isfinite(arr)] = np.nan
         feats.loc[:, num_cols] = arr
         feats.loc[:, num_cols] = feats.loc[:, num_cols].ffill(limit=3)
+        
+        # Add tiny noise to prevent exact duplicates when data is constant
+        # This is especially important for features that become identical due to constant prices
+        np.random.seed(42)  # For reproducibility
+        for col in num_cols:
+            col_data = feats[col].copy()
+            finite_mask = np.isfinite(col_data)
+            if finite_mask.sum() > 1:  # Only add noise if we have more than one finite value
+                # Calculate the scale of noise as a tiny fraction of the data's standard deviation
+                std_val = np.nanstd(col_data)
+                if std_val == 0 or not np.isfinite(std_val):
+                    # For constant data, use a tiny absolute noise
+                    noise_scale = 1e-10
+                else:
+                    noise_scale = std_val * 1e-8  # Very small relative noise
+                
+                # Add noise only to finite values, ensuring dtype compatibility
+                noise = np.random.normal(0, noise_scale, size=len(col_data)).astype(col_data.dtype)
+                col_data.loc[finite_mask] += noise[finite_mask]
+                feats[col] = col_data
     return feats
 
 

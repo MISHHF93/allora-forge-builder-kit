@@ -565,12 +565,18 @@ def _log_submission(
 
         # Set defaults to avoid nulls
         # Fallback logic: For failed submissions, score defaults to 0.0 (placeholder).
-        # Reward defaults to score if score != 0.0, else 0.0. This may cause score==reward in logs,
-        # but refresh_scores.py will update reward with actual on-chain values when available.
-        if score is None:
-            score = 0.0
-        if reward is None or reward == "pending":
-            reward = score if score != 0.0 else 0.0
+        # For successful submissions, leave score as None so refresh_scores can update it.
+        # Reward defaults to score if score != 0.0, else 0.0 for failed; "pending" for successful if None.
+        if success:
+            if score is None:
+                score = None  # Leave as None for refresh_scores to update
+            if reward is None:
+                reward = "pending"  # Mark for later update
+        else:
+            if score is None:
+                score = 0.0
+            if reward is None or reward == "pending":
+                reward = score if score != 0.0 else 0.0
         if nonce is None:
             nonce = 0
         if tx_hash is None:
