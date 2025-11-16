@@ -3167,6 +3167,11 @@ def run_pipeline(args, cfg, root_dir) -> int:
         )
 
     # Topic validation and audit (moved out of abort block)
+    # Initialize variables first to avoid UnboundLocalError in exception handler
+    topic_validation_ok = False
+    topic_validation_funded = False
+    topic_validation_epoch = False
+    
     try:
         topic_id_eff = int(DEFAULT_TOPIC_ID)
         assert topic_id_eff == int(EXPECTED_TOPIC_67["topic_id"]), "Topic ID must be 67 for this workflow"
@@ -3200,8 +3205,8 @@ def run_pipeline(args, cfg, root_dir) -> int:
             print("Topic 67 validation: OK and funded")
     except Exception as e:
         print(f"Warning: topic creation/funding validation skipped or failed: {e}")
-        if topic_validation_reason is None:
-            topic_validation_reason = str(e)
+        # Set reason to exception details if not already set
+        topic_validation_reason = topic_validation_reason if 'topic_validation_reason' in locals() else str(e)
 
     # Enforce non-overlapping targets for 7-day horizon: sample timestamps at least `non_overlap_hours` apart
     def _non_overlapping_mask(idx: pd.DatetimeIndex, hours: int) -> pd.Series:
@@ -4439,9 +4444,24 @@ def main() -> int:
             return last_rc
         iteration += 1
         logging.info(f"[loop] iteration={iteration} start")
-        rc = _run_once()
-        last_rc = rc
-        logging.info(f"[loop] iteration={iteration} completed with rc={rc}")
+        
+        # Wrap pipeline execution in try-except to prevent loop crashes
+        try:
+            rc = _run_once()
+            last_rc = rc
+            logging.info(f"[loop] iteration={iteration} completed with rc={rc}")
+        except KeyboardInterrupt:
+            logging.info("[loop] received KeyboardInterrupt during execution; exiting loop")
+            return last_rc
+        except Exception as e:
+            # Log error but continue loop - ensures resilience against API failures, validation errors, etc.
+            error_msg = f"[loop] iteration={iteration} failed with exception: {type(e).__name__}: {e}"
+            logging.error(error_msg)
+            print(f"ERROR: {error_msg}", file=sys.stderr)
+            rc = 1
+            last_rc = rc
+            logging.info(f"[loop] iteration={iteration} error handled, continuing to next cycle")
+        
         now_utc = pd.Timestamp.now(tz="UTC")
         window_start = _window_start_utc(now=now_utc, cadence_s=cadence_s)
         next_window = window_start + pd.Timedelta(seconds=cadence_s)
