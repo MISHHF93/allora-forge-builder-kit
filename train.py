@@ -3773,59 +3773,59 @@ def run_pipeline(args, cfg, root_dir) -> int:
     X_val = _clip_outliers(X_val, ["logret_1h"]) if not X_val.empty and "logret_1h" in X_val.columns else X_val
     X_test = _clip_outliers(X_test, ["logret_1h"]) if "logret_1h" in X_test.columns else X_test
 
-    # 4.5) Feature deduplication: remove duplicate columns to prevent data leakage and overfitting
-    def _deduplicate_features(df: pd.DataFrame, name: str) -> pd.DataFrame:
-        """Remove duplicate columns by name and content, ensuring feature integrity."""
-        if df.empty:
-            return df
-        
-        original_count = len(df.columns)
-        
-        # Step 1: Remove exact column name duplicates (keep first occurrence)
-        df_deduped = df.loc[:, ~df.columns.duplicated(keep='first')]
-        name_dupes_removed = original_count - len(df_deduped.columns)
-        
-        # Step 2: Remove columns with identical content but different names
-        # Use a more efficient approach for large datasets by comparing column hashes
-        cols_to_keep = []
-        content_signatures = {}
-        
-        for col in df_deduped.columns:
-            # Create a content signature using hash of non-null values
-            try:
-                col_data = df_deduped[col].dropna()
-                if len(col_data) > 0:
-                    # Use a robust hash that handles floating point precision
-                    content_hash = hash(tuple(np.round(col_data.astype(float), 8).values)) if col_data.dtype.kind in 'biufc' else hash(tuple(col_data.values))
-                else:
-                    content_hash = hash(tuple())  # Empty column signature
-                
-                # Check if we've seen this content before
-                if content_hash not in content_signatures:
-                    content_signatures[content_hash] = col
-                    cols_to_keep.append(col)
-                else:
-                    print(f"    Dropping content duplicate: '{col}' (identical to '{content_signatures[content_hash]}')")
-            except (TypeError, ValueError, OverflowError):
-                # If hashing fails, keep the column to be safe
-                cols_to_keep.append(col)
-        
-        df_final = df_deduped[cols_to_keep]
-        content_dupes_removed = len(df_deduped.columns) - len(df_final.columns)
-        total_removed = name_dupes_removed + content_dupes_removed
-        
-        if total_removed > 0:
-            print(f"  {name}: Removed {total_removed} duplicate features ({name_dupes_removed} name dupes, {content_dupes_removed} content dupes)")
-            print(f"  {name}: {original_count} → {len(df_final.columns)} features after deduplication")
-        else:
-            print(f"  {name}: No duplicate features detected ({original_count} unique features)")
-        
-        return df_final
+    # 4.5) Feature deduplication: remove duplicate columns by content across splits
+    def _drop_duplicate_features_by_content(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Identify duplicate feature columns in X_train by content and drop them across all splits."""
+        if train_df.empty:
+            print("⏭️ Skipping duplicate feature check: X_train is empty.")
+            return train_df, val_df, test_df
 
-    print("🔍 Checking for duplicate features across all splits...")
-    X_train = _deduplicate_features(X_train, "X_train")
-    X_val = _deduplicate_features(X_val, "X_val") if not X_val.empty else X_val
-    X_test = _deduplicate_features(X_test, "X_test") if not X_test.empty else X_test
+        total_before = len(train_df.columns)
+
+        # Remove duplicate column names in X_train while keeping the first occurrence
+        unique_mask = ~train_df.columns.duplicated(keep="first")
+        name_duplicates = train_df.columns[~unique_mask].tolist()
+        if name_duplicates:
+            print(f"  Removing duplicate column names from X_train (keeping first occurrence): {name_duplicates}")
+        train_unique = train_df.loc[:, unique_mask]
+
+        # Build content signatures for each column
+        signatures: Dict[bytes, List[str]] = {}
+        duplicate_groups: List[List[str]] = []
+        for col in train_unique.columns:
+            hashed = pd.util.hash_pandas_object(train_unique[col], index=False).to_numpy().tobytes()
+            signatures.setdefault(hashed, []).append(col)
+
+        for cols in signatures.values():
+            if len(cols) > 1:
+                duplicate_groups.append(cols)
+
+        drop_cols: List[str] = []
+        for group in duplicate_groups:
+            keep_col = "logret_1h" if "logret_1h" in group else group[0]
+            drop_cols.extend([c for c in group if c != keep_col])
+
+        drop_cols = list(dict.fromkeys(name_duplicates + drop_cols))
+
+        train_clean = train_unique.drop(columns=drop_cols, errors="ignore")
+        val_clean = val_df.drop(columns=drop_cols, errors="ignore") if not val_df.empty else val_df
+        test_clean = test_df.drop(columns=drop_cols, errors="ignore") if not test_df.empty else test_df
+
+        total_after = len(train_clean.columns)
+
+        print("📑 Duplicate feature report:")
+        print(f"  Total features before deduplication: {total_before}")
+        print(f"  Total features after deduplication:  {total_after}")
+        print(f"  Duplicate groups found: {len(duplicate_groups)}")
+        if drop_cols:
+            print(f"  Dropped columns: {', '.join(drop_cols)}")
+        else:
+            print("  Dropped columns: None")
+
+        return train_clean, val_clean, test_clean
+
+    print("🔍 Removing duplicate features using X_train as reference...")
+    X_train, X_val, X_test = _drop_duplicate_features_by_content(X_train, X_val, X_test)
 
     # 5) Feature selection: ensure aligned numeric columns across splits with debug logs
     def _print_cols(df: pd.DataFrame, name: str) -> None:
@@ -3885,10 +3885,8 @@ def run_pipeline(args, cfg, root_dir) -> int:
         _print_cols(X_test, "X_test[fallback]")
         
         # Apply deduplication to fallback splits as well
-        print("🔍 Checking for duplicate features in fallback splits...")
-        X_train = _deduplicate_features(X_train, "X_train[fallback]")
-        X_val = _deduplicate_features(X_val, "X_val[fallback]") if not X_val.empty else X_val
-        X_test = _deduplicate_features(X_test, "X_test[fallback]") if not X_test.empty else X_test
+        print("🔍 Removing duplicate features in fallback splits using X_train[fallback] as reference...")
+        X_train, X_val, X_test = _drop_duplicate_features_by_content(X_train, X_val, X_test)
         
         num_train = X_train.select_dtypes(include=["number"]).columns.tolist()
         num_val = X_val.select_dtypes(include=["number"]).columns.tolist() if not X_val.empty else num_train
