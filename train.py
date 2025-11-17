@@ -3775,25 +3775,31 @@ def run_pipeline(args, cfg, root_dir) -> int:
 
     # 4.5) Feature deduplication: remove duplicate columns by content across splits
     def _drop_duplicate_features_by_content(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Identify duplicate feature columns in X_train by content and drop them across all splits."""
+        """Identify duplicate feature columns, keeping the first occurrence across splits."""
         if train_df.empty:
             print("⏭️ Skipping duplicate feature check: X_train is empty.")
             return train_df, val_df, test_df
 
-        total_before = len(train_df.columns)
+        def _dedupe_names(df: pd.DataFrame, label: str) -> pd.DataFrame:
+            if df.empty:
+                return df
+            mask = ~df.columns.duplicated(keep="first")
+            dup_names = df.columns[~mask].tolist()
+            if dup_names:
+                print(f"  Removing duplicate column names from {label} (keeping first occurrence): {dup_names}")
+            return df.loc[:, mask]
 
-        # Remove duplicate column names in X_train while keeping the first occurrence
-        unique_mask = ~train_df.columns.duplicated(keep="first")
-        name_duplicates = train_df.columns[~unique_mask].tolist()
-        if name_duplicates:
-            print(f"  Removing duplicate column names from X_train (keeping first occurrence): {name_duplicates}")
-        train_unique = train_df.loc[:, unique_mask]
+        train_df = _dedupe_names(train_df, "X_train")
+        val_df = _dedupe_names(val_df, "X_val")
+        test_df = _dedupe_names(test_df, "X_test")
+
+        total_before = len(train_df.columns)
 
         # Build content signatures for each column
         signatures: Dict[bytes, List[str]] = {}
         duplicate_groups: List[List[str]] = []
-        for col in train_unique.columns:
-            hashed = pd.util.hash_pandas_object(train_unique[col], index=False).to_numpy().tobytes()
+        for col in train_df.columns:
+            hashed = pd.util.hash_pandas_object(train_df[col], index=False).to_numpy().tobytes()
             signatures.setdefault(hashed, []).append(col)
 
         for cols in signatures.values():
@@ -3805,9 +3811,9 @@ def run_pipeline(args, cfg, root_dir) -> int:
             keep_col = "logret_1h" if "logret_1h" in group else group[0]
             drop_cols.extend([c for c in group if c != keep_col])
 
-        drop_cols = list(dict.fromkeys(name_duplicates + drop_cols))
+        drop_cols = list(dict.fromkeys(drop_cols))
 
-        train_clean = train_unique.drop(columns=drop_cols, errors="ignore")
+        train_clean = train_df.drop(columns=drop_cols, errors="ignore")
         val_clean = val_df.drop(columns=drop_cols, errors="ignore") if not val_df.empty else val_df
         test_clean = test_df.drop(columns=drop_cols, errors="ignore") if not test_df.empty else test_df
 

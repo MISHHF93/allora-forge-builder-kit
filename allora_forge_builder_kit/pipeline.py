@@ -388,11 +388,11 @@ class Pipeline:
 
         initial_count = features.shape[1]
 
-        # Drop duplicate column names, keeping the last occurrence to mirror pandas join semantics
+        # Drop duplicate column names, keeping the first occurrence so earlier features win
         if features.columns.duplicated().any():
             dup_names = features.columns[features.columns.duplicated()].unique().tolist()
             before = features.shape[1]
-            features = features.loc[:, ~features.columns.duplicated(keep="last")]
+            features = features.loc[:, ~features.columns.duplicated(keep="first")]
             removed = before - features.shape[1]
             self.train_logger.warning(
                 "Duplicate feature names detected; removed %d columns (names: %s)",
@@ -403,7 +403,7 @@ class Pipeline:
         # Drop columns that are perfectly identical (exact match)
         if not features.empty:
             before_redundant = features.shape[1]
-            transposed = features.T.drop_duplicates(keep="last")
+            transposed = features.T.drop_duplicates(keep="first")
             features = transposed.T
             redundant_removed = before_redundant - features.shape[1]
             if redundant_removed > 0:
@@ -432,13 +432,13 @@ class Pipeline:
                 h = hashlib.md5(rounded.tobytes()).hexdigest()
                 fingerprints.setdefault(h, []).append(col)
 
-            # For each fingerprint group, verify near-duplicates with allclose and drop earlier ones
+            # For each fingerprint group, verify near-duplicates with allclose and drop later ones
             for cols in fingerprints.values():
                 if len(cols) <= 1:
                     continue
-                # keep last occurrence, drop earlier ones
-                keeper = cols[-1]
-                for candidate in cols[:-1]:
+                # keep first occurrence, drop later ones
+                keeper = cols[0]
+                for candidate in cols[1:]:
                     a = features[keeper].to_numpy()
                     b = features[candidate].to_numpy()
                     try:
