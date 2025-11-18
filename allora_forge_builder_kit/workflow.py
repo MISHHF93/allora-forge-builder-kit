@@ -182,6 +182,82 @@ class AlloraMLWorkflow:
         df = df.sort_values("date").reset_index(drop=True)
         return df
 
+    def _build_ohlcv_history(
+        self,
+        ticker: str,
+        from_month: str,
+        include_local_override: bool = False,
+        top_up_hours: int | None = None,
+    ) -> pd.DataFrame:
+        """Centralized OHLCV loader that deduplicates and optionally tops up with live data.
+
+        Args:
+            ticker: Asset ticker, e.g. BTCUSD.
+            from_month: Month string (YYYY-MM) for bucket discovery or fallback pulls.
+            include_local_override: If True, merge any local fixture CSV before remote pulls.
+            top_up_hours: If provided, fetch recent candles from ``max(date) - top_up_hours``.
+        """
+        frames: list[pd.DataFrame] = []
+
+        if include_local_override:
+            try:
+                root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+                local_csv = os.path.join(root, "data", "external", f"{ticker}_ohlcv.csv")
+                if os.path.exists(local_csv):
+                    df_local = pd.read_csv(local_csv)
+                    df_local["date"] = pd.to_datetime(df_local["date"], utc=True)
+                    for col in ["open", "high", "low", "close", "volume"]:
+                        if col not in df_local.columns:
+                            df_local[col] = np.nan
+                        else:
+                            df_local[col] = pd.to_numeric(df_local[col], errors="coerce")
+                    if "trades_done" not in df_local.columns:
+                        df_local["trades_done"] = 0
+                    frames.append(df_local[["date", "open", "high", "low", "close", "volume", "trades_done"]])
+            except Exception:
+                pass
+
+        try:
+            for bucket in self.list_ready_buckets(ticker, from_month):
+                df = self.fetch_bucket_csv(bucket["download_url"])
+                frames.append(df)
+        except RuntimeError:
+            # Likely unauthorized; fall back below
+            frames = []
+
+        combined_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if combined_df.empty:
+            # Try Allora OHLC; on 401, fall back to Tiingo
+            try:
+                combined_df = self.fetch_ohlcv_data(ticker, f"{from_month}-01")
+            except RuntimeError:
+                combined_df = self.fetch_ohlcv_data_tiingo(ticker, f"{from_month}-01")
+            combined_df["date"] = pd.to_datetime(combined_df["date"], utc=True)
+        else:
+            combined_df["date"] = pd.to_datetime(combined_df["date"], utc=True)
+            combined_df = combined_df.drop_duplicates(subset="date")
+
+            if top_up_hours:
+                latest_ts = combined_df["date"].max()
+                if latest_ts is not None:
+                    fetch_start = (latest_ts - pd.Timedelta(hours=top_up_hours)).strftime("%Y-%m-%d")
+                    try:
+                        live_df = self.fetch_ohlcv_data(ticker, fetch_start)
+                    except (ValueError, RuntimeError):
+                        try:
+                            live_df = self.fetch_ohlcv_data_tiingo(ticker, fetch_start)
+                        except Exception:
+                            live_df = pd.DataFrame()
+                    if not live_df.empty:
+                        live_df["date"] = pd.to_datetime(live_df["date"], utc=True)
+                        combined_df = pd.concat([combined_df, live_df], ignore_index=True)
+                        combined_df = combined_df.drop_duplicates(subset="date").sort_values("date")
+
+        if combined_df.empty:
+            combined_df = self._offline_ohlcv_from_local(ticker, f"{from_month}-01")
+
+        return combined_df
+
     def fetch_ohlcv_data(self, ticker, from_date: str, max_pages: int = 1000, sleep_sec: float = 0.1) -> pd.DataFrame:
         url = "https://api.allora.network/v2/allora/market-data/ohlc"
         headers = self._headers()
@@ -414,62 +490,12 @@ class AlloraMLWorkflow:
         all_data = {}
         for t in self.tickers:
             print(f"Downloading Historical Data for {t}")
-            frames = []
-            # Optional local override to ensure full coverage through t+7d after competition end
-            try:
-                root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-                local_csv = os.path.join(root, "data", "external", f"{t}_ohlcv.csv")
-                if os.path.exists(local_csv):
-                    df_local = pd.read_csv(local_csv)
-                    # Expect columns: date, open, high, low, close, volume (trades_done optional)
-                    df_local["date"] = pd.to_datetime(df_local["date"], utc=True)
-                    for col in ["open", "high", "low", "close", "volume"]:
-                        if col not in df_local.columns:
-                            df_local[col] = np.nan
-                        else:
-                            df_local[col] = pd.to_numeric(df_local[col], errors="coerce")
-                    if "trades_done" not in df_local.columns:
-                        df_local["trades_done"] = 0
-                    frames.append(df_local[["date","open","high","low","close","volume","trades_done"]])
-            except Exception:
-                pass
-            try:
-                for bucket in self.list_ready_buckets(t, from_month):
-                    df = self.fetch_bucket_csv(bucket["download_url"])
-                    frames.append(df)
-            except RuntimeError:
-                # Likely unauthorized; fall back below
-                frames = []
-
-            combined_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-            if not combined_df.empty:
-                combined_df["date"] = pd.to_datetime(combined_df["date"], utc=True)
-                combined_df = combined_df.drop_duplicates(subset="date")
-                latest_ts = combined_df["date"].max()
-                if latest_ts is not None:
-                    # Attempt to top up with the most recent 48h of candles to minimize gaps
-                    fetch_start = (latest_ts - pd.Timedelta(hours=max(48, self.target_length))).strftime("%Y-%m-%d")
-                    try:
-                        live_df = self.fetch_ohlcv_data(t, fetch_start)
-                    except (ValueError, RuntimeError):
-                        try:
-                            live_df = self.fetch_ohlcv_data_tiingo(t, fetch_start)
-                        except Exception:
-                            live_df = pd.DataFrame()
-                    if not live_df.empty:
-                        live_df["date"] = pd.to_datetime(live_df["date"], utc=True)
-                        combined_df = pd.concat([combined_df, live_df], ignore_index=True)
-                        combined_df = combined_df.drop_duplicates(subset="date").sort_values("date")
-            else:
-                # Try Allora OHLC; on 401, fall back to Tiingo
-                try:
-                    combined_df = self.fetch_ohlcv_data(t, f"{from_month}-01")
-                except RuntimeError:
-                    combined_df = self.fetch_ohlcv_data_tiingo(t, f"{from_month}-01")
-                combined_df["date"] = pd.to_datetime(combined_df["date"], utc=True)
-            if combined_df.empty:
-                print(f"Warning: no OHLCV rows retrieved for {t}; generating offline fallback data.")
-                combined_df = self._offline_ohlcv_from_local(t, f"{from_month}-01")
+            combined_df = self._build_ohlcv_history(
+                t,
+                from_month,
+                include_local_override=True,
+                top_up_hours=max(48, self.target_length),
+            )
             if combined_df.empty:
                 print(f"Warning: offline fallback produced no rows for {t}; skipping ticker.")
                 continue
@@ -593,33 +619,12 @@ class AlloraMLWorkflow:
         all_data = {}
         for t in self.tickers:
             print(f"Downloading Historical Data for {t}")
-            frames = []
-            try:
-                for bucket in self.list_ready_buckets(t, from_month):
-                    df = self.fetch_bucket_csv(bucket["download_url"])
-                    frames.append(df)
-            except RuntimeError:
-                # Likely 401: fall back to Tiingo below
-                frames = []
-
-            combined_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-            if not combined_df.empty:
-                latest_ts = sorted(pd.to_datetime(combined_df["date"]).dt.date.unique())[-2]
-                try:
-                    live_df = self.fetch_ohlcv_data(t, latest_ts.strftime("%Y-%m-%d"))
-                    combined_df = pd.concat([combined_df, live_df], ignore_index=True)
-                except (ValueError, RuntimeError):
-                    # No data or unauthorized; continue with combined only
-                    pass
-                combined_df['date'] = pd.to_datetime(combined_df['date'], utc=True)
-                combined_df = combined_df.drop_duplicates(subset='date')
-            else:
-                # Try Allora direct; if unauthorized, fallback to Tiingo
-                try:
-                    combined_df = self.fetch_ohlcv_data(t, f"{from_month}-01")
-                except RuntimeError:
-                    combined_df = self.fetch_ohlcv_data_tiingo(t, f"{from_month}-01")
-                combined_df["date"] = pd.to_datetime(combined_df["date"], utc=True)
+            combined_df = self._build_ohlcv_history(
+                t,
+                from_month,
+                include_local_override=False,
+                top_up_hours=max(48, self.target_length),
+            )
             all_data[t] = combined_df
 
         datasets = []
