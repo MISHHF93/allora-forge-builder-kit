@@ -29,6 +29,7 @@ from allora_forge_builder_kit.submission_log import (
     dedupe_submission_log_file,
     log_submission_row,
 )
+from allora_forge_builder_kit.environment import warn_on_suspect_api_key
 
 try:
     import yaml  # type: ignore
@@ -79,19 +80,20 @@ def _to_naive_utc_ts(ts: pd.Timestamp) -> pd.Timestamp:
 def _require_api_key() -> str:
     api_key = os.getenv("ALLORA_API_KEY")
     if api_key:
-        return api_key.strip()
+        key = api_key.strip()
+        warn_on_suspect_api_key(key)
+        return key
 
-    # Retry with explicit path near this script and with find_dotenv fallback
     repo_dotenv = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    # If a .env is found elsewhere (e.g., parent), prefer that
     discovered = find_dotenv(usecwd=True) or repo_dotenv
     if os.path.exists(discovered):
         load_dotenv(dotenv_path=discovered, override=True, encoding="utf-8")
         api_key = os.getenv("ALLORA_API_KEY")
         if api_key:
-            return api_key.strip()
+            key = api_key.strip()
+            warn_on_suspect_api_key(key)
+            return key
 
-    # Last-chance parse without injecting into env
     def _manual_parse_env(path: str) -> Dict[str, str]:
         result: Dict[str, str] = {}
         try:
@@ -103,9 +105,8 @@ def _require_api_key() -> str:
                     if "=" not in line:
                         continue
                     k, v = line.split("=", 1)
-                    # Normalize key: keep only [A-Za-z0-9_]
                     k = re.sub(r"[^A-Za-z0-9_]", "", k.strip())
-                    v = v.strip().strip('"').strip("'")
+                    v = v.strip().strip('\"').strip("'")
                     result[k] = v
         except (OSError, IOError):
             return {}
@@ -113,50 +114,52 @@ def _require_api_key() -> str:
 
     try:
         parsed = dotenv_values(discovered) if os.path.exists(discovered) else {}
-        # Also parse manually and merge if needed
         manual: Dict[str, str] = _manual_parse_env(discovered) if os.path.exists(discovered) else {}
         parsed_clean: Dict[str, str] = {k: str(v) for k, v in (parsed or {}).items() if isinstance(v, str) and v}
         merged: Dict[str, str] = {**parsed_clean, **{k: v for k, v in manual.items() if v}}
-        # Debug: list parsed keys without values
         if merged:
             print(f"Loaded .env from {discovered} with keys: {list(merged.keys())}")
         api_key = (merged or {}).get("ALLORA_API_KEY")
         if api_key:
             os.environ["ALLORA_API_KEY"] = api_key
+            warn_on_suspect_api_key(api_key.strip())
     except (OSError, IOError):
         api_key = None
 
-    # Final attempt: bytes-level grep for the key with tolerant separators/whitespace
     if not api_key and os.path.exists(discovered):
         try:
             with open(discovered, "rb") as fb:
                 raw = fb.read()
-            text = None
+            text_blob = None
             for enc in ("utf-8-sig", "utf-8", "latin-1"):
                 try:
-                    text = raw.decode(enc)
+                    text_blob = raw.decode(enc)
                     break
                 except UnicodeDecodeError:
                     continue
-            if text is None:
-                text = raw.decode("latin-1", errors="ignore")
-            # Regex: allow non-word separators around key and either '=' or ':' as assignment
-            m = re.search(r"(?mi)^\s*ALLORA_API_KEY\s*[:=]\s*([^\r\n]+)", text)
+            if text_blob is None:
+                text_blob = raw.decode("latin-1", errors="ignore")
+            m = re.search(r"(?mi)^\\s*ALLORA_API_KEY\\s*[:=]\\s*([^\\r\\n]+)", text_blob)
             if m:
-                candidate = m.group(1).strip().strip('"').strip("'")
+                candidate = m.group(1).strip().strip('\"').strip("'")
                 if candidate:
                     os.environ["ALLORA_API_KEY"] = candidate
+                    warn_on_suspect_api_key(candidate)
                     return candidate
         except OSError:
             pass
 
     if not api_key:
+        warn_on_suspect_api_key("")
         print(
-            f"ERROR: ALLORA_API_KEY not found in environment (.env). Searched: {discovered} (exists={os.path.exists(discovered)}).",
+            f"ERROR: ALLORA_API_KEY not found in environment (.env). Searched: {discovered} (exists={os.path.exists(discovered)})",
             file=sys.stderr,
         )
         sys.exit(1)
-    return api_key.strip()
+
+    key = api_key.strip()
+    warn_on_suspect_api_key(key)
+    return key
 
 
 def _load_pipeline_config(root_dir: str) -> Dict[str, Any]:
@@ -1892,13 +1895,28 @@ def _post_submit_backfill(root_dir: str, tail: int = 20, attempts: int = 3, dela
         # Never raise from a post-submit refresher
         pass
 
-async def _submit_with_sdk(topic_id: int, value: float, api_key: str, timeout_s: int, max_retries: int, root_dir: str, pre_log10_loss: Optional[float]) -> int:
+async def _submit_with_sdk(topic_id: int, value: float, timeout_s: int, max_retries: int, root_dir: str, pre_log10_loss: Optional[float]) -> int:
     try:
         from allora_sdk.worker import AlloraWorker as WorkerCls  # type: ignore
+        from allora_sdk.rpc_client.config import AlloraNetworkConfig, AlloraWalletConfig  # type: ignore
     except ImportError as e:
         print("ERROR: allora-sdk is required. Install with 'python -m pip install -U allora-sdk'.", file=sys.stderr)
         print(f"Detail: {e}", file=sys.stderr)
         return 1
+
+    try:
+        wallet_cfg = AlloraWalletConfig.from_env()
+    except ValueError as exc:
+        print(f"ERROR: wallet configuration missing for SDK submission: {exc}", file=sys.stderr)
+        return 1
+
+    network_cfg = AlloraNetworkConfig(
+        chain_id=str(CHAIN_ID),
+        url=DEFAULT_GRPC,
+        websocket_url=DEFAULT_WEBSOCKET,
+        fee_denom="uallo",
+        fee_minimum_gas_price=10.0,
+    )
 
     def run_fn(_: int) -> float:
         return float(value)
@@ -2085,16 +2103,23 @@ async def _submit_with_sdk(topic_id: int, value: float, api_key: str, timeout_s:
             import inspect as _inspect
             sig = _inspect.signature(WorkerCls.__init__)
             param_names = set(sig.parameters.keys())
-            kwargs: Dict[str, Any] = {"run": run_fn, "api_key": api_key, "topic_id": topic_id}
-            if "chain_id" in param_names:
-                kwargs["chain_id"] = CHAIN_ID
-            if "rpc_url" in param_names:
-                kwargs["rpc_url"] = DEFAULT_RPC
-            elif "node" in param_names:
-                kwargs["node"] = DEFAULT_RPC
+            kwargs: Dict[str, Any] = {"run": run_fn, "topic_id": topic_id}
+            if "wallet" in param_names:
+                kwargs["wallet"] = wallet_cfg
+            if "network" in param_names:
+                kwargs["network"] = network_cfg
+            else:
+                if "chain_id" in param_names:
+                    kwargs["chain_id"] = CHAIN_ID
+                if "rpc_url" in param_names:
+                    kwargs["rpc_url"] = DEFAULT_RPC
+                elif "node" in param_names:
+                    kwargs["node"] = DEFAULT_RPC
+            if "polling_interval" in param_names and timeout_s:
+                kwargs["polling_interval"] = int(max(1, timeout_s))
             worker = WorkerCls(**kwargs)
         except TypeError:
-            worker = WorkerCls(run_fn, api_key=api_key, topic_id=topic_id)
+            worker = WorkerCls(run_fn, topic_id=topic_id)
         except (RuntimeError, ValueError, OSError, AttributeError) as e:
             msg = str(e)
             print(f"ERROR: SDK worker initialization failed: {msg}", file=sys.stderr)
@@ -4595,14 +4620,13 @@ def run_pipeline(args, cfg, root_dir) -> int:
             else:
                 print("submit(helper): external helper failed, falling back to direct client submission", file=sys.stderr)
 
-        api_key = _require_api_key()
         # Prefer client-based submit to guarantee forecast, fallback to SDK worker if client path fails
         rc_client = asyncio.run(_submit_with_client_xgb(int(topic_id_cfg or 67), float(live_value), root_dir, pre_log10_loss, args.force_submit))
         rc = rc_client
         if rc_client != 0:
             # Always attempt SDK fallback when client path fails; unfulfilled nonces query can be stale
             print("Client-based xgb-only submit failed; attempting SDK worker fallback (forecast may be null)", file=sys.stderr)
-            rc = asyncio.run(_submit_with_sdk(int(topic_id_cfg or 67), float(live_value), api_key, int(args.submit_timeout), int(args.submit_retries), root_dir, pre_log10_loss))
+            rc = asyncio.run(_submit_with_sdk(int(topic_id_cfg or 67), float(live_value), int(args.submit_timeout), int(args.submit_retries), root_dir, pre_log10_loss))
         if rc == 0:
             try:
                 _update_window_lock(root_dir, cadence_s, intended_env)
@@ -4651,15 +4675,23 @@ def main() -> int:
     
     # Handle standalone print-wallet mode
     if args.print_wallet:
-        api_key = os.getenv("ALLORA_API_KEY", "").strip()
-        if not api_key:
-            print("ERROR: Missing ALLORA_API_KEY in environment or .env", file=sys.stderr)
-            return 1
         try:
             from allora_sdk.worker import AlloraWorker
+            from allora_sdk.rpc_client.config import AlloraNetworkConfig, AlloraWalletConfig
+
+            wallet_cfg = AlloraWalletConfig.from_env()
+            network_cfg = AlloraNetworkConfig(
+                chain_id=os.getenv("ALLORA_CHAIN_ID", "allora-testnet-1"),
+                url=os.getenv("ALLORA_GRPC_URL") or "grpc+https://testnet-allora.lavenderfive.com:443",
+                websocket_url=os.getenv("ALLORA_WS_URL") or "wss://testnet-rpc.lavenderfive.com:443/allora/websocket",
+                fee_denom="uallo",
+                fee_minimum_gas_price=10.0,
+            )
+
             def dummy_run(_: int) -> float:
                 return 0.0
-            w = AlloraWorker(run=dummy_run, api_key=api_key, topic_id=67)
+
+            w = AlloraWorker(run=dummy_run, wallet=wallet_cfg, network=network_cfg, topic_id=67)
             addr = None
             for attr in ("wallet_address", "address", "wallet"):
                 try:
@@ -4680,6 +4712,9 @@ def main() -> int:
                 return 2
         except ImportError as e:
             print(f"ERROR: allora-sdk is required (pip install allora-sdk): {e}", file=sys.stderr)
+            return 1
+        except ValueError as e:
+            print(f"ERROR: Wallet configuration missing: {e}", file=sys.stderr)
             return 1
         except Exception as e:
             print(f"ERROR: Could not construct AlloraWorker: {e}", file=sys.stderr)

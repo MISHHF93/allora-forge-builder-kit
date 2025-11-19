@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -15,7 +17,11 @@ __all__ = [
     "load_last_nonce",
     "write_last_nonce",
     "require_api_key",
+    "warn_on_suspect_api_key",
 ]
+
+_ALLORA_KEY_PATTERN = re.compile(r"^UP-[A-Za-z0-9]{8,}")
+_TIINGO_KEY_PATTERN = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 
 
 def resolve_env_path(root: Path) -> Path:
@@ -83,5 +89,27 @@ def write_last_nonce(root: Path, payload: Dict[str, Any]) -> None:
 def require_api_key() -> str:
     key = os.getenv("ALLORA_API_KEY", "").strip()
     if not key:
+        warn_on_suspect_api_key(key)
         raise RuntimeError("ALLORA_API_KEY is not set. Add it to .env or the environment.")
+    warn_on_suspect_api_key(key)
     return key
+
+
+def warn_on_suspect_api_key(key: str) -> None:
+    """Emit a warning when the configured key is missing or malformed."""
+
+    if not key:
+        print("Warning: ALLORA_API_KEY is missing; OHLCV fetches will fall back to offline data only.", file=sys.stderr)
+        return
+
+    if _TIINGO_KEY_PATTERN.match(key):
+        print(
+            "Warning: ALLORA_API_KEY looks like a Tiingo token. Set TIINGO_API_KEY for Tiingo and use a valid Allora key for"
+            " market data.",
+            file=sys.stderr,
+        )
+    elif not _ALLORA_KEY_PATTERN.match(key):
+        print(
+            "Warning: ALLORA_API_KEY does not match the expected 'UP-' Allora format. Double-check the key in your .env.",
+            file=sys.stderr,
+        )
