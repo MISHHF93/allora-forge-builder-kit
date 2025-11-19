@@ -166,7 +166,6 @@ class Pipeline:
         data = json.loads(path.read_text(encoding="utf-8"))
         value = float(data["value"])
         topic = int(topic_id or data.get("topic_id", self.config.topic_id))
-        api_key = require_api_key()
 
         cfg = SubmissionConfig(
             topic_id=topic,
@@ -174,7 +173,6 @@ class Pipeline:
             retries=int(retries or self.config.submission_retries),
             log_path=self.config.submission_log,
             repo_root=self.root,
-            api_key=api_key,
             training_metrics=training_metrics,
         )
 

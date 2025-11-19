@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from allora_sdk.rpc_client import AlloraRPCClient
 from allora_sdk.rpc_client.config import AlloraNetworkConfig, AlloraWalletConfig
@@ -60,7 +60,6 @@ class SubmissionConfig:
     retries: int
     log_path: Path
     repo_root: Path
-    api_key: str
     training_metrics: Optional[Dict[str, float]] = None
 
     chain_id: str = DEFAULT_CHAIN_ID
@@ -100,7 +99,6 @@ async def submit_prediction(value: float, cfg: SubmissionConfig) -> SubmissionRe
                 run=lambda _: float(value),
                 wallet=wallet_cfg,
                 network=network_cfg,
-                api_key=cfg.api_key,
                 topic_id=cfg.topic_id,
                 polling_interval=int(cfg.timeout_seconds),
             )
