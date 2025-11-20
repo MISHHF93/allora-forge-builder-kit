@@ -676,11 +676,12 @@ def _run_allorad_json(args: List[str], timeout: int = 20, label: Optional[str] =
             return None
             
         if cp.returncode not in (0, None):
-            # Only warn for non-connection errors
-            if "connection refused" not in (cp.stderr or "").lower():
-                logging.warning("allorad query failed (%s): rc=%s stderr=%s", label, cp.returncode, (cp.stderr or "").strip()[:200])
-            return None
-            
+            stderr = (cp.stderr or "").strip()
+            msg = stderr.lower()
+            if "unknown command" in msg or "unknown query path" in msg:
+                logging.error("allorad query unsupported (%s): %s", label, stderr)
+            else:
+                logging.warning("allorad query failed (%s): rc=%s stderr=%s", label, cp.returncode, stderr)
         if not out:
             logging.debug("allorad query produced no output (%s)", label)
             return None
@@ -812,6 +813,34 @@ def _get_emissions_params() -> Dict[str, Any]:
     return out
 
 
+def _list_available_topic_ids() -> List[int]:
+    """Return a sorted list of topic IDs visible to the CLI."""
+    payload = _run_allorad_json(["q", "emissions", "topics"], label="topics:list") or {}
+    found: Set[int] = set()
+
+    def _collect(node: Any) -> None:
+        if isinstance(node, dict):
+            # Topics may be keyed by id or be in a list under a key
+            tid = node.get("id") or node.get("topic_id") or node.get("topicId")
+            if tid is not None:
+                try:
+                    found.add(int(tid))
+                except Exception:
+                    pass
+            for v in node.values():
+                _collect(v)
+        elif isinstance(node, list):
+            for it in node:
+                _collect(it)
+
+    _collect(payload)
+
+    if not found and payload:
+        logging.warning("Failed to extract topic IDs from emissions topics payload: %s", list(payload.keys()))
+
+    return sorted(found)
+
+
 def _get_topic_info(topic_id: int) -> Dict[str, Any]:
     """Query topic status/info, normalizing effective_revenue, delegated_stake, reputers_count, weight, last_update."""
 
@@ -844,17 +873,31 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
             entry["status"] = "empty"
         cli_debug.append(entry)
 
+    # If nothing came back from the CLI, surface available topics to aid misconfiguration triage
+    if not cli_results:
+        available_topics = _list_available_topic_ids()
+        if available_topics:
+            cli_results["available_topics"] = available_topics
+            logging.error(
+                "allorad returned no topic data for %s; available topics per CLI: %s",
+                topic_str,
+                available_topics,
+            )
+
     rest_results: Dict[str, Any] = {}
     rest_debug: List[Dict[str, Any]] = []
-    rest_base = _derive_rest_base_from_rpc(DEFAULT_RPC)
+    rest_base_raw = _derive_rest_base_from_rpc(DEFAULT_RPC).rstrip("/")
+    rest_prefix = rest_base_raw
+    if rest_prefix and not rest_prefix.endswith("/allora"):
+        rest_prefix = f"{rest_prefix}/allora"
     rest_paths: List[Tuple[str, str]] = []
-    if rest_base:
+    if rest_prefix:
         rest_paths = [
-            ("rest_topic", f"{rest_base}/allora/emissions/topic/{topic_str}"),
-            ("rest_topic_status", f"{rest_base}/allora/emissions/topic/{topic_str}/status"),
-            ("rest_topic_stake", f"{rest_base}/allora/emissions/topic/{topic_str}/stake"),
-            ("rest_topic_reputers", f"{rest_base}/allora/emissions/topic/{topic_str}/reputers"),
-            ("rest_topic_summary", f"{rest_base}/emissions/topic/{topic_str}"),
+            ("rest_topic", f"{rest_prefix}/emissions/topic/{topic_str}"),
+            ("rest_topic_status", f"{rest_prefix}/emissions/topic/{topic_str}/status"),
+            ("rest_topic_stake", f"{rest_prefix}/emissions/topic/{topic_str}/stake"),
+            ("rest_topic_reputers", f"{rest_prefix}/emissions/topic/{topic_str}/reputers"),
+            ("rest_topic_summary", f"{rest_prefix}/emissions/topic/{topic_str}"),
         ]
 
     # Track 501 errors for throttling
@@ -1200,22 +1243,18 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
         # Check if topic-quantile-reputer-score command returned data
         quantile_result = None
         try:
-            # Try the quantile query that we know works
-            node_param = "--node https://allora-testnet-rpc.polkachu.com:443"
-            cmd = f"allorad q emissions topic-quantile-reputer-score {topic_str} {node_param}"
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=15
+            quantile_payload = _run_allorad_json(
+                ["q", "emissions", "topic-quantile-reputer-score", topic_str],
+                label=f"topic_quantile_reputer_score:{topic_str}",
             )
-            if result.returncode == 0 and result.stdout.strip():
-                import json
-                try:
-                    quantile_data = json.loads(result.stdout.strip())
-                    if quantile_data.get("value") and float(quantile_data["value"]) > 0:
-                        quantile_result = True
-                except:
-                    pass
-        except Exception:
-            pass
+            quantile_value = None
+            if isinstance(quantile_payload, dict):
+                quantile_value = _deep_find_any(quantile_payload, ["value", "score", "quantile"])
+            qf = _to_float(quantile_value)
+            if qf is not None and qf > 0:
+                quantile_result = True
+        except Exception as exc:
+            logging.debug("Quantile reputer score probe failed for topic %s: %s", topic_str, exc)
         
         # Estimate reputer count based on evidence
         if quantile_result or (active_reputer_quantile and _to_float(active_reputer_quantile) > 0):
@@ -1302,6 +1341,7 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
         "required_delegated_stake": _to_float(required_delegate_candidate),
         "min_delegated_stake": _first_positive_float(min_stake_candidate, required_delegate_candidate, min_stake_env, network_min_stake),
         "query_debug": combined.get("query_debug"),
+        "available_topics": cli_results.get("available_topics"),
         "fallback_mode": {
             "rest_501_count": rest_501_count,
             "rest_501_endpoints": list(rest_501_endpoints),
