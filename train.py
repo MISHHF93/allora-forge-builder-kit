@@ -3326,8 +3326,41 @@ def _sleep_until_next_window(cadence_s: int) -> None:
         logging.info(f"[loop] aligning to cadence; sleeping {wait:.1f}s until {next_window.strftime('%Y-%m-%dT%H:%M:%SZ')}")
         try:
             time.sleep(wait)
-        except Exception:
-            pass
+        except KeyboardInterrupt:
+            logging.info("[loop] interrupted while aligning to cadence; exiting")
+            raise
+
+
+def _resolve_schedule(args: argparse.Namespace, sched_cfg: Dict[str, Any]) -> Tuple[str, str, str]:
+    """Resolve effective schedule mode/cadence from CLI and config without overlap.
+
+    Returns a tuple of (effective_mode, cadence, reason).
+    - ``--once`` always wins to guarantee a single pass.
+    - ``--loop`` OR ``--schedule-mode loop`` collapse into the same loop mode
+      so callers don't need to provide both; loop mode enforces an hourly cadence.
+    - Otherwise, fall back to provided CLI cadence or config cadence.
+    """
+
+    mode_cfg = str(getattr(args, "schedule_mode", None) or sched_cfg.get("mode", "single"))
+    cadence_cfg = str(getattr(args, "cadence", None) or sched_cfg.get("cadence", "1h"))
+    loop_flag = bool(getattr(args, "loop", False))
+    mode_loop = mode_cfg.lower() == "loop"
+
+    if getattr(args, "once", False):
+        return "once", cadence_cfg, "--once overrides loop/config to ensure single iteration"
+
+    # If both CLI loop and schedule-mode=loop are provided, surface that only one loop path will run.
+    if loop_flag and mode_loop:
+        logging.info("[schedule] --loop and --schedule-mode loop both provided; using single loop path with hourly cadence")
+        return "loop", "1h", "--loop and schedule-mode=loop both set; collapsing to single loop path"
+
+    if loop_flag:
+        return "loop", "1h", "--loop requested; schedule-mode ignored and cadence forced to 1h"
+
+    if mode_loop:
+        return "loop", "1h", "schedule-mode=loop requested; --loop not required; enforcing 1h cadence"
+
+    return mode_cfg, cadence_cfg, "default/config scheduling applied"
 
 
 def resolve_wallet() -> None:
@@ -4847,19 +4880,11 @@ def main() -> int:
     data_cfg: Dict[str, Any] = cfg.get("data", {})
     args.from_month = str(data_cfg.get("from_month", args.from_month))
     sched_cfg: Dict[str, Any] = cfg.get("schedule", {})
-    mode_cfg = str(args.schedule_mode or sched_cfg.get("mode", "single"))
-    if getattr(args, "once", False):
-        effective_mode = "once"
-    elif args.loop or mode_cfg.lower() == "loop":
-        effective_mode = "loop"
-    else:
-        effective_mode = mode_cfg
-    if effective_mode.lower() == "loop":
-        cadence = "1h"
-    else:
-        cadence = str(args.cadence or sched_cfg.get("cadence", "1h"))
+    effective_mode, cadence, schedule_reason = _resolve_schedule(args, sched_cfg)
     setattr(args, "_effective_mode", effective_mode)
     setattr(args, "_effective_cadence", cadence)
+    # Normalize args.loop flag so downstream code consistently reflects the resolved mode
+    setattr(args, "loop", effective_mode.lower() == "loop")
     cadence_s = _parse_cadence(cadence)
     
     def _run_once() -> int:
@@ -4875,6 +4900,7 @@ def main() -> int:
     print(f"Cadence:       {cadence} ({cadence_s} seconds)")
     print(f"Submit:        {'YES' if args.submit else 'NO'}")
     print(f"Force Submit:  {'YES' if args.force_submit else 'NO'}")
+    print(f"Schedule Src:  {schedule_reason}")
     
     if effective_mode.lower() != "loop":
         # SINGLE-SHOT MODE: Run once and exit immediately (no looping, no sleep)
