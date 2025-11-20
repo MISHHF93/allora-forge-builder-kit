@@ -2521,6 +2521,31 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
     # Resolve wallet (env/log placeholder until we construct LocalWallet below)
     wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip() or _resolve_wallet_for_logging(root_dir)
 
+    # Get topic info for epoch nonce
+    info = _get_topic_info(topic_id)
+    raw_info = info.get("raw") if isinstance(info, dict) else None
+    last_epoch_candidate = None
+    if isinstance(raw_info, dict):
+        last_epoch_candidate = _deep_find_any(
+            raw_info,
+            [
+                "epoch_last_ended",
+                "epochLastEnded",
+                "last_epoch_ended",
+                "lastEpochEnded",
+                "epoch_last_end",
+                "epochLastEnd",
+                "last_epoch",
+                "epoch_last",
+            ],
+        )
+    last_epoch_end = None
+    try:
+        last_epoch_end = int(str(last_epoch_candidate)) if last_epoch_candidate is not None else None
+    except Exception:
+        last_epoch_end = None
+    epoch_nonce = last_epoch_end if last_epoch_end is not None else None
+
     # Resolve nonce helpers. We'll poll for the worker window to open via can-submit,
     # then select the fresh unfulfilled nonce for this topic. Fallback to current height.
     def _query_unfulfilled_nonce(topic: int, wal: Optional[str], timeout: int = 20) -> Optional[int]:
@@ -2678,10 +2703,10 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
         if str(CHAIN_ID) == "allora-testnet-1":
             net_cfg = AlloraNetworkConfig(
                 chain_id=str(CHAIN_ID),
-                url=DEFAULT_GRPC,
-                websocket_url=DEFAULT_WEBSOCKET,
+                url=base_url,
+                websocket_url=None,
                 fee_denom="uallo",
-                fee_minimum_gas_price=10.0,
+                fee_minimum_gas_price=20.0,
             )
         elif str(CHAIN_ID) == "allora-mainnet-1":
             net_cfg = AlloraNetworkConfig.mainnet()
@@ -2733,8 +2758,11 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
         if isinstance(unf, int) and unf > 0:
             chosen_nonce = int(unf)
             break
-        # If we can submit but unfulfilled list isn't populated yet, use current height
+        # If we can submit but unfulfilled list isn't populated yet, use epoch nonce or current height
         if can_sub is True:
+            if epoch_nonce is not None:
+                chosen_nonce = epoch_nonce
+                break
             h = _current_block_height()
             if isinstance(h, int) and h > 0:
                 chosen_nonce = int(h)
@@ -2749,6 +2777,7 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
     if chosen_nonce is None:
         chosen_nonce = (
             _query_unfulfilled_nonce(int(topic_id), wallet)
+            or epoch_nonce
             or _current_block_height()
             or _query_topic_last_worker_commit_nonce(int(topic_id))
             or 0

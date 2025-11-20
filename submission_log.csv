@@ -11,3 +11,5 @@ timestamp_utc,topic_id,value,wallet,nonce,tx_hash,success,exit_code,status,log10
 2025-11-19T17:00:00Z,67,-0.051781427115,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,0,skipped_topic_not_ready,-1.370956,0,0
 2025-11-20T00:00:00Z,67,-0.050225351006,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,0,skipped_topic_not_ready,-1.371324,0,0
 2025-11-20T01:00:00Z,67,-0.050225351006,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,0,skipped_topic_not_ready,-1.371151,0,0
+2025-11-20T12:00:00Z,67,-0.050225351006,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,2,timeout,0,0,0
+2025-11-20T13:00:00Z,67,-0.050225351006,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6605515,B7C50DD1644FD5F6F6F9BE4EB16A05B1AEC77B711884B6E3B373A0922C25AC25,true,0,submitted,-1.371086,0,0
