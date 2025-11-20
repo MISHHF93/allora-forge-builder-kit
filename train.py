@@ -4795,48 +4795,91 @@ def main() -> int:
     setattr(args, "_effective_mode", effective_mode)
     setattr(args, "_effective_cadence", cadence)
     cadence_s = _parse_cadence(cadence)
+    
     def _run_once() -> int:
         return run_pipeline(args, cfg, root_dir)
+    
+    # Print startup mode information
+    now_utc = pd.Timestamp.now(tz="UTC")
+    print("="*80)
+    print("ALLORA PIPELINE - Topic 67 (7-Day BTC/USD Log-Return Prediction)")
+    print("="*80)
+    print(f"Start Time:    {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    print(f"Mode:          {effective_mode.upper()}")
+    print(f"Cadence:       {cadence} ({cadence_s} seconds)")
+    print(f"Submit:        {'YES' if args.submit else 'NO'}")
+    print(f"Force Submit:  {'YES' if args.force_submit else 'NO'}")
+    
     if effective_mode.lower() != "loop":
+        # SINGLE-SHOT MODE: Run once and exit immediately (no looping, no sleep)
+        print("Execution:     Single iteration (--once mode)")
+        print("="*80)
+        print()
         return _run_once()
+    
+    # LOOP MODE: Continuous execution with cadence alignment
+    print("Execution:     Continuous loop (--loop mode)")
+    next_window = _window_start_utc(now=now_utc, cadence_s=cadence_s) + pd.Timedelta(seconds=cadence_s)
+    print(f"Next Cycle:    {next_window.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    if args.timeout > 0:
+        print(f"Timeout:       {args.timeout} seconds")
+    else:
+        print(f"Timeout:       None (runs indefinitely)")
+    print("="*80)
+    print()
+    
     iteration = 0
     loop_timeout = max(0, int(getattr(args, "timeout", 0) or 0))
     start_wall = time.time()
+    
+    # Initial alignment: sleep until next cadence boundary before first iteration
     _sleep_until_next_window(cadence_s)
     last_rc = 0
     while True:
         if loop_timeout and (time.time() - start_wall) >= loop_timeout:
             logging.info("[loop] timeout reached before next iteration; exiting loop")
+            print(f"Loop timeout reached. Exiting after {iteration} iterations.")
             return last_rc
         iteration += 1
-        logging.info(f"[loop] iteration={iteration} start")
+        iter_start = pd.Timestamp.now(tz="UTC")
+        logging.info(f"[loop] iteration={iteration} start at {iter_start.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        print(f"\n{'='*80}")
+        print(f"LOOP ITERATION {iteration} - {iter_start.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print(f"{'='*80}\n")
         
         # Wrap pipeline execution in try-except to prevent loop crashes
         try:
             rc = _run_once()
             last_rc = rc
-            logging.info(f"[loop] iteration={iteration} completed with rc={rc}")
+            iter_end = pd.Timestamp.now(tz="UTC")
+            duration = (iter_end - iter_start).total_seconds()
+            logging.info(f"[loop] iteration={iteration} completed with rc={rc} in {duration:.1f}s")
+            print(f"\n✅ Iteration {iteration} completed (rc={rc}, duration={duration:.1f}s)")
         except KeyboardInterrupt:
             logging.info("[loop] received KeyboardInterrupt during execution; exiting loop")
+            print("\n\n🛑 Received KeyboardInterrupt. Exiting loop gracefully.")
             return last_rc
         except Exception as e:
             # Log error but continue loop - ensures resilience against API failures, validation errors, etc.
             error_msg = f"[loop] iteration={iteration} failed with exception: {type(e).__name__}: {e}"
             logging.error(error_msg)
-            print(f"ERROR: {error_msg}", file=sys.stderr)
+            print(f"\n❌ ERROR in iteration {iteration}: {type(e).__name__}: {e}", file=sys.stderr)
             rc = 1
             last_rc = rc
             logging.info(f"[loop] iteration={iteration} error handled, continuing to next cycle")
+            print(f"⚠️  Error handled. Will retry in next cycle.")
         
         now_utc = pd.Timestamp.now(tz="UTC")
         window_start = _window_start_utc(now=now_utc, cadence_s=cadence_s)
         next_window = window_start + pd.Timedelta(seconds=cadence_s)
         sleep_seconds = max(0.0, (next_window - now_utc).total_seconds())
         logging.info(f"[loop] sleeping {sleep_seconds:.1f}s until {next_window.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        print(f"\n💤 Sleeping {sleep_seconds/60:.1f} minutes until next cycle at {next_window.strftime('%H:%M:%S')} UTC...")
         try:
             time.sleep(sleep_seconds)
         except KeyboardInterrupt:
             logging.info("[loop] received KeyboardInterrupt; exiting loop")
+            print("\n\n🛑 Received KeyboardInterrupt. Exiting loop gracefully.")
             return rc
         if loop_timeout and (time.time() - start_wall) >= loop_timeout:
             logging.info("[loop] timeout reached after iteration; exiting loop")
