@@ -41,7 +41,14 @@ class AlloraMLWorkflow:
         }
 
     def _get_tiingo_key(self):
-        return (os.getenv("TIINGO_API_KEY") or "").strip()
+        """Return the data API key.
+
+        Historically this fetched ``TIINGO_API_KEY`` for the fallback OHLCV
+        data source. The builder now standardises on ``ALLORA_API_KEY`` for
+        all market-data access so the environment no longer needs a separate
+        Tiingo-specific variable.
+        """
+        return (os.getenv("ALLORA_API_KEY") or "").strip()
 
     def fetch_ohlcv_data_tiingo(self, ticker: str, from_date: str) -> pd.DataFrame:
         """
@@ -50,7 +57,7 @@ class AlloraMLWorkflow:
         """
         tkey = self._get_tiingo_key()
         if not tkey:
-            raise RuntimeError("TIINGO_API_KEY not set; cannot fallback to Tiingo.")
+            raise RuntimeError("ALLORA_API_KEY not set; cannot fallback to Tiingo.")
         # Tiingo expects startDate in ISO date and tickers like btcusd
         url = "https://api.tiingo.com/tiingo/crypto/prices"
         params = {
