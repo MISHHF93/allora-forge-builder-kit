@@ -1,0 +1,348 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║           ALLORA FORGE - EC2 MIGRATION COMPLETE WORKFLOW                   ║
+║           Instance: i-0dc6b17115f9836fa (44.249.158.207)                   ║
+║           Topic 67: 7-Day BTC/USD Log-Return Prediction                    ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 1: CONNECT TO EC2 FROM YOUR LOCAL MACHINE
+═══════════════════════════════════════════════════════════════════════════
+
+# Ensure key has correct permissions
+chmod 400 allora-keypair.pem
+
+# Connect to EC2 instance
+ssh -i allora-keypair.pem ubuntu@44.249.158.207
+
+# If connection fails, verify:
+# - Security group allows SSH (port 22) from your IP
+# - Instance is running (check AWS console)
+# - Public IP hasn't changed (44.249.158.207)
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 2: ONCE CONNECTED TO EC2, RUN AUTOMATED BOOTSTRAP
+═══════════════════════════════════════════════════════════════════════════
+
+# Option A: Quick Clone & Bootstrap (RECOMMENDED)
+cd ~
+git clone https://github.com/MISHHF93/allora-forge-builder-kit.git
+cd allora-forge-builder-kit
+./ec2_bootstrap.sh
+
+# The bootstrap script will:
+# ✅ Update system packages
+# ✅ Install Python and dependencies
+# ✅ Clone/update repository
+# ✅ Setup wallet configuration
+# ✅ Configure environment variables
+# ✅ Verify everything is working
+# ✅ Optionally start the worker
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 3: CONFIGURE WALLET (If bootstrap prompts you)
+═══════════════════════════════════════════════════════════════════════════
+
+# Create wallet file with your 24-word mnemonic
+nano .allora_key
+
+# Paste your mnemonic (one line, space-separated):
+# word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24
+
+# Save: Ctrl+O, Enter, Ctrl+X
+
+# Secure the file
+chmod 600 .allora_key
+
+# Verify wallet address
+python3 tools/print_wallet_address.py
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 4: SET ENVIRONMENT VARIABLES (If not auto-detected)
+═══════════════════════════════════════════════════════════════════════════
+
+# Get wallet address from mnemonic
+export ALLORA_WALLET_ADDR=$(python3 tools/print_wallet_address.py | tail -1)
+
+# Set API key (optional but recommended)
+export ALLORA_API_KEY="your_api_key_here"
+
+# Make persistent across sessions
+echo "export ALLORA_WALLET_ADDR=\"$ALLORA_WALLET_ADDR\"" >> ~/.bashrc
+echo "export ALLORA_API_KEY=\"your_api_key_here\"" >> ~/.bashrc
+source ~/.bashrc
+
+# Verify
+echo $ALLORA_WALLET_ADDR
+echo $ALLORA_API_KEY
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 5: START PRODUCTION WORKER
+═══════════════════════════════════════════════════════════════════════════
+
+# Start worker with our production-ready script
+./start_worker.sh
+
+# This will:
+# ✅ Stop any old workers
+# ✅ Verify configuration
+# ✅ Check critical bug fixes are present
+# ✅ Start worker in loop mode: --loop --schedule-mode loop --submit
+# ✅ Save PID to pipeline.pid
+# ✅ Log to pipeline_run.log
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 6: MONITOR WORKER
+═══════════════════════════════════════════════════════════════════════════
+
+# Quick status check
+./monitor.sh
+
+# Live monitoring dashboard (updates every 5 seconds)
+./watch_live.sh
+
+# Follow logs in real-time
+tail -f pipeline_run.log
+
+# Check submissions
+tail submission_log.csv
+
+# View worker process
+ps aux | grep "python.*train"
+
+# Check worker PID
+cat pipeline.pid
+
+═══════════════════════════════════════════════════════════════════════════
+MANUAL DEPLOYMENT (If you prefer step-by-step control)
+═══════════════════════════════════════════════════════════════════════════
+
+# 1. Update system
+sudo apt update && sudo apt upgrade -y
+
+# 2. Install packages
+sudo apt install -y python3 python3-pip git build-essential curl wget jq
+
+# 3. Clone repository
+git clone https://github.com/MISHHF93/allora-forge-builder-kit.git
+cd allora-forge-builder-kit
+
+# 4. Install Python dependencies
+pip3 install -r requirements.txt
+
+# 5. Create wallet file
+echo "word1 word2 ... word24" > .allora_key
+chmod 600 .allora_key
+
+# 6. Set environment
+export ALLORA_WALLET_ADDR=$(python3 tools/print_wallet_address.py | tail -1)
+export ALLORA_API_KEY="your_api_key"
+
+# 7. Verify
+python3 -c "import train; print('✅ Ready')"
+python3 tools/print_wallet_address.py
+
+# 8. Start worker
+./start_worker.sh
+
+═══════════════════════════════════════════════════════════════════════════
+ALTERNATIVE: START WORKER DIRECTLY (Without start_worker.sh)
+═══════════════════════════════════════════════════════════════════════════
+
+# Start in background with nohup
+nohup python3 train.py --loop --schedule-mode loop --submit > pipeline_run.log 2>&1 &
+
+# Save PID
+echo $! > pipeline.pid
+
+# Verify running
+ps -p $(cat pipeline.pid)
+
+# Monitor
+tail -f pipeline_run.log
+
+═══════════════════════════════════════════════════════════════════════════
+SYSTEMD SERVICE (For Production - Auto-restart)
+═══════════════════════════════════════════════════════════════════════════
+
+# Create service file
+sudo nano /etc/systemd/system/allora-worker.service
+
+# Paste this content:
+[Unit]
+Description=Allora Forge Worker - Topic 67
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/allora-forge-builder-kit
+Environment="ALLORA_API_KEY=your_api_key"
+Environment="ALLORA_WALLET_ADDR=allo1xxxxxxxxx6vma"
+ExecStart=/usr/bin/python3 train.py --loop --schedule-mode loop --submit
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/ubuntu/allora-forge-builder-kit/pipeline_run.log
+StandardError=append:/home/ubuntu/allora-forge-builder-kit/pipeline_run.log
+
+[Install]
+WantedBy=multi-user.target
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable allora-worker.service
+sudo systemctl start allora-worker.service
+
+# Check status
+sudo systemctl status allora-worker.service
+
+# View logs
+sudo journalctl -u allora-worker.service -f
+
+# Control commands
+sudo systemctl stop allora-worker.service
+sudo systemctl restart allora-worker.service
+
+═══════════════════════════════════════════════════════════════════════════
+TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════════════════
+
+Connection Issues:
+  ✓ Verify security group allows port 22 from your IP
+  ✓ Check instance state in AWS console (should be "running")
+  ✓ Confirm public IP: 44.249.158.207
+  ✓ Try: ssh -v -i allora-keypair.pem ubuntu@44.249.158.207
+
+Wallet Issues:
+  ✓ Check .allora_key exists: ls -la .allora_key
+  ✓ Verify permissions: chmod 600 .allora_key
+  ✓ Test derivation: python3 tools/print_wallet_address.py
+
+Worker Not Starting:
+  ✓ Check logs: tail -50 pipeline_run.log
+  ✓ Verify imports: python3 -c "import train"
+  ✓ Check dependencies: pip3 install -r requirements.txt
+  ✓ Verify env vars: echo $ALLORA_WALLET_ADDR
+
+Submission Failures:
+  ✓ Check submission_log.csv for status codes
+  ✓ View recent lifecycle: ls -lt data/artifacts/logs/ | head -5
+  ✓ Check window timing: ./monitor.sh
+
+═══════════════════════════════════════════════════════════════════════════
+EXPECTED OPERATION
+═══════════════════════════════════════════════════════════════════════════
+
+Once running, the worker will:
+  ✅ Train XGBoost models every hour with 28-day BTC/USD data
+  ✅ Submit predictions at HH:00:00 UTC when submission window opens
+  ✅ Handle REST API 501 errors gracefully (fallback mode)
+  ✅ Log all iterations with timestamps and durations
+  ✅ Track submissions in submission_log.csv
+  ✅ Generate lifecycle JSON artifacts for debugging
+  ✅ Run autonomously through December 15, 2025
+
+Log messages you'll see:
+  • INFO - REST endpoint not implemented: status=501 (using fallback)
+  • INFO - REST API fallback mode: 4 endpoint(s) not implemented...
+  • INFO - Topic 67: Fallback reputers_count=1
+  • INFO - [loop] iteration=X start at YYYY-MM-DDTHH:00:00Z
+  • ✅ Iteration X completed (rc=0, duration=XX.Xs)
+  • 💤 Sleeping XX.X minutes until next cycle...
+
+═══════════════════════════════════════════════════════════════════════════
+VERIFICATION CHECKLIST
+═══════════════════════════════════════════════════════════════════════════
+
+Before disconnecting from SSH:
+  ☐ Worker process running: ps aux | grep "python.*train"
+  ☐ PID file exists: cat pipeline.pid
+  ☐ Logs being written: tail pipeline_run.log
+  ☐ Submissions tracked: tail submission_log.csv
+  ☐ Wallet address correct: python3 tools/print_wallet_address.py
+  ☐ Environment vars set: echo $ALLORA_WALLET_ADDR
+  ☐ Next iteration time visible in logs
+  ☐ No critical errors in recent logs (last 50 lines)
+
+═══════════════════════════════════════════════════════════════════════════
+KEEPALIVE (Optional - Stay connected during long runs)
+═══════════════════════════════════════════════════════════════════════════
+
+# Option 1: Use screen (recommended for long sessions)
+screen -S allora
+# Run your commands
+# Detach: Ctrl+A then D
+# Reattach: screen -r allora
+
+# Option 2: Use tmux
+tmux new -s allora
+# Run your commands
+# Detach: Ctrl+B then D
+# Reattach: tmux attach -t allora
+
+# Option 3: Configure SSH keepalive
+# Add to ~/.ssh/config on your local machine:
+Host allora-ec2
+    HostName 44.249.158.207
+    User ubuntu
+    IdentityFile ~/path/to/allora-keypair.pem
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+
+# Then connect with: ssh allora-ec2
+
+═══════════════════════════════════════════════════════════════════════════
+FILES REFERENCE
+═══════════════════════════════════════════════════════════════════════════
+
+Key Files on EC2:
+  📁 ~/allora-forge-builder-kit/       → Main repository
+  🔐 .allora_key                        → Wallet mnemonic (SECURE!)
+  🤖 pipeline.pid                       → Worker process ID
+  📝 pipeline_run.log                   → Execution logs
+  📊 submission_log.csv                 → Submission history
+  ⚙️  config/pipeline.yaml              → Competition schedule
+  🗂️  data/artifacts/logs/lifecycle-*.json → Debug artifacts
+
+Scripts:
+  🚀 start_worker.sh                    → Start production worker
+  📊 monitor.sh                         → Status snapshot
+  👁️  watch_live.sh                     → Live dashboard
+  🔧 ec2_bootstrap.sh                   → Initial setup script
+
+Documentation:
+  📖 AWS_DEPLOYMENT_GUIDE.md            → Full deployment guide
+  📋 AWS_QUICK_PROMPT.txt               → Quick reference
+  🛡️  HTTP_501_HANDLING.md              → 501 error handling docs
+
+═══════════════════════════════════════════════════════════════════════════
+INSTANCE DETAILS
+═══════════════════════════════════════════════════════════════════════════
+
+Instance ID:    i-0dc6b17115f9836fa
+Public IP:      44.249.158.207
+Key File:       allora-keypair.pem
+User:           ubuntu
+Region:         (Check AWS console)
+Instance Type:  (Check AWS console - recommend t3.medium or larger)
+
+SSH Command:    ssh -i allora-keypair.pem ubuntu@44.249.158.207
+
+═══════════════════════════════════════════════════════════════════════════
+COMPETITION DETAILS
+═══════════════════════════════════════════════════════════════════════════
+
+Topic:          67 (7-Day BTC/USD Log-Return Prediction)
+Period:         Sep 16, 2025 13:00 UTC → Dec 15, 2025 13:00 UTC
+Cadence:        Hourly (HH:00:00 UTC)
+Window:         Last 600 blocks (~50 minutes) of each epoch
+Training:       28-day rolling window of BTC/USD OHLCV
+Model:          XGBoost histogram gradient boosting
+
+═══════════════════════════════════════════════════════════════════════════
+
+🎯 READY TO DEPLOY!
+
+Run: ssh -i allora-keypair.pem ubuntu@44.249.158.207
+Then: ./ec2_bootstrap.sh
+
+═══════════════════════════════════════════════════════════════════════════
