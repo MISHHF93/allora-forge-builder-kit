@@ -1466,7 +1466,7 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
     topic_cfg = _get_topic_config_cached(topic_id)
     rank, total = _get_weights_rank(topic_id)
     unfulfilled = _get_unfulfilled_nonces_count(topic_id)
-    epoch_len = params.get("epoch_length")
+    epoch_len = params.get("epoch_length")  # This is in SECONDS, not blocks!
 
     def _to_positive_int(val: Any) -> Optional[int]:
         try:
@@ -1515,9 +1515,14 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
     blocks_remaining: Optional[int] = None
     window_open: Optional[bool] = None
     window_confident = False
-    epoch_len_int = _to_positive_int(epoch_len)
+    
+    # CRITICAL FIX: epoch_len is in SECONDS, must convert to BLOCKS
+    # Average block time is ~5 seconds
+    epoch_len_seconds = _to_positive_int(epoch_len)
+    epoch_len_blocks = int(epoch_len_seconds / 5) if epoch_len_seconds else None
+    
     if (
-        epoch_len_int is not None
+        epoch_len_blocks is not None
         and submission_window_blocks is not None
         and submission_window_blocks > 0
         and isinstance(last_epoch_end, int)
@@ -1525,14 +1530,15 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
     ):
         window_confident = True
         blocks_since_epoch = max(0, int(current_block_height) - int(last_epoch_end))
-        epoch_progress = blocks_since_epoch % epoch_len_int
-        blocks_remaining = epoch_len_int - epoch_progress
+        epoch_progress = blocks_since_epoch % epoch_len_blocks
+        blocks_remaining = epoch_len_blocks - epoch_progress
         if blocks_remaining <= 0:
-            blocks_remaining += epoch_len_int
+            blocks_remaining += epoch_len_blocks
         window_open = 0 < blocks_remaining <= int(submission_window_blocks)
 
     submission_window_state: Dict[str, Any] = {
-        "epoch_length": epoch_len_int,
+        "epoch_length": epoch_len_seconds,  # Keep original seconds for reference
+        "epoch_length_blocks": epoch_len_blocks,  # Add blocks for clarity
         "window_size": submission_window_blocks,
         "last_epoch_end": last_epoch_end,
         "current_block": current_block_height,
