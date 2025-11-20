@@ -88,3 +88,9 @@ env/
 
 .allora_key
 .allora_api_key
+
+# Runtime files
+.submission_lock.json
+data/artifacts/
+pipeline.pid
+submission_log.csv
