@@ -5,9 +5,11 @@ import os
 import asyncio
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+import pytest
 
 load_dotenv()
 
+@pytest.mark.asyncio
 async def test_submission():
     """Perform a test submission for the current hour"""
     print("=" * 60)
