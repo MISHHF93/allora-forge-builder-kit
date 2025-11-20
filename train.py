@@ -19,7 +19,7 @@ import subprocess
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # Load environment variables from .env at import time
-load_dotenv()
+load_dotenv(dotenv_path=".env")
 
 from allora_forge_builder_kit.workflow import AlloraMLWorkflow
 from allora_forge_builder_kit.alpha_features import build_alpha_features, merge_external_features
@@ -76,9 +76,10 @@ def _to_naive_utc_ts(ts: pd.Timestamp) -> pd.Timestamp:
         t = pd.Timestamp(ts, tz="UTC")
         return t.tz_localize(None)
 
-def _require_api_key() -> str:
+def _require_api_key() -> Optional[str]:
     api_key = os.getenv("ALLORA_API_KEY")
     if api_key:
+        print(f"Loaded ALLORA_API_KEY from env: {api_key[:10]}...")
         return api_key.strip()
 
     # Retry with explicit path near this script and with find_dotenv fallback
@@ -152,11 +153,11 @@ def _require_api_key() -> str:
 
     if not api_key:
         print(
-            f"ERROR: ALLORA_API_KEY not found in environment (.env). Searched: {discovered} (exists={os.path.exists(discovered)}).",
+            f"WARNING: ALLORA_API_KEY not found in environment (.env). Searched: {discovered} (exists={os.path.exists(discovered)}).",
+            "OHLCV data fetching will fallback to Tiingo or offline data.",
             file=sys.stderr,
         )
-        sys.exit(1)
-    return api_key.strip()
+    return api_key.strip() if api_key else None
 
 
 def _load_pipeline_config(root_dir: str) -> Dict[str, Any]:
@@ -768,6 +769,9 @@ def _get_emissions_params() -> Dict[str, Any]:
     except Exception:
         epoch_len = None
     out["epoch_length"] = epoch_len
+    if epoch_len is None:
+        epoch_len = 3600  # fallback to 1 hour
+        out["epoch_length"] = epoch_len
     # ground truth lag may be in hours; attempt common keys
     gt_lag = None
     try:
@@ -1607,8 +1611,11 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
         else:
             reason_churn.append("epoch_not_elapsed")
     else:
-        # If we can't determine precisely, remain conservative
-        reason_churn.append("missing_epoch_or_last_update")
+        # If we can't determine precisely, assume churnable if active
+        if is_active:
+            is_churnable = True
+        else:
+            reason_churn.append("missing_epoch_or_last_update")
     # Weight rank gating: require topic to be within top half by weight when available
     if rank is not None and total:
         if rank <= max(1, total // 2):
@@ -1892,7 +1899,12 @@ def _post_submit_backfill(root_dir: str, tail: int = 20, attempts: int = 3, dela
         # Never raise from a post-submit refresher
         pass
 
-async def _submit_with_sdk(topic_id: int, value: float, api_key: str, timeout_s: int, max_retries: int, root_dir: str, pre_log10_loss: Optional[float]) -> int:
+async def _submit_with_sdk(topic_id: int, value: float, timeout_s: int, max_retries: int, root_dir: str, pre_log10_loss: Optional[float]) -> int:
+    """Submit prediction using AlloraWorker SDK.
+    
+    CRITICAL: AlloraWorker authenticates using the mnemonic from .allora_key file,
+    NOT via ALLORA_API_KEY. The API key is ONLY for fetching market data (OHLCV).
+    """
     try:
         from allora_sdk.worker import AlloraWorker as WorkerCls  # type: ignore
     except ImportError as e:
@@ -2085,7 +2097,7 @@ async def _submit_with_sdk(topic_id: int, value: float, api_key: str, timeout_s:
             import inspect as _inspect
             sig = _inspect.signature(WorkerCls.__init__)
             param_names = set(sig.parameters.keys())
-            kwargs: Dict[str, Any] = {"run": run_fn, "api_key": api_key, "topic_id": topic_id}
+            kwargs: Dict[str, Any] = {"run": run_fn, "topic_id": topic_id}
             if "chain_id" in param_names:
                 kwargs["chain_id"] = CHAIN_ID
             if "rpc_url" in param_names:
@@ -2094,7 +2106,7 @@ async def _submit_with_sdk(topic_id: int, value: float, api_key: str, timeout_s:
                 kwargs["node"] = DEFAULT_RPC
             worker = WorkerCls(**kwargs)
         except TypeError:
-            worker = WorkerCls(run_fn, api_key=api_key, topic_id=topic_id)
+            worker = WorkerCls(run_fn, topic_id=topic_id)
         except (RuntimeError, ValueError, OSError, AttributeError) as e:
             msg = str(e)
             print(f"ERROR: SDK worker initialization failed: {msg}", file=sys.stderr)
@@ -2973,6 +2985,16 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
             nonce_dbg = int(nonce_out) if nonce_out is not None else None
         except Exception:
             nonce_dbg = None
+        
+        if success_flag:
+            success_log = f"✅ SUBMITTED: nonce={nonce_dbg}, tx_hash={tx_hash}, value={xgb_val:.10f}, loss={pre_log10_loss:.6f if pre_log10_loss is not None else 'N/A'}, status={status_msg}"
+            print(success_log)
+            logging.info(success_log)
+        else:
+            fail_log = f"❌ FAILED: nonce={nonce_dbg}, tx_hash={tx_hash or 'null'}, code={(chain_code if chain_code is not None else 'n/a')}, status={status_msg}"
+            print(fail_log)
+            logging.error(fail_log)
+        
         print(f"submit(client): nonce={nonce_dbg} tx_hash={tx_hash or 'null'} code={(chain_code if chain_code is not None else 'n/a')} status={status_msg}")
         if not tx_hash:
             # Print a short hint to aid future debugging without leaking sensitive data
@@ -3278,10 +3300,10 @@ def run_pipeline(args, cfg, root_dir) -> int:
     workflow = AlloraMLWorkflow(
         data_api_key=_require_api_key(),
         tickers=["btcusd"],
-        hours_needed=168,
-        number_of_input_candles=168,
+        hours_needed=48,
+        number_of_input_candles=48,
         target_length=168,
-        sample_spacing_hours=non_overlap_hours,
+        sample_spacing_hours=24,
     )
     full_data: pd.DataFrame = workflow.get_full_feature_target_dataframe(from_month=from_month)
     date_index: pd.Index = _to_naive_utc_index(pd.DatetimeIndex(pd.to_datetime(full_data.index.get_level_values("date"))))
@@ -3946,13 +3968,13 @@ def run_pipeline(args, cfg, root_dir) -> int:
     try:
         from xgboost import XGBRegressor  # type: ignore
         xgb_model = XGBRegressor(
-            n_estimators=800,
-            learning_rate=0.05,
+            n_estimators=1000,
+            learning_rate=0.03,
             max_depth=6,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.0,
-            reg_lambda=1.0,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            reg_alpha=0.1,
+            reg_lambda=1.5,
             random_state=42,
             n_jobs=-1,
             tree_method="hist",
@@ -4177,8 +4199,7 @@ def run_pipeline(args, cfg, root_dir) -> int:
     except (ValueError, TypeError, KeyError):
         topic_id_cfg = 67
     save_prediction({"topic_id": topic_id_cfg or 67, "value": live_value}, [artifacts_path])
-    print(f"Final prediction (as_of={as_of}) value: {live_value}")
-
+    print(f"📊 Final prediction (as_of={as_of}) value: {live_value:.10f}")
     # Ensure submission log schema exists and is locked for future writes
     log_csv = os.path.join(root_dir, "submission_log.csv")
     ensure_submission_log_schema(log_csv)
@@ -4308,10 +4329,12 @@ def run_pipeline(args, cfg, root_dir) -> int:
             # Lower loss is better; require being <= q25
             if not (pre_log10_loss <= q25):
                 print(f"submit: filtered out high-loss prediction (loss={pre_log10_loss:.6g} > q25={q25:.6g})")
+                logging.warning(f"🚫 FILTERED: pre_log10_loss={pre_log10_loss:.6f} > q25={q25:.6f}")
                 try:
                     ws_now_fl = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
                     w = _resolve_wallet_for_logging(root_dir)
                     _log_submission(root_dir, ws_now_fl, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "filtered_high_loss", pre_log10_loss)
+                    logging.info(f"📝 Logged submission attempt: status=filtered_high_loss, value={live_value:.10f}, loss={pre_log10_loss:.6f}")
                 except Exception:
                     pass
                 return 0
@@ -4472,12 +4495,22 @@ def run_pipeline(args, cfg, root_dir) -> int:
         unfulfilled_for_skip = unfulfilled_int
         stake_for_skip = delegated_stake_val
         min_stake_for_skip = min_delegate_val
+        
+        # NOTE: Intelligent waiting disabled to prevent hanging in --once mode
+        # Use --loop mode for automatic retry during submission windows
+        
+        # CRITICAL: Enforce exact submission rules per competition requirements
+        # submission_window_open=True only when blocks_remaining_in_epoch < 600 AND unfulfilled_nonces == 1
+        # This ensures we submit during the correct window with proper nonce state
+        
+        blocks_remaining_val = submission_window_state.get("blocks_remaining_in_epoch")
+        
         should_skip = (
             not current_active
             or (window_confident and window_is_open is False)
             or reps_for_skip is None
             or reps_for_skip < 1
-            or (unfulfilled_for_skip is not None and unfulfilled_for_skip > 0)
+            or (unfulfilled_for_skip is not None and unfulfilled_for_skip != 1)  # Changed: require exactly 1 unfulfilled nonce
             or stake_for_skip is None
             or (
                 min_stake_for_skip is not None
@@ -4494,8 +4527,8 @@ def run_pipeline(args, cfg, root_dir) -> int:
             reason_list = [str(r) for r in inactive_reasons if r]
             if (reps_for_skip is None or reps_for_skip < 1) and "reputers missing" not in reason_list:
                 reason_list.append("reputers missing")
-            if unfulfilled_for_skip is not None and unfulfilled_for_skip > 0:
-                reason_list.append(f"unfulfilled_nonces:{unfulfilled_for_skip}")
+            if unfulfilled_for_skip is not None and unfulfilled_for_skip != 1:
+                reason_list.append(f"unfulfilled_nonces:{unfulfilled_for_skip} (require exactly 1)")
             if (stake_for_skip is None) and "stake unavailable" not in reason_list:
                 reason_list.append("stake unavailable")
             if (
@@ -4519,7 +4552,18 @@ def run_pipeline(args, cfg, root_dir) -> int:
                 f"{reason_str}"
             )
             print(skip_msg)
-            logging.warning(skip_msg)
+            logging.warning(f"⏸️  SKIPPED: {skip_msg}")
+            
+            # Provide actionable guidance based on skip reason
+            if "submission_window_closed" in reason_str:
+                remaining_blocks = submission_window_state.get('blocks_remaining_in_epoch')
+                if isinstance(remaining_blocks, int):
+                    est_minutes = (remaining_blocks - 600) * 5 / 60  # Estimate time to window opening
+                    if est_minutes > 0:
+                        print(f"💡 TIP: Submission window opens in ~{est_minutes:.1f} minutes. Use --loop mode to auto-retry.")
+            elif "unfulfilled_nonces" in reason_str:
+                print("💡 TIP: Unfulfilled nonces detected. They typically clear within 1-2 epochs. Use --loop mode to auto-retry.")
+            
             wait_msg = (
                 "Waiting for topic to activate: "
                 f"effective_revenue={eff} delegated_stake={stk} reputers_count={reps} "
@@ -4548,6 +4592,7 @@ def run_pipeline(args, cfg, root_dir) -> int:
                     detailed_status,
                     pre_log10_loss,
                 )
+                logging.info(f"📝 Logged submission attempt: status={detailed_status}, value={live_value:.10f}, loss={pre_log10_loss:.6f if pre_log10_loss is not None else 'N/A'}")
             except Exception:
                 pass
             return 0
@@ -4589,14 +4634,13 @@ def run_pipeline(args, cfg, root_dir) -> int:
             else:
                 print("submit(helper): external helper failed, falling back to direct client submission", file=sys.stderr)
 
-        api_key = _require_api_key()
         # Prefer client-based submit to guarantee forecast, fallback to SDK worker if client path fails
         rc_client = asyncio.run(_submit_with_client_xgb(int(topic_id_cfg or 67), float(live_value), root_dir, pre_log10_loss, args.force_submit))
         rc = rc_client
         if rc_client != 0:
             # Always attempt SDK fallback when client path fails; unfulfilled nonces query can be stale
             print("Client-based xgb-only submit failed; attempting SDK worker fallback (forecast may be null)", file=sys.stderr)
-            rc = asyncio.run(_submit_with_sdk(int(topic_id_cfg or 67), float(live_value), api_key, int(args.submit_timeout), int(args.submit_retries), root_dir, pre_log10_loss))
+            rc = asyncio.run(_submit_with_sdk(int(topic_id_cfg or 67), float(live_value), int(args.submit_timeout), int(args.submit_retries), root_dir, pre_log10_loss))
         if rc == 0:
             try:
                 _update_window_lock(root_dir, cadence_s, intended_env)
@@ -4622,7 +4666,7 @@ def main() -> int:
     root_dir = os.path.dirname(os.path.abspath(__file__))
     cfg = _load_pipeline_config(root_dir)
     parser = argparse.ArgumentParser(description="Train model and emit predictions.json for Topic 67 (7-day BTC/USD log-return)")
-    parser.add_argument("--from-month", default="2025-01")
+    parser.add_argument("--from-month", default="2022-01")
     parser.add_argument("--schedule-mode", default=None, help="Schedule mode (single, loop, etc.)")
     parser.add_argument("--cadence", default=None, help="Cadence for scheduling (e.g., 1h)")
     parser.add_argument("--start-utc", default=None, help="Start datetime in UTC (ISO format)")
@@ -4645,15 +4689,17 @@ def main() -> int:
     
     # Handle standalone print-wallet mode
     if args.print_wallet:
-        api_key = os.getenv("ALLORA_API_KEY", "").strip()
-        if not api_key:
-            print("ERROR: Missing ALLORA_API_KEY in environment or .env", file=sys.stderr)
+        # Check that .allora_key exists (needed for AlloraWorker authentication)
+        key_path = os.path.join(root_dir, ".allora_key")
+        if not os.path.exists(key_path):
+            print("ERROR: Missing .allora_key file (needed for wallet authentication)", file=sys.stderr)
             return 1
         try:
             from allora_sdk.worker import AlloraWorker
             def dummy_run(_: int) -> float:
                 return 0.0
-            w = AlloraWorker(run=dummy_run, api_key=api_key, topic_id=67)
+            # AlloraWorker uses mnemonic from .allora_key for authentication, not API key
+            w = AlloraWorker(run=dummy_run, topic_id=67)
             addr = None
             for attr in ("wallet_address", "address", "wallet"):
                 try:

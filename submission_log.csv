@@ -4,4 +4,10 @@ timestamp_utc,topic_id,value,wallet,nonce,tx_hash,success,exit_code,status,log10
 2025-11-15T23:00:00Z,67,-0.054082,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6534235,2AFBDB28615999FF404B040ECAB26043CAC19437729715584A33FEFD1F6D405F,true,0,submitted,-1.303405,0.36291303,0.36291303
 2025-11-16T03:00:00Z,67,-0.054082,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6536395,46BE0CB668A745CA2610BFC04446D62D2287BC131F6879DBD662DAD87D2EBB13,true,0,submitted,-1.303405,0.36291303,0.36291303
 2025-11-16T20:00:00Z,67,-0.033222239465,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6547915,0B82022ADAC47E7186C1C23E35C59455EB549F142554D0F478E8B86816152EB3,true,0,submitted,-1.301599,0,0
-2025-11-17T01:00:00Z,67,-0.033222239465,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6550795,702A9F339AA48C6BE4AB545501203DCEA8799230E8CDE556C723D7D0B8AD1073,true,0,submitted,-1.301599,0,0
+2025-11-17T01:00:00Z,67,-0.035606075078,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,2,timeout,0,0,0
+2025-11-19T14:00:00Z,67,-0.025587795302,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,0,filtered_high_loss,-1.032884,0,0
+2025-11-19T15:00:00Z,67,-0.025587795302,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,0,filtered_high_loss,-1.036794,0,0
+2025-11-19T16:00:00Z,67,-0.051781427115,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,0,skipped_window,0,0,0
+2025-11-19T17:00:00Z,67,-0.051781427115,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,0,skipped_topic_not_ready,-1.370956,0,0
+2025-11-20T00:00:00Z,67,-0.050225351006,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,0,skipped_topic_not_ready,-1.371324,0,0
+2025-11-20T01:00:00Z,67,-0.050225351006,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,0,skipped_topic_not_ready,-1.371151,0,0

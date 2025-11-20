@@ -415,6 +415,7 @@ class AlloraMLWorkflow:
         for t in self.tickers:
             print(f"Downloading Historical Data for {t}")
             frames = []
+            frames = []
             # Optional local override to ensure full coverage through t+7d after competition end
             try:
                 root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -560,7 +561,7 @@ class AlloraMLWorkflow:
     
         return full_data
 
-    def get_train_validation_test_data(self, from_month="2025-10", validation_months=3, test_months=3, force_redownload=False):
+    def get_train_validation_test_data(self, from_month="2023-01", validation_months=1, test_months=0.25, force_redownload=False):
         def generate_filename():
             """Generate a unique filename based on parameters."""
             tickers_str = "_".join(self.tickers)
@@ -614,11 +615,11 @@ class AlloraMLWorkflow:
                 combined_df['date'] = pd.to_datetime(combined_df['date'], utc=True)
                 combined_df = combined_df.drop_duplicates(subset='date')
             else:
-                # Try Allora direct; if unauthorized, fallback to Tiingo
+                # Try Tiingo direct
                 try:
-                    combined_df = self.fetch_ohlcv_data(t, f"{from_month}-01")
-                except RuntimeError:
                     combined_df = self.fetch_ohlcv_data_tiingo(t, f"{from_month}-01")
+                except RuntimeError:
+                    combined_df = self._offline_ohlcv_from_local(t, f"{from_month}-01")
                 combined_df["date"] = pd.to_datetime(combined_df["date"], utc=True)
             all_data[t] = combined_df
 
