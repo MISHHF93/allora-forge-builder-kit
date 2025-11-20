@@ -50,6 +50,34 @@ logging.basicConfig(
 # datetime values to NAIVE UTC (tz stripped) before any NumPy conversion.
 # (removed unused timezone alias)
 
+def _find_num(obj: Any) -> Optional[float]:
+    """Recursively search JSON-like object for a numeric value, preferring known keys."""
+    if isinstance(obj, (int, float)) and math.isfinite(obj):
+        return float(obj)
+    if isinstance(obj, str):
+        try:
+            v = float(obj)
+            return v if math.isfinite(v) else None
+        except Exception:
+            return None
+    if isinstance(obj, dict):
+        # Prefer known keys
+        for k in ("score", "ema", "score_ema", "inferer_score_ema", "value", "result"):
+            if k in obj:
+                v = _find_num(obj[k])
+                if v is not None:
+                    return v
+        for v in obj.values():
+            r = _find_num(v)
+            if r is not None:
+                return r
+    if isinstance(obj, (list, tuple)):
+        for item in obj:
+            r = _find_num(item)
+            if r is not None:
+                return r
+    return None
+
 def _to_naive_utc_index(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
     """Return a DatetimeIndex normalized to naive UTC (tz stripped).
     - If tz-aware, convert to UTC and strip tzinfo.
@@ -1944,7 +1972,7 @@ def _is_nullish(x: Any) -> bool:
     return False
 
 
-def _query_ema_score(topic: int, wallet: Optional[str], retries: int = 2, delay_s: float = 2.0, timeout: int = 15) -> Optional[float]:
+def _query_ema_score(topic: int, wallet: Optional[str], retries: int = 3, delay_s: float = 2.0, timeout: int = 15) -> Optional[float]:
     """Best-effort query of EMA score via allorad CLI. Returns float or None on failure.
     Tries JSON parsing first, then regex fallback. Retries a couple times for eventual consistency.
     """
@@ -1967,32 +1995,6 @@ def _query_ema_score(topic: int, wallet: Optional[str], retries: int = 2, delay_
         # Attempt JSON parse
         try:
             j = json.loads(out)
-            def _find_num(obj: Any) -> Optional[float]:
-                if isinstance(obj, (int, float)) and np.isfinite(obj):
-                    return float(obj)
-                if isinstance(obj, str):
-                    try:
-                        v = float(obj)
-                        return v if np.isfinite(v) else None
-                    except Exception:
-                        return None
-                if isinstance(obj, dict):
-                    # Prefer known keys
-                    for k in ("score", "ema", "score_ema", "inferer_score_ema", "value", "result"):
-                        if k in obj:
-                            v = _find_num(obj[k])
-                            if v is not None:
-                                return v
-                    for v in obj.values():
-                        r = _find_num(v)
-                        if r is not None:
-                            return r
-                if isinstance(obj, (list, tuple)):
-                    for item in obj:
-                        r = _find_num(item)
-                        if r is not None:
-                            return r
-                return None
             return _find_num(j)
         except Exception:
             pass
@@ -2176,31 +2178,6 @@ def _post_submit_backfill(root_dir: str, tail: int = 20, attempts: int = 3, dela
                                 got_val: Optional[float] = None
                                 try:
                                     j = json.loads(out_text)
-                                    def _find_num(obj: Any) -> Optional[float]:
-                                        if isinstance(obj, (int, float)) and math.isfinite(obj):
-                                            return float(obj)
-                                        if isinstance(obj, str):
-                                            try:
-                                                v = float(obj)
-                                                return v if math.isfinite(v) else None
-                                            except Exception:
-                                                return None
-                                        if isinstance(obj, dict):
-                                            for k in ("score", "ema", "score_ema", "inferer_score_ema", "value", "result"):
-                                                if k in obj:
-                                                    v = _find_num(obj[k])
-                                                    if v is not None:
-                                                        return v
-                                            for v in obj.values():
-                                                r2 = _find_num(v)
-                                                if r2 is not None:
-                                                    return r2
-                                        if isinstance(obj, (list, tuple)):
-                                            for v in obj:
-                                                r2 = _find_num(v)
-                                                if r2 is not None:
-                                                    return r2
-                                        return None
                                     got_val = _find_num(j)
                                 except Exception:
                                     got_val = None
@@ -3075,60 +3052,7 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
                                         reward_amt = (reward_amt or 0.0) + (amt / scale)
             return score_val, reward_amt
 
-        # Reusable EMA score query with retries (inferer role)
-        def _query_ema_score_retry(topic: int, wal: Optional[str], retries: int = 3, delay_s: float = 2.0, timeout: int = 15) -> Optional[float]:
-            if not wal:
-                return None
-            cmd = [
-                "allorad", "q", "emissions", "inferer-score-ema", str(int(topic)), str(wal),
-                "--trace",
-            ]
-            def _try_once() -> Optional[float]:
-                try:
-                    cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-                except Exception:
-                    return None
-                out = (cp.stdout or cp.stderr or "").strip()
-                try:
-                    j = json.loads(out)
-                    # Probe common numeric fields; otherwise deep search for first float
-                    for key in ("score", "ema", "score_ema", "inferer_score_ema", "value", "result"):
-                        if key in j:
-                            v = _parse_float_any(j.get(key))
-                            if v is not None:
-                                return v
-                    # Deep search
-                    def _find_num(o: Any) -> Optional[float]:
-                        if isinstance(o, (int, float)) and np.isfinite(o):
-                            return float(o)
-                        if isinstance(o, str):
-                            return _parse_float_any(o)
-                        if isinstance(o, dict):
-                            for v in o.values():
-                                r = _find_num(v)
-                                if r is not None:
-                                    return r
-                        if isinstance(o, (list, tuple)):
-                            for v in o:
-                                r = _find_num(v)
-                                if r is not None:
-                                    return r
-                        return None
-                    return _find_num(j)
-                except Exception:
-                    m = re.search(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", out)
-                    if m:
-                        return _parse_float_any(m.group(1))
-                return None
-            for _ in range(max(1, int(retries) + 1)):
-                val = _try_once()
-                if val is not None:
-                    return val
-                try:
-                    time.sleep(float(delay_s))
-                except Exception:
-                    pass
-            return None
+
 
         score_final: Optional[float] = None
         reward_final: Any = None
@@ -3164,7 +3088,7 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
                     pass
         # Best-effort fallback for score via EMA query if not in the tx logs yet
         if score_final is None and wallet:
-            score_final = _query_ema_score_retry(int(topic_id), wallet, retries=4, delay_s=2.0, timeout=15)
+            score_final = _query_ema_score(int(topic_id), wallet, retries=4, delay_s=2.0, timeout=15)
         # Reward fallback via tx query helper if not already populated
         if reward_final is None and tx_hash:
             try:

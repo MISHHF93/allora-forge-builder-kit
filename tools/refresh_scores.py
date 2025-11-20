@@ -265,20 +265,21 @@ def main() -> int:
                                     except Exception:
                                         return None
                                 if isinstance(obj, dict):
+                                    # Prefer known keys
                                     for k in ("score", "ema", "score_ema", "inferer_score_ema", "value", "result"):
                                         if k in obj:
                                             v = _find_num(obj[k])
                                             if v is not None:
                                                 return v
                                     for v in obj.values():
-                                        r2 = _find_num(v)
-                                        if r2 is not None:
-                                            return r2
+                                        r = _find_num(v)
+                                        if r is not None:
+                                            return r
                                 if isinstance(obj, (list, tuple)):
-                                    for v in obj:
-                                        r2 = _find_num(v)
-                                        if r2 is not None:
-                                            return r2
+                                    for item in obj:
+                                        r = _find_num(item)
+                                        if r is not None:
+                                            return r
                                 return None
                             got_val = _find_num(j)
                         except Exception:
