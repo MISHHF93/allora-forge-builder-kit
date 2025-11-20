@@ -821,6 +821,7 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
 
     rest_results: Dict[str, Any] = {}
     rest_debug: List[Dict[str, Any]] = []
+    rest_unsupported: List[str] = []
     rest_base = _derive_rest_base_from_rpc(DEFAULT_RPC)
     rest_paths: List[Tuple[str, str]] = []
     if rest_base:
@@ -839,6 +840,15 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
                 resp = requests.get(url, timeout=8)
                 attempt_entry.setdefault("attempts", []).append({"attempt": attempt + 1, "status_code": resp.status_code})
                 if resp.status_code != 200:
+                    if resp.status_code in {404, 405, 501}:
+                        msg = (
+                            f"REST endpoint unsupported for {label} (status={resp.status_code}); "
+                            "falling back to CLI/cached topic info"
+                        )
+                        logging.info(msg)
+                        rest_unsupported.append(label)
+                        attempt_entry["status"] = "unsupported"
+                        continue
                     logging.warning("REST query non-200 (%s): status=%s", label, resp.status_code)
                     continue
                 try:
@@ -855,6 +865,8 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
         rest_debug.append(attempt_entry)
 
     combined: Dict[str, Any] = {**cli_results, **rest_results}
+    if rest_unsupported:
+        combined["rest_unsupported"] = rest_unsupported
     combined["query_debug"] = {"cli": cli_debug, "rest": rest_debug}
 
     def _to_float(x: Any) -> Optional[float]:
@@ -1528,7 +1540,6 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
         blocks_remaining = epoch_len_int - epoch_progress
         if blocks_remaining <= 0:
             blocks_remaining += epoch_len_int
-        window_open = 0 < blocks_remaining <= int(submission_window_blocks)
 
     submission_window_state: Dict[str, Any] = {
         "epoch_length": epoch_len_int,
@@ -1619,8 +1630,22 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
         else:
             is_churnable = False
             reason_churn.append(f"low_weight_rank({rank}/{total})")
-    # Rewardable: no unfulfilled nonces suggests requests/fulfillments cleared; heuristic
-    is_rewardable = (unfulfilled is not None and int(unfulfilled) == 0)
+    # Rewardable: active topic with clean/unblocked nonces
+    is_rewardable = bool(is_active and (unfulfilled is not None) and int(unfulfilled) <= 1)
+
+    # Submission window is open only under strict gating
+    if (
+        window_confident
+        and blocks_remaining is not None
+        and int(blocks_remaining) < 600
+        and unfulfilled is not None
+        and int(unfulfilled) == 1
+        and is_rewardable
+    ):
+        window_open = True
+    elif window_confident:
+        window_open = False
+    submission_window_state["is_open"] = window_open if window_open is not None else None
     return {
         "params": params,
         "info": info,
@@ -1895,6 +1920,214 @@ def _post_submit_backfill(root_dir: str, tail: int = 20, attempts: int = 3, dela
         # Never raise from a post-submit refresher
         pass
 
+def _query_ema_score(topic: int, wallet: Optional[str], retries: int = 2, delay_s: float = 2.0, timeout: int = 15) -> Optional[float]:
+    """Best-effort query of EMA score via allorad CLI. Returns float or None on failure.
+    Tries JSON parsing first, then regex fallback. Retries a couple times for eventual consistency.
+    """
+    if not wallet:
+        return None
+    cmd = [
+        "allorad",
+        "q",
+        "emissions",
+        "inferer-score-ema",
+        str(int(topic)),
+        str(wallet),
+        "--node",
+        str(DEFAULT_RPC),
+        "--chain-id",
+        str(CHAIN_ID),
+        "--output",
+        "json",
+        "--trace",
+    ]
+
+    def _try_once() -> Optional[float]:
+        try:
+            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return None
+        out = (cp.stdout or "").strip()
+        if cp.returncode != 0 and not out:
+            out = (cp.stderr or "").strip()
+        # Attempt JSON parse
+        try:
+            j = json.loads(out)
+
+            def _find_num(obj: Any) -> Optional[float]:
+                if isinstance(obj, (int, float)) and np.isfinite(obj):
+                    return float(obj)
+                if isinstance(obj, str):
+                    try:
+                        v = float(obj)
+                        return v if np.isfinite(v) else None
+                    except Exception:
+                        return None
+                if isinstance(obj, dict):
+                    # Prefer known keys
+                    for k in ("score", "ema", "score_ema", "inferer_score_ema", "value", "result"):
+                        if k in obj:
+                            v = _find_num(obj[k])
+                            if v is not None:
+                                return v
+                    for v in obj.values():
+                        r = _find_num(v)
+                        if r is not None:
+                            return r
+                if isinstance(obj, (list, tuple)):
+                    for v in obj:
+                        r = _find_num(v)
+                        if r is not None:
+                            return r
+                return None
+
+            val = _find_num(j)
+            if val is not None and np.isfinite(val):
+                return float(val)
+        except Exception:
+            pass
+        # Regex fallback
+        m = re.search(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", out)
+        if m:
+            try:
+                v = float(m.group(1))
+                return v if np.isfinite(v) else None
+            except Exception:
+                return None
+        return None
+
+    # Retry loop
+    for _ in range(max(1, int(retries) + 1)):
+        val = _try_once()
+        if val is not None:
+            return val
+        try:
+            time.sleep(float(delay_s))
+        except Exception:
+            pass
+    return None
+
+
+def _query_reward_for_tx(
+    wallet: Optional[str],
+    tx_hash: Optional[str],
+    denom_hint: Optional[str] = None,
+    retries: int = 2,
+    delay_s: float = 2.0,
+    timeout: int = 20,
+) -> Optional[float]:
+    """Query the transaction by hash and extract reward tokens received by the wallet.
+    Heuristics:
+      - Inspect transfer/coin_received events with recipient==wallet
+      - Parse amounts like '123uallo' (Cosmos SDK coin string), sum matching 'allo' denoms
+      - Convert micro-denoms (prefix 'u') to base by dividing by 1e6
+    Returns amount in base units (e.g., ALLO), or None if not found yet.
+    """
+    if not wallet or not tx_hash:
+        return None
+    cmd = ["allorad", "q", "tx", str(tx_hash), "--node", str(DEFAULT_RPC), "--output", "json", "--trace"]
+
+    def _parse_amounts(s: str) -> float:
+        # Supports comma-separated coins
+        total = 0.0
+        for part in re.split(r"[,\s]+", s.strip()):
+            if not part:
+                continue
+            m = re.match(r"^([0-9]+)([a-zA-Z/\.]+)$", part)
+            if not m:
+                # Try float amount then unit
+                m2 = re.match(r"^([0-9]*\.?[0-9]+)([a-zA-Z/\.]+)$", part)
+                if not m2:
+                    continue
+                amt = float(m2.group(1))
+                unit = m2.group(2)
+            else:
+                amt = float(m.group(1))
+                unit = m.group(2)
+            unit_low = unit.lower()
+            if denom_hint and denom_hint.lower() in unit_low:
+                scale = 1e6 if unit_low.startswith("u") else 1.0
+                total += (amt / scale)
+            elif "allo" in unit_low:
+                scale = 1e6 if unit_low.startswith("u") else 1.0
+                total += (amt / scale)
+        return total
+
+    def _try_once() -> Optional[float]:
+        try:
+            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return None
+        out = (cp.stdout or "").strip()
+        if not out:
+            out = (cp.stderr or "").strip()
+        try:
+            j = json.loads(out)
+        except Exception:
+            # regex amount fallback if any
+            m_amt = re.findall(r"([0-9]*\.?[0-9]+[a-zA-Z/\.]+)", out)
+            total_fallback = 0.0
+            for token in m_amt:
+                total_fallback += _parse_amounts(token)
+            return total_fallback if total_fallback > 0 else None
+        if isinstance(j, dict):
+            # Prefer events
+            evs = j.get("events") or j.get("tx_response", {}).get("logs") or []
+            for ev in evs:
+                attrs = ev.get("attributes") or []
+                if isinstance(attrs, list):
+                    recipient = None
+                    amount = None
+                    for attr in attrs:
+                        key = attr.get("key") if isinstance(attr, dict) else None
+                        val = attr.get("value") if isinstance(attr, dict) else None
+                        if key == "recipient":
+                            recipient = val
+                        if key == "amount":
+                            amount = val
+                    if recipient and str(recipient) == str(wallet) and amount:
+                        total = _parse_amounts(str(amount))
+                        if total > 0:
+                            return total
+        if isinstance(j, dict):
+            # Fallback to searching messages
+            msgs = j.get("tx", {}).get("body", {}).get("messages", [])
+            for msg in msgs:
+                if isinstance(msg, dict):
+                    recv = msg.get("to_address") or msg.get("receiver")
+                    amt = msg.get("amount")
+                    if recv and str(recv) == str(wallet) and amt:
+                        if isinstance(amt, str):
+                            total = _parse_amounts(amt)
+                            if total > 0:
+                                return total
+                        elif isinstance(amt, list):
+                            total = 0.0
+                            for coin in amt:
+                                if isinstance(coin, dict):
+                                    amt_val = coin.get("amount")
+                                    denom = coin.get("denom")
+                                    if amt_val and denom:
+                                        total += _parse_amounts(f"{amt_val}{denom}")
+                            if total > 0:
+                                return total
+        return None
+
+    for _ in range(max(1, int(retries) + 1)):
+        val = _try_once()
+        if val is not None:
+            return val
+        try:
+            time.sleep(float(delay_s))
+        except Exception:
+            pass
+    return None
+
+
 async def _submit_with_sdk(topic_id: int, value: float, timeout_s: int, max_retries: int, root_dir: str, pre_log10_loss: Optional[float]) -> int:
     try:
         from allora_sdk.worker import AlloraWorker as WorkerCls  # type: ignore
@@ -1931,171 +2164,6 @@ async def _submit_with_sdk(topic_id: int, value: float, timeout_s: int, max_retr
     last_tx: Optional[str] = None
     intended_env = os.getenv("ALLORA_WALLET_ADDR", "").strip() or None
     wallet_str: Optional[str] = intended_env
-
-    def _query_ema_score(topic: int, wallet: Optional[str], retries: int = 2, delay_s: float = 2.0, timeout: int = 15) -> Optional[float]:
-        """Best-effort query of EMA score via allorad CLI. Returns float or None on failure.
-        Tries JSON parsing first, then regex fallback. Retries a couple times for eventual consistency.
-        """
-        if not wallet:
-            return None
-        cmd = [
-            "allorad", "q", "emissions", "inferer-score-ema", str(int(topic)), str(wallet),
-            "--node", str(DEFAULT_RPC), "--chain-id", str(CHAIN_ID), "--output", "json", "--trace",
-        ]
-        def _try_once() -> Optional[float]:
-            try:
-                cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            except FileNotFoundError:
-                return None
-            except Exception:
-                return None
-            out = (cp.stdout or "").strip()
-            if cp.returncode != 0 and not out:
-                out = (cp.stderr or "").strip()
-            # Attempt JSON parse
-            try:
-                j = json.loads(out)
-                def _find_num(obj: Any) -> Optional[float]:
-                    if isinstance(obj, (int, float)) and np.isfinite(obj):
-                        return float(obj)
-                    if isinstance(obj, str):
-                        try:
-                            v = float(obj)
-                            return v if np.isfinite(v) else None
-                        except Exception:
-                            return None
-                    if isinstance(obj, dict):
-                        # Prefer known keys
-                        for k in ("score", "ema", "score_ema", "inferer_score_ema", "value", "result"):
-                            if k in obj:
-                                v = _find_num(obj[k])
-                                if v is not None:
-                                    return v
-                        for v in obj.values():
-                            r = _find_num(v)
-                            if r is not None:
-                                return r
-                    if isinstance(obj, (list, tuple)):
-                        for v in obj:
-                            r = _find_num(v)
-                            if r is not None:
-                                return r
-                    return None
-                val = _find_num(j)
-                if val is not None and np.isfinite(val):
-                    return float(val)
-            except Exception:
-                pass
-            # Regex fallback
-            m = re.search(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", out)
-            if m:
-                try:
-                    v = float(m.group(1))
-                    return v if np.isfinite(v) else None
-                except Exception:
-                    return None
-            return None
-        # Retry loop
-        for i in range(max(1, int(retries) + 1)):
-            val = _try_once()
-            if val is not None:
-                return val
-            try:
-                time.sleep(float(delay_s))
-            except Exception:
-                pass
-        return None
-
-    def _query_reward_for_tx(wallet: Optional[str], tx_hash: Optional[str], denom_hint: Optional[str] = None, retries: int = 2, delay_s: float = 2.0, timeout: int = 20) -> Optional[float]:
-        """Query the transaction by hash and extract reward tokens received by the wallet.
-        Heuristics:
-          - Inspect transfer/coin_received events with recipient==wallet
-          - Parse amounts like '123uallo' (Cosmos SDK coin string), sum matching 'allo' denoms
-          - Convert micro-denoms (prefix 'u') to base by dividing by 1e6
-        Returns amount in base units (e.g., ALLO), or None if not found yet.
-        """
-        if not wallet or not tx_hash:
-            return None
-        cmd = ["allorad", "q", "tx", str(tx_hash), "--node", str(DEFAULT_RPC), "--output", "json", "--trace"]
-
-        def _parse_amounts(s: str) -> float:
-            # Supports comma-separated coins
-            total = 0.0
-            for part in re.split(r"[,\s]+", s.strip()):
-                if not part:
-                    continue
-                m = re.match(r"^([0-9]+)([a-zA-Z/\.]+)$", part)
-                if not m:
-                    # Try float amount then unit
-                    m2 = re.match(r"^([0-9]*\.?[0-9]+)([a-zA-Z/\.]+)$", part)
-                    if not m2:
-                        continue
-                    amt = float(m2.group(1))
-                    unit = m2.group(2)
-                else:
-                    amt = float(m.group(1))
-                    unit = m.group(2)
-                unit_low = unit.lower()
-                if denom_hint and denom_hint.lower() in unit_low:
-                    scale = 1e6 if unit_low.startswith("u") else 1.0
-                    total += (amt / scale)
-                elif "allo" in unit_low:
-                    scale = 1e6 if unit_low.startswith("u") else 1.0
-                    total += (amt / scale)
-            return total
-
-        def _try_once() -> Optional[float]:
-            try:
-                cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            except FileNotFoundError:
-                return None
-            except Exception:
-                return None
-            out = (cp.stdout or "").strip()
-            if not out:
-                out = (cp.stderr or "").strip()
-            try:
-                j = json.loads(out)
-            except Exception:
-                # regex amount fallback if any
-                return None
-            # Cosmos tx JSON usually has logs -> [ { events: [ {type, attributes:[{key,value}]} ] } ]
-            try:
-                logs = j.get("logs") or []
-                acc = 0.0
-                for lg in logs:
-                    events = lg.get("events") or []
-                    for ev in events:
-                        et = (ev.get("type") or "").lower()
-                        attrs = ev.get("attributes") or []
-                        # Build a small dict of attributes
-                        ad: Dict[str, List[str]] = {}
-                        for a in attrs:
-                            k = str(a.get("key", "")).lower()
-                            v = str(a.get("value", ""))
-                            ad.setdefault(k, []).append(v)
-                        recipients = [r for r in ad.get("recipient", []) if r]
-                        amounts = ad.get("amount", [])
-                        # Both transfer and coin_received are relevant in Cosmos
-                        if (et in ("transfer", "coin_received") or "reward" in et) and recipients:
-                            if wallet in recipients:
-                                for am in amounts:
-                                    acc += _parse_amounts(am)
-                if acc > 0:
-                    return float(acc)
-            except Exception:
-                return None
-            return None
-
-        for _ in range(max(1, int(retries) + 1)):
-            val = _try_once()
-            if val is not None:
-                return val
-            try:
-                time.sleep(float(delay_s))
-            except Exception:
-                pass
-        return None
 
     while attempt <= max_retries:
         attempt += 1
@@ -4371,6 +4439,22 @@ def run_pipeline(args, cfg, root_dir) -> int:
         ws_now = _window_start_utc(cadence_s=cadence_s)
         comp_start, comp_end = _comp_window_from_config(root_dir)
         now_utc = pd.Timestamp.now(tz="UTC")
+        try:
+            from zoneinfo import ZoneInfo
+        except Exception:
+            ZoneInfo = None  # type: ignore
+        toronto_tz = ZoneInfo("America/Toronto") if ZoneInfo else None
+        now_toronto = now_utc.tz_convert(toronto_tz) if toronto_tz else now_utc
+        next_target_local = now_toronto.replace(hour=21, minute=30, second=0, microsecond=0)
+        if now_toronto >= next_target_local:
+            next_target_local = next_target_local + pd.Timedelta(days=1)
+        next_target_utc = next_target_local.tz_convert("UTC") if hasattr(next_target_local, "tz_convert") else next_target_local
+        logging.info(
+            "Submission timing check: now_utc=%s now_toronto=%s next_local_target=%s (~9:30PM Toronto)",
+            now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            now_toronto.strftime("%Y-%m-%d %H:%M") if toronto_tz else str(now_toronto),
+            next_target_local.strftime("%Y-%m-%d %H:%M"),
+        )
         if (not args.force_submit) and (not (comp_start <= now_utc < comp_end)):
             print("submit: outside competition window; skipping submission")
             try:
@@ -4505,10 +4589,10 @@ def run_pipeline(args, cfg, root_dir) -> int:
         min_stake_for_skip = min_delegate_val
         should_skip = (
             not current_active
+            or not is_rewardable
             or (window_confident and window_is_open is False)
             or reps_for_skip is None
             or reps_for_skip < 1
-            or (unfulfilled_for_skip is not None and unfulfilled_for_skip > 0)
             or stake_for_skip is None
             or (
                 min_stake_for_skip is not None
@@ -4525,8 +4609,11 @@ def run_pipeline(args, cfg, root_dir) -> int:
             reason_list = [str(r) for r in inactive_reasons if r]
             if (reps_for_skip is None or reps_for_skip < 1) and "reputers missing" not in reason_list:
                 reason_list.append("reputers missing")
-            if unfulfilled_for_skip is not None and unfulfilled_for_skip > 0:
-                reason_list.append(f"unfulfilled_nonces:{unfulfilled_for_skip}")
+            if not is_rewardable:
+                if unfulfilled_for_skip is not None:
+                    reason_list.append(f"unfulfilled_nonces:{unfulfilled_for_skip}")
+                elif "unfulfilled unavailable" not in reason_list:
+                    reason_list.append("unfulfilled unavailable")
             if (stake_for_skip is None) and "stake unavailable" not in reason_list:
                 reason_list.append("stake unavailable")
             if (
@@ -4643,6 +4730,23 @@ def run_pipeline(args, cfg, root_dir) -> int:
             normalize_submission_log_file(log_csv)
             dedupe_submission_log_file(log_csv)
         except (OSError, IOError, ValueError, RuntimeError):
+            pass
+        try:
+            logging.info(
+                "Submission summary: value=%.6f pre_log10_loss=%s rc=%s next_window=%s retrain_needed=%s",
+                float(live_value),
+                f"{pre_log10_loss:.6f}" if pre_log10_loss is not None else "unknown",
+                rc,
+                next_target_utc.strftime("%Y-%m-%dT%H:%MZ") if 'next_target_utc' in locals() and next_target_utc is not None else "unknown",
+                not bool(rc == 0),
+            )
+            print(
+                "Summary -> alignment=competition_window "
+                f"status={'ok' if rc == 0 else 'deferred'} "
+                f"next_submission={next_target_utc.strftime('%Y-%m-%dT%H:%MZ') if 'next_target_utc' in locals() and next_target_utc is not None else 'unknown'} "
+                f"retraining_required={'yes' if rc != 0 else 'no'}"
+            )
+        except Exception:
             pass
         return rc
 
@@ -4791,7 +4895,8 @@ def main() -> int:
     iteration = 0
     loop_timeout = max(0, int(getattr(args, "timeout", 0) or 0))
     start_wall = time.time()
-    _sleep_until_next_window(cadence_s)
+    # Align once to the next full hour before entering the loop
+    sleep_until_top_of_hour_utc()
     last_rc = 0
     while True:
         if loop_timeout and (time.time() - start_wall) >= loop_timeout:
@@ -4817,11 +4922,8 @@ def main() -> int:
             last_rc = rc
             logging.info(f"[loop] iteration={iteration} error handled, continuing to next cycle")
         
-        now_utc = pd.Timestamp.now(tz="UTC")
-        window_start = _window_start_utc(now=now_utc, cadence_s=cadence_s)
-        next_window = window_start + pd.Timedelta(seconds=cadence_s)
-        sleep_seconds = max(0.0, (next_window - now_utc).total_seconds())
-        logging.info(f"[loop] sleeping {sleep_seconds:.1f}s until {next_window.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        sleep_seconds = float(cadence_s)
+        logging.info(f"[loop] sleeping {sleep_seconds:.1f}s until next cadence boundary")
         try:
             time.sleep(sleep_seconds)
         except KeyboardInterrupt:

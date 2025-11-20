@@ -78,6 +78,10 @@ async def submit_prediction(value: float, cfg: SubmissionConfig) -> SubmissionRe
         attempt += 1
         logger.info("Submitting value %.6f for topic %s (attempt %d/%d)", value, cfg.topic_id, attempt, cfg.retries + 1)
         try:
+            if os.getenv("ALLORA_API_KEY"):
+                logger.debug("ALLORA_API_KEY detected; keeping it scoped to market-data fetches only (not passed to worker)")
+            if not os.getenv("MNEMONIC") and not os.getenv("ALLORA_MNEMONIC"):
+                raise ValueError("MNEMONIC/ALLORA_MNEMONIC is required for submission")
             wallet_cfg = AlloraWalletConfig.from_env()
         except ValueError as exc:
             logger.error("Wallet configuration missing: %s", exc)
