@@ -2,14 +2,19 @@
 """Test a single submission to validate the pipeline"""
 import sys
 import os
-import asyncio
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
+import pytest
+
 load_dotenv()
 
-async def test_submission():
-    """Perform a test submission for the current hour"""
+
+def test_submission():
+    """Perform a test submission for the current hour."""
+
+    if os.getenv("RUN_SUBMISSION_TESTS") != "1":
+        pytest.skip("Submission test requires RUN_SUBMISSION_TESTS=1 to execute.")
     print("=" * 60)
     print("TEST SUBMISSION - Current Hour")
     print("=" * 60)
@@ -49,12 +54,12 @@ async def test_submission():
     import subprocess
     result = subprocess.run(
         ['python3', 'train.py', '--submit', '--as-of-now'],
-        capture_output=False,
+        capture_output=True,
         text=True
     )
-    
-    return result.returncode
+
+    assert result.returncode == 0, f"Submission command failed: {result.stderr}"
+
 
 if __name__ == '__main__':
-    exit_code = asyncio.run(test_submission())
-    sys.exit(exit_code)
+    test_submission()
