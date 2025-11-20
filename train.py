@@ -3386,6 +3386,12 @@ def run_pipeline(args, cfg, root_dir) -> int:
     from_month = getattr(args, "from_month", str(data_cfg.get("from_month", "2025-10")))
     non_overlap_hours = max(1, int(data_cfg.get("non_overlap_hours", 48)))
     sched_cfg: Dict[str, Any] = cfg.get("schedule", {})
+    schedule_reason = getattr(args, "_schedule_reason", None)
+    if not getattr(args, "_effective_mode", None) or not getattr(args, "_effective_cadence", None):
+        effective_mode, cadence, schedule_reason = _resolve_schedule(args, sched_cfg)
+        setattr(args, "_effective_mode", effective_mode)
+        setattr(args, "_effective_cadence", cadence)
+        setattr(args, "loop", effective_mode.lower() == "loop")
     mode = getattr(args, "_effective_mode", str(getattr(args, "schedule_mode", None) or sched_cfg.get("mode", "single")))
     cadence = getattr(args, "_effective_cadence", str(getattr(args, "cadence", None) or sched_cfg.get("cadence", "1h")))
     start_raw = str(getattr(args, "start_utc", None) or sched_cfg.get("start", "2025-09-16T13:00:00Z"))
@@ -4883,8 +4889,15 @@ def main() -> int:
     effective_mode, cadence, schedule_reason = _resolve_schedule(args, sched_cfg)
     setattr(args, "_effective_mode", effective_mode)
     setattr(args, "_effective_cadence", cadence)
+    setattr(args, "_schedule_reason", schedule_reason)
     # Normalize args.loop flag so downstream code consistently reflects the resolved mode
     setattr(args, "loop", effective_mode.lower() == "loop")
+    logging.info(
+        "[schedule] resolved mode=%s cadence=%s source=%s",
+        effective_mode,
+        cadence,
+        schedule_reason,
+    )
     cadence_s = _parse_cadence(cadence)
     
     def _run_once() -> int:
