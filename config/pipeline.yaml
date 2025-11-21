@@ -3,6 +3,7 @@
 
 data:
   ticker: "btcusd"
+  from_month: "2025-10"
   target_hours: 168            # 7 days
   history_buffer_hours: 48
 

@@ -446,8 +446,8 @@ class AlloraMLWorkflow:
                     df = self.fetch_bucket_csv(bucket["download_url"])
                     frames.append(df)
             except RuntimeError:
-                # Likely unauthorized; fall back below
-                frames = []
+                # Likely unauthorized; continue with local data only
+                pass
 
             combined_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
             if not combined_df.empty:
