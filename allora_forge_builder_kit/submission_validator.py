@@ -33,7 +33,8 @@ class AllroraSubmissionValidator:
     def run_allorad(self, cmd: str) -> str:
         """Run allorad command and return JSON output."""
         try:
-            full_cmd = f"allorad {cmd} --chain-id {self.chain_id} -o json"
+            # Use Allora testnet RPC endpoint for queries
+            full_cmd = f"allorad {cmd} --node https://testnet-rpc.lavenderfive.com:443 -o json"
             result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=10)
             if result.returncode != 0:
                 logger.debug(f"Command failed: {result.stderr}")

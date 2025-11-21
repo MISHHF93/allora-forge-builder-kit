@@ -19,16 +19,60 @@ import sys
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
+# Try to import aiohttp for direct RPC calls
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
+RPC_ENDPOINT = "https://testnet-rpc.lavenderfive.com:443"
+
+
+async def json_rpc_call(method: str, params: list = None) -> Optional[dict]:
+    """Make a JSON-RPC call to the Tendermint RPC endpoint."""
+    if not AIOHTTP_AVAILABLE:
+        return None
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params or []
+            }
+            async with session.post(
+                f"{RPC_ENDPOINT}/",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if "result" in data:
+                        return data["result"]
+                    elif "error" in data:
+                        logger.debug(f"JSON-RPC error: {data['error']}")
+                        return None
+    except Exception as e:
+        logger.debug(f"JSON-RPC call failed: {e}")
+    return None
+
 
 def run_command(cmd: str) -> str:
     """Run shell command and return output."""
     try:
+        # Use Allora testnet RPC endpoint for allorad commands
+        if "allorad" in cmd:
+            # Replace all --chain-id flags with --node flag
+            import re
+            cmd = re.sub(r'--chain-id\s+\S+', f'--node {RPC_ENDPOINT}', cmd)
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
         return result.stdout.strip()
     except Exception as e:
@@ -42,7 +86,7 @@ def check_topic_active(topic_id: int, chain_id: str = "allora-testnet-1") -> boo
     logger.info(f"1️⃣  CHECKING TOPIC STATUS (Topic {topic_id})")
     logger.info(f"{'='*70}")
     
-    cmd = f"allorad q emissions is-topic-active {topic_id} --chain-id {chain_id}"
+    cmd = f"allorad q emissions is-topic-active {topic_id} --chain-id {chain_id} -o json"
     output = run_command(cmd)
     
     if not output:
