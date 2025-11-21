@@ -33,6 +33,9 @@ from allora_forge_builder_kit.competition_deadline import (
     get_deadline_info,
 )
 
+# Import submission validator
+from allora_forge_builder_kit.submission_validator import validate_before_submission
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -378,10 +381,57 @@ def run_competition_pipeline(root_dir: str, once: bool = False) -> int:
             # Train model
             model, metrics, prediction = train_model(root_dir, force_retrain=True)
             
-            # Submit prediction
+            # Validate submission eligibility BEFORE attempting submission
+            logger.info("\n📋 Validating submission eligibility...")
+            wallet_addr = os.getenv("ALLORA_WALLET_ADDR")
+            
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
+                # Run validation check
+                is_valid, issues = loop.run_until_complete(
+                    validate_before_submission(
+                        topic_id=COMPETITION_TOPIC_ID,
+                        wallet_addr=wallet_addr,
+                        strict=False  # Don't fail on warnings, only critical issues
+                    )
+                )
+                
+                if not is_valid:
+                    # Check if critical issue
+                    critical_issues = [i for i in issues if i.startswith("CRITICAL")]
+                    if critical_issues:
+                        logger.error(f"❌ Critical validation failure - SKIPPING submission this cycle")
+                        for issue in critical_issues:
+                            logger.error(f"   {issue}")
+                        logger.warning(f"   Run: python diagnose_leaderboard_visibility.py")
+                        logger.warning(f"   For help, see: LEADERBOARD_VISIBILITY_GUIDE.md")
+                        
+                        # Log this as a skipped submission
+                        _log_submission({
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "topic_id": COMPETITION_TOPIC_ID,
+                            "prediction": prediction,
+                            "tx_hash": "SKIPPED",
+                            "nonce": None,
+                            "status": "validation_failed",
+                        }, root_dir)
+                        
+                        time.sleep(10)  # Brief delay before next cycle
+                        if once:
+                            return 1
+                        else:
+                            logger.info(f"\n⏳ Waiting {SUBMISSION_INTERVAL_HOURS} hour until next submission...")
+                            time.sleep(SUBMISSION_INTERVAL_HOURS * 3600 - 10)
+                            continue
+                    else:
+                        logger.warning(f"⚠️  Validation warnings but no critical issues:")
+                        for issue in issues:
+                            logger.warning(f"   {issue}")
+                        logger.info(f"   Proceeding with submission")
+                
+                # Submit prediction (validation passed or only warnings)
+                logger.info("\n📤 Submitting prediction...")
                 tx_hash, exit_code, status = loop.run_until_complete(
                     submit_prediction_sdk(
                         COMPETITION_TOPIC_ID,
