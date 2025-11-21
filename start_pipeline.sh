@@ -1,8 +1,8 @@
 #!/bin/bash
 # Start the Allora competition pipeline with wallet credentials
 
-# Set wallet credentials (User's production wallet from earlier session)
-export MNEMONIC="tiger salmon health level chase shift type enough struggle knife coast spray"
+# Set wallet credentials (User's production wallet)
+export MNEMONIC="tiger salmon health level chase shift type enough glue cliff rubber pitch alert arrest novel goose doll sweet tired carbon visit custom soul random"
 export ALLORA_WALLET_ADDR="allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"
 
 # Verify credentials are set
