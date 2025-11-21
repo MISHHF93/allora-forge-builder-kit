@@ -26,6 +26,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
 
+# Import competition deadline utilities
+from allora_forge_builder_kit.competition_deadline import (
+    should_exit_loop,
+    log_deadline_status,
+    get_deadline_info,
+)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -309,11 +316,18 @@ def _log_submission(submission: dict, root_dir: str) -> None:
 
 
 def run_competition_pipeline(root_dir: str, once: bool = False) -> int:
-    """Run the complete competition pipeline."""
+    """Run the complete competition pipeline with time-bound deadline control.
+    
+    Runs hourly submission cycles until competition deadline (Dec 15, 2025, 13:00 UTC).
+    Stops gracefully when deadline is reached without requiring manual intervention.
+    """
     
     logger.info("\n" + "=" * 70)
     logger.info("ALLORA COMPETITION PIPELINE STARTED")
     logger.info("=" * 70)
+    
+    # Log deadline status at startup
+    log_deadline_status()
     
     # Verify environment
     mnemonic = os.getenv("MNEMONIC")
@@ -329,15 +343,36 @@ def run_competition_pipeline(root_dir: str, once: bool = False) -> int:
     logger.info(f"✅ Environment verified")
     logger.info(f"   Wallet: {wallet_name}")
     logger.info(f"   Topic: {COMPETITION_TOPIC_ID} ({COMPETITION_NAME})")
-    logger.info(f"   Mode: {'Once' if once else 'Continuous (every hour)'}")
+    logger.info(f"   Mode: {'Once' if once else 'Continuous (hourly until deadline)'}")
     
     iteration = 0
     
     while True:
         iteration += 1
+        
+        # Check if we should exit due to deadline (before starting cycle)
+        if not once:
+            should_exit, exit_reason = should_exit_loop(cadence_hours=SUBMISSION_INTERVAL_HOURS)
+            if should_exit:
+                logger.info("\n" + "=" * 70)
+                logger.info("🎯 COMPETITION DEADLINE REACHED")
+                logger.info("=" * 70)
+                logger.info(exit_reason)
+                deadline_info = get_deadline_info()
+                logger.info(f"Deadline: {deadline_info['deadline']}")
+                logger.info(f"Current:  {deadline_info['current_utc']}")
+                logger.info("=" * 70)
+                logger.info("✅ Pipeline stopped gracefully. All submissions completed.")
+                return 0
+        
         logger.info(f"\n{'=' * 70}")
         logger.info(f"SUBMISSION CYCLE {iteration}")
         logger.info(f"{'=' * 70}")
+        
+        # Log remaining time (excluding final cycle)
+        if not once:
+            info = get_deadline_info()
+            logger.info(f"⏰ Time remaining: {info['formatted_remaining']}")
         
         try:
             # Train model
@@ -372,7 +407,7 @@ def run_competition_pipeline(root_dir: str, once: bool = False) -> int:
             if once:
                 return exit_code
             
-            # Wait for next hour
+            # Wait for next hour (but check deadline before sleeping)
             logger.info(f"\n⏳ Waiting {SUBMISSION_INTERVAL_HOURS} hour until next submission...")
             time.sleep(SUBMISSION_INTERVAL_HOURS * 3600)
             
