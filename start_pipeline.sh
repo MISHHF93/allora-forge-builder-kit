@@ -54,15 +54,23 @@ PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
 echo "✅ Python version: $PYTHON_VERSION"
 
 # Check required packages
-REQUIRED_PACKAGES=("xgboost" "numpy" "scikit-learn" "allora-sdk")
+REQUIRED_PACKAGES=("xgboost" "numpy" "sklearn" "allora_sdk")
 MISSING_PACKAGES=()
 
 for pkg in "${REQUIRED_PACKAGES[@]}"; do
-    if python3 -c "import ${pkg//-/_}" 2>/dev/null; then
-        echo "✅ $pkg installed"
+    if python3 -c "import $pkg" 2>/dev/null; then
+        # Map back to display names
+        case $pkg in
+            sklearn) echo "✅ scikit-learn installed" ;;
+            allora_sdk) echo "✅ allora-sdk installed" ;;
+            *) echo "✅ $pkg installed" ;;
+        esac
     else
-        MISSING_PACKAGES+=("$pkg")
-        echo "⚠️  $pkg not found"
+        case $pkg in
+            sklearn) MISSING_PACKAGES+=("scikit-learn"); echo "⚠️  scikit-learn not found" ;;
+            allora_sdk) MISSING_PACKAGES+=("allora-sdk"); echo "⚠️  allora-sdk not found" ;;
+            *) MISSING_PACKAGES+=("$pkg"); echo "⚠️  $pkg not found" ;;
+        esac
     fi
 done
 
