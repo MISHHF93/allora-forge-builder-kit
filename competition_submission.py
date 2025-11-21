@@ -228,8 +228,20 @@ async def submit_prediction_sdk(
         
         # Run worker with timeout
         logger.info(f"🚀 Submitting to network (timeout: {timeout_s}s)...")
+        submitted = False
         async for outcome in worker.run(timeout=timeout_s):
+            # Skip duplicate/retry submissions - only handle the first outcome
+            if submitted:
+                continue
+                
             if isinstance(outcome, Exception):
+                # Check if error is "already submitted" - this means submission succeeded earlier
+                error_msg = str(outcome)
+                if "already submitted" in error_msg.lower() or "inference already submitted" in error_msg.lower():
+                    logger.warning(f"⚠️  Submission already recorded in this epoch (expected behavior)")
+                    worker.stop()
+                    return None, 0, "already_submitted"  # Return success since it was submitted
+                
                 logger.error(f"❌ Worker error: {outcome}")
                 worker.stop()
                 return None, 1, "worker_error"
@@ -248,8 +260,6 @@ async def submit_prediction_sdk(
             logger.info(f"   Nonce: {nonce}")
             logger.info(f"   Prediction: {prediction:.8f}")
             
-            worker.stop()
-            
             # Log submission
             _log_submission({
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -260,9 +270,14 @@ async def submit_prediction_sdk(
                 "status": "success",
             }, root_dir)
             
-            return tx_hash, 0, "success"
+            submitted = True
+            break  # Exit loop after first successful submission
         
         worker.stop()
+        
+        if submitted:
+            return tx_hash, 0, "success"
+        
         logger.warning("⚠️  Worker completed without result")
         return None, 1, "no_result"
         
