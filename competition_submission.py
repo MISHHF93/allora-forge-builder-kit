@@ -26,6 +26,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
 
+# Apply worker patch to handle 404 on is_worker_registered_in_topic_id
+from worker_patch import apply_worker_patch
+apply_worker_patch()
+
 # Import competition deadline utilities
 from allora_forge_builder_kit.competition_deadline import (
     should_exit_loop,
@@ -218,9 +222,11 @@ async def submit_prediction_sdk(
             return None, 1, "wallet_config_error"
         
         # Configure network
+        # Use the dedicated gRPC endpoint for testnet
+        grpc_url = os.getenv("ALLORA_GRPC_URL") or "grpc+https://allora-grpc.testnet.allora.network:443/"
         network_cfg = AlloraNetworkConfig(
             chain_id=DEFAULT_CHAIN_ID,
-            url="grpc+https://allora-rpc.testnet.allora.network/",
+            url=grpc_url,
             websocket_url="wss://allora-rpc.testnet.allora.network/websocket",
             fee_denom="uallo",
             fee_minimum_gas_price=10.0,
