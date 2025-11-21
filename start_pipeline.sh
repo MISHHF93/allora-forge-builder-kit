@@ -155,7 +155,27 @@ import os
 import sys
 
 # Read .env file and set environment variables
-env_file = "/workspaces/allora-forge-builder-kit/.env"
+# Try multiple paths to find .env
+env_paths = [
+    ".env",  # Current directory
+    os.path.expanduser("~/.env"),  # Home directory
+    "/workspaces/allora-forge-builder-kit/.env",  # Default workspace
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),  # Script directory
+]
+
+env_file = None
+for path in env_paths:
+    if os.path.exists(path):
+        env_file = path
+        break
+
+if not env_file:
+    print(f"ERROR: Could not find .env file. Tried: {env_paths}")
+    sys.exit(1)
+
+# Determine project directory
+project_dir = os.path.dirname(os.path.abspath(env_file))
+
 with open(env_file, 'r') as f:
     for line in f:
         line = line.strip()
@@ -164,7 +184,7 @@ with open(env_file, 'r') as f:
             os.environ[key.strip()] = value.strip()
 
 # Change to project directory and run pipeline
-os.chdir("/workspaces/allora-forge-builder-kit")
+os.chdir(project_dir)
 os.execvp("python3", ["python3", "competition_submission.py"])
 STARTUP_EOF
 

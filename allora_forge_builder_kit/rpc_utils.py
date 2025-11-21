@@ -19,15 +19,14 @@ GRPC_ENDPOINTS = [
 ]
 
 # Fallback REST endpoints (Tendermint JSON-RPC)
+# Using only official Allora RPC endpoint (Ankr endpoint returns 404)
 TENDERMINT_RPC_ENDPOINTS = [
     "https://allora-rpc.testnet.allora.network",
-    "https://rpc.ankr.com/allora_testnet",
 ]
 
 # REST API endpoints (less reliable but still useful)
 REST_ENDPOINTS = [
     "https://allora-rpc.testnet.allora.network",
-    "https://rpc.ankr.com/allora_testnet",
 ]
 
 
