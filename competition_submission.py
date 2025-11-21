@@ -42,6 +42,14 @@ from allora_forge_builder_kit.competition_deadline import (
 # Import submission validator
 from allora_forge_builder_kit.submission_validator import validate_before_submission  # DISABLED: RPC endpoint issues
 
+# Import RPC utilities for metadata fetching and transaction confirmation
+from allora_forge_builder_kit.rpc_utils import (
+    get_topic_metadata,
+    confirm_transaction,
+    verify_leaderboard_visibility,
+    diagnose_rpc_connectivity,
+)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -58,12 +66,6 @@ COMPETITION_TOPIC_ID = 67  # BTC/USD 7-day log-return
 COMPETITION_NAME = "7 Day BTC/USD Log-Return Prediction"
 SUBMISSION_INTERVAL_HOURS = 1
 DEFAULT_CHAIN_ID = "allora-testnet-1"
-
-# Preferred RPC endpoints for testnet visibility checks
-RPC_ENDPOINTS = [
-    "https://rpc.ankr.com/allora_testnet",
-    "https://allora-rpc.testnet.allora.network",
-]
 
 print("=" * 70)
 print(f"Allora Competition: {COMPETITION_NAME}")
@@ -89,73 +91,6 @@ def _get_wallet_name(root_dir: str) -> Optional[str]:
         with open(wallet_file) as f:
             return f.read().strip()
     return os.getenv("ALLORA_WALLET_NAME", "test-wallet")
-
-
-def _rpc_get(path: str) -> Tuple[Optional[dict], Optional[str]]:
-    """Fetch JSON from the configured RPC endpoints in priority order."""
-
-    for endpoint in RPC_ENDPOINTS:
-        url = f"{endpoint.rstrip('/')}{path}"
-        try:
-            response = requests.get(url, timeout=8)
-            if response.status_code == 200:
-                return response.json(), endpoint
-        except requests.RequestException as exc:  # pragma: no cover - network dependent
-            logger.debug(f"RPC fetch failed for {url}: {exc}")
-
-    logger.warning("⚠️  Unable to fetch data from configured RPC endpoints")
-    return None, None
-
-
-def _log_topic_state(topic_id: int) -> None:
-    """Query topic metadata for visibility debugging (reputers, activity, stake)."""
-
-    data, endpoint = _rpc_get(f"/allora/emissions/v1/topic/{topic_id}")
-    if not data:
-        logger.warning(
-            "⚠️  Topic metadata could not be retrieved from any RPC endpoint; "
-            "leaderboard visibility cannot be confirmed"
-        )
-        return
-
-    topic = data.get("topic") or data
-    active = topic.get("active", topic.get("is_active"))
-    reputers_count = topic.get("reputers_count")
-    delegated_stake = topic.get("delegated_stake_value") or topic.get("delegated_stake")
-
-    if reputers_count is None:
-        logger.warning(
-            "⚠️  reputers_count is None in topic metadata (endpoint %s) - treating as 0 for logs",
-            endpoint,
-        )
-        reputers_count = 0
-
-    logger.info("📡 Topic %s metadata (%s): active=%s reputers=%s delegated_stake=%s", topic_id, endpoint, active, reputers_count, delegated_stake)
-
-
-def _confirm_transaction(tx_hash: str) -> None:
-    """Confirm a transaction exists on-chain via RPC."""
-
-    data, endpoint = _rpc_get(f"/cosmos/tx/v1beta1/txs/{tx_hash}")
-    if not data:
-        logger.warning(
-            "⚠️  Could not confirm transaction %s via RPC (network delay or endpoint issue)",
-            tx_hash,
-        )
-        return
-
-    tx_response = data.get("tx_response") or {}
-    height = tx_response.get("height")
-    codespace = tx_response.get("codespace")
-    code = tx_response.get("code")
-    logger.info(
-        "🔗 Transaction %s found on %s (height=%s code=%s codespace=%s)",
-        tx_hash,
-        endpoint,
-        height,
-        code,
-        codespace,
-    )
 
 
 def train_model(
@@ -370,7 +305,8 @@ async def submit_prediction_sdk(
             }, root_dir)
 
             if tx_hash:
-                _confirm_transaction(tx_hash)
+                # Verify transaction is on-chain
+                confirm_transaction(tx_hash)
 
             submitted = True
             break  # Exit loop after first successful submission
@@ -472,8 +408,14 @@ def run_competition_pipeline(root_dir: str, once: bool = False, dry_run: bool = 
         logger.info(f"SUBMISSION CYCLE {iteration}")
         logger.info(f"{'=' * 70}")
 
-        # Inspect topic state before training/submitting
-        _log_topic_state(COMPETITION_TOPIC_ID)
+        # Diagnose RPC connectivity and fetch topic metadata
+        logger.info("Verifying RPC connectivity and topic metadata...")
+        metadata = get_topic_metadata(COMPETITION_TOPIC_ID)
+        if metadata:
+            logger.info(f"✅ Topic {COMPETITION_TOPIC_ID} is accessible")
+            logger.debug(f"   Reputers: {metadata.get('reputers_count')}, Epoch: {metadata.get('epoch_length')}")
+        else:
+            logger.warning(f"⚠️  Could not fetch metadata for Topic {COMPETITION_TOPIC_ID}")
 
         if dry_run:
             logger.info("🧪 Dry run enabled - skipping training and submission after metadata check")
