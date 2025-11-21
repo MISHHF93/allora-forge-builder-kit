@@ -173,8 +173,8 @@ def submit_forecast_sdk(
             # Configure network
             network_cfg = AlloraNetworkConfig(
                 chain_id=DEFAULT_CHAIN_ID,
-                url="grpc+https://testnet-allora.lavenderfive.com:443",
-                websocket_url="wss://testnet-rpc.lavenderfive.com:443/allora/websocket",
+                url="grpc+https://allora-rpc.testnet.allora.network/",
+                websocket_url="wss://allora-rpc.testnet.allora.network/websocket",
                 fee_denom="uallo",
                 fee_minimum_gas_price=10.0,
             )

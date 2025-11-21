@@ -39,8 +39,8 @@ async def check_health():
         # Initialize network config
         network_config = AlloraNetworkConfig(
             chain_id="allora-testnet-1",
-            url="grpc+https://testnet-allora.lavenderfive.com:443",
-            websocket_url="wss://testnet-rpc.lavenderfive.com:443/allora/websocket",
+            url="grpc+https://allora-rpc.testnet.allora.network/",
+            websocket_url="wss://allora-rpc.testnet.allora.network/websocket",
             fee_denom="uallo",
             fee_minimum_gas_price=10.0
         )

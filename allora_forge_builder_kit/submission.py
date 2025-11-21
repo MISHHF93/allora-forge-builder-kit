@@ -17,10 +17,10 @@ from .logging_utils import get_stage_logger
 from .submission_log import ensure_submission_log_schema, log_submission_row
 
 # Lavender Five Testnet Endpoints
-DEFAULT_GRPC_URL = "grpc+https://testnet-allora.lavenderfive.com:443"
-DEFAULT_WEBSOCKET_URL = "wss://testnet-rpc.lavenderfive.com:443/allora/websocket"
-DEFAULT_REST_URL = "https://testnet-rest.lavenderfive.com:443/allora/"
-DEFAULT_RPC_URL = "https://testnet-rpc.lavenderfive.com:443/allora/"
+DEFAULT_GRPC_URL = "grpc+https://allora-rpc.testnet.allora.network/"
+DEFAULT_WEBSOCKET_URL = "wss://allora-rpc.testnet.allora.network/websocket"
+DEFAULT_REST_URL = "https://allora-rpc.testnet.allora.network/"
+DEFAULT_RPC_URL = "https://rpc.ankr.com/allora_testnet"
 DEFAULT_CHAIN_ID = "allora-testnet-1"
 DEFAULT_FEE_DENOM = "uallo"
 DEFAULT_MIN_GAS_PRICE = 10.0

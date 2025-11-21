@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-RPC_ENDPOINT = "https://testnet-rpc.lavenderfive.com:443"
+RPC_ENDPOINT = "https://rpc.ankr.com/allora_testnet"
 
 
 async def json_rpc_call(method: str, params: list = None) -> Optional[dict]:

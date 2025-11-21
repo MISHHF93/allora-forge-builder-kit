@@ -5,7 +5,7 @@ import csv
 import requests
 from datetime import datetime
 
-REST_ENDPOINT = "https://testnet-rest.lavenderfive.com:443/allora"
+REST_ENDPOINT = "https://allora-rpc.testnet.allora.network/"
 
 def verify_tx(tx_hash):
     """Verify transaction on blockchain."""

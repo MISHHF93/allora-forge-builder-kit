@@ -45,8 +45,8 @@ logger = logging.getLogger(__name__)
 
 # Constants
 CHAIN_ID = "allora-testnet-1"
-RPC_URL = "https://testnet-rpc.lavenderfive.com:443/allora/"
-REST_URL = "https://testnet-rest.lavenderfive.com:443/allora/"
+RPC_URL = "https://rpc.ankr.com/allora_testnet"
+REST_URL = "https://allora-rpc.testnet.allora.network/"
 FAUCET_URL = "https://faucet.testnet.allora.network"  # May vary
 DEFAULT_GAS = "300000"
 DEFAULT_FEES = "1000uallo"
