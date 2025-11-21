@@ -20,6 +20,8 @@ import time
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
+import requests
+
 import numpy as np
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
@@ -57,6 +59,12 @@ COMPETITION_NAME = "7 Day BTC/USD Log-Return Prediction"
 SUBMISSION_INTERVAL_HOURS = 1
 DEFAULT_CHAIN_ID = "allora-testnet-1"
 
+# Preferred RPC endpoints for testnet visibility checks
+RPC_ENDPOINTS = [
+    "https://rpc.ankr.com/allora_testnet",
+    "https://allora-rpc.testnet.allora.network",
+]
+
 print("=" * 70)
 print(f"Allora Competition: {COMPETITION_NAME}")
 print(f"Topic ID: {COMPETITION_TOPIC_ID}")
@@ -81,6 +89,73 @@ def _get_wallet_name(root_dir: str) -> Optional[str]:
         with open(wallet_file) as f:
             return f.read().strip()
     return os.getenv("ALLORA_WALLET_NAME", "test-wallet")
+
+
+def _rpc_get(path: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Fetch JSON from the configured RPC endpoints in priority order."""
+
+    for endpoint in RPC_ENDPOINTS:
+        url = f"{endpoint.rstrip('/')}{path}"
+        try:
+            response = requests.get(url, timeout=8)
+            if response.status_code == 200:
+                return response.json(), endpoint
+        except requests.RequestException as exc:  # pragma: no cover - network dependent
+            logger.debug(f"RPC fetch failed for {url}: {exc}")
+
+    logger.warning("⚠️  Unable to fetch data from configured RPC endpoints")
+    return None, None
+
+
+def _log_topic_state(topic_id: int) -> None:
+    """Query topic metadata for visibility debugging (reputers, activity, stake)."""
+
+    data, endpoint = _rpc_get(f"/allora/emissions/v1/topic/{topic_id}")
+    if not data:
+        logger.warning(
+            "⚠️  Topic metadata could not be retrieved from any RPC endpoint; "
+            "leaderboard visibility cannot be confirmed"
+        )
+        return
+
+    topic = data.get("topic") or data
+    active = topic.get("active", topic.get("is_active"))
+    reputers_count = topic.get("reputers_count")
+    delegated_stake = topic.get("delegated_stake_value") or topic.get("delegated_stake")
+
+    if reputers_count is None:
+        logger.warning(
+            "⚠️  reputers_count is None in topic metadata (endpoint %s) - treating as 0 for logs",
+            endpoint,
+        )
+        reputers_count = 0
+
+    logger.info("📡 Topic %s metadata (%s): active=%s reputers=%s delegated_stake=%s", topic_id, endpoint, active, reputers_count, delegated_stake)
+
+
+def _confirm_transaction(tx_hash: str) -> None:
+    """Confirm a transaction exists on-chain via RPC."""
+
+    data, endpoint = _rpc_get(f"/cosmos/tx/v1beta1/txs/{tx_hash}")
+    if not data:
+        logger.warning(
+            "⚠️  Could not confirm transaction %s via RPC (network delay or endpoint issue)",
+            tx_hash,
+        )
+        return
+
+    tx_response = data.get("tx_response") or {}
+    height = tx_response.get("height")
+    codespace = tx_response.get("codespace")
+    code = tx_response.get("code")
+    logger.info(
+        "🔗 Transaction %s found on %s (height=%s code=%s codespace=%s)",
+        tx_hash,
+        endpoint,
+        height,
+        code,
+        codespace,
+    )
 
 
 def train_model(
@@ -255,6 +330,14 @@ async def submit_prediction_sdk(
                 error_msg = str(outcome)
                 if "already submitted" in error_msg.lower() or "inference already submitted" in error_msg.lower():
                     logger.warning(f"⚠️  Submission already recorded in this epoch (expected behavior)")
+                    _log_submission({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "topic_id": topic_id,
+                        "prediction": prediction,
+                        "tx_hash": None,
+                        "nonce": None,
+                        "status": "already_submitted",
+                    }, root_dir)
                     worker.stop()
                     return None, 0, "already_submitted"  # Return success since it was submitted
                 
@@ -285,7 +368,10 @@ async def submit_prediction_sdk(
                 "nonce": nonce,
                 "status": "success",
             }, root_dir)
-            
+
+            if tx_hash:
+                _confirm_transaction(tx_hash)
+
             submitted = True
             break  # Exit loop after first successful submission
         
@@ -324,7 +410,7 @@ def _log_submission(submission: dict, root_dir: str) -> None:
     logger.info(f"📝 Submission logged to {log_path}")
 
 
-def run_competition_pipeline(root_dir: str, once: bool = False) -> int:
+def run_competition_pipeline(root_dir: str, once: bool = False, dry_run: bool = False) -> int:
     """Run the complete competition pipeline with time-bound deadline control.
     
     Runs hourly submission cycles until competition deadline (Dec 15, 2025, 13:00 UTC).
@@ -341,18 +427,26 @@ def run_competition_pipeline(root_dir: str, once: bool = False) -> int:
     # Verify environment
     mnemonic = os.getenv("MNEMONIC")
     if not mnemonic:
-        logger.error("❌ MNEMONIC environment variable not set!")
-        return 1
+        if dry_run:
+            logger.warning("⚠️  MNEMONIC not set - continuing because this is a dry run")
+        else:
+            logger.error("❌ MNEMONIC environment variable not set!")
+            return 1
     
     wallet_name = _get_wallet_name(root_dir)
     if not wallet_name:
-        logger.error("❌ Wallet name not found!")
-        return 1
+        if dry_run:
+            logger.warning("⚠️  Wallet name not found - using placeholder for dry run")
+            wallet_name = "dry-run-wallet"
+        else:
+            logger.error("❌ Wallet name not found!")
+            return 1
     
     logger.info(f"✅ Environment verified")
     logger.info(f"   Wallet: {wallet_name}")
     logger.info(f"   Topic: {COMPETITION_TOPIC_ID} ({COMPETITION_NAME})")
-    logger.info(f"   Mode: {'Once' if once else 'Continuous (hourly until deadline)'}")
+    mode_label = "Dry run" if dry_run else ("Once" if once else "Continuous (hourly until deadline)")
+    logger.info(f"   Mode: {mode_label}")
     
     iteration = 0
     
@@ -377,6 +471,13 @@ def run_competition_pipeline(root_dir: str, once: bool = False) -> int:
         logger.info(f"\n{'=' * 70}")
         logger.info(f"SUBMISSION CYCLE {iteration}")
         logger.info(f"{'=' * 70}")
+
+        # Inspect topic state before training/submitting
+        _log_topic_state(COMPETITION_TOPIC_ID)
+
+        if dry_run:
+            logger.info("🧪 Dry run enabled - skipping training and submission after metadata check")
+            return 0
         
         # Log remaining time (excluding final cycle)
         if not once:
@@ -489,6 +590,11 @@ def main():
         help="Run once and exit (don't loop hourly)",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run visibility checks without training/submitting",
+    )
+    parser.add_argument(
         "--topic",
         type=int,
         default=COMPETITION_TOPIC_ID,
@@ -499,7 +605,7 @@ def main():
     
     root_dir = os.path.dirname(os.path.abspath(__file__))
     
-    exit_code = run_competition_pipeline(root_dir, once=args.once)
+    exit_code = run_competition_pipeline(root_dir, once=args.once, dry_run=args.dry_run)
     sys.exit(exit_code)
 
 
