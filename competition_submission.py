@@ -346,16 +346,23 @@ def run_competition_pipeline(root_dir: str, once: bool = False) -> int:
             # Submit prediction
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            tx_hash, exit_code, status = loop.run_until_complete(
-                submit_prediction_sdk(
-                    COMPETITION_TOPIC_ID,
-                    prediction,
-                    wallet_name,
-                    root_dir,
-                    timeout_s=60,
+            try:
+                tx_hash, exit_code, status = loop.run_until_complete(
+                    submit_prediction_sdk(
+                        COMPETITION_TOPIC_ID,
+                        prediction,
+                        wallet_name,
+                        root_dir,
+                        timeout_s=60,
+                    )
                 )
-            )
-            loop.close()
+            finally:
+                # Properly close the event loop and cancel pending tasks
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.close()
             
             if exit_code == 0:
                 logger.info(f"✅ Cycle {iteration} complete - submission successful!")
