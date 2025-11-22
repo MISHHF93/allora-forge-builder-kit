@@ -3,35 +3,25 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "allora-forge-builder-kit"
+name = "btc-7d-log-return-forecast"
 version = "0.1.0"
-description = "Allora ML Workflow Utilities"
-authors = [{ name = "Tim DeLise", email = "tim@alloralabs.xyz" }]
+description = "Minimal 7-Day BTC/USD Log-Return Forecast & Submission"
+authors = [{ name = "MISHHF93" }]
 license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.8"
 
 dependencies = [
-    "pandas",
     "numpy",
+    "pandas",
     "scikit-learn",
     "xgboost",
-    "scipy",
-    "statsmodels",
-    "optuna",
-    "matplotlib",
-    "ta",
-    "cloudpickle",
-    "python-dotenv",
-    "PyYAML",
-    "allora-sdk",
     "requests",
-    "dill",
 ]
 
 [project.urls]
-Homepage = "https://github.com/allora-network/allora-forge-builder-kit"
+Homepage = "https://github.com/MISHHF93/allora-forge-builder-kit"
 
 [tool.setuptools.packages.find]
-include = ["allora_forge_builder_kit"]
+# No packages to find, single script
 

@@ -22,19 +22,19 @@ Environment variables configure run behavior:
 Run (training + prediction + optional submission):
 
 ```bash
-python btc_7d_log_return_forecast.py
+python train.py
 ```
 
 Disable submission:
 
 ```bash
-FORECAST_SUBMIT=false python btc_7d_log_return_forecast.py
+FORECAST_SUBMIT=false python train.py
 ```
 
 Adjust history window:
 
 ```bash
-FORECAST_DAYS_BACK=75 python btc_7d_log_return_forecast.py
+FORECAST_DAYS_BACK=75 python train.py
 ```
 
 ## Output Artifacts
@@ -47,7 +47,7 @@ FORECAST_DAYS_BACK=75 python btc_7d_log_return_forecast.py
 ## Cron Example (Hourly)
 
 ```cron
-0 * * * * cd /path/to/repo && FORECAST_SUBMIT=true python btc_7d_log_return_forecast.py >> hourly_forecast.log 2>&1
+0 * * * * cd /path/to/repo && FORECAST_SUBMIT=true python train.py >> hourly_forecast.log 2>&1
 ```
 
 ## Dependencies

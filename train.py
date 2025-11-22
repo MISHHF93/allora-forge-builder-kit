@@ -22,12 +22,14 @@ from dataclasses import dataclass
 from typing import List, Optional
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import requests
 import numpy as np
 import pandas as pd
 
 try:
-    from xgboost import XGBoostError  # type: ignore
     import xgboost as xgb
     _XGB_AVAILABLE = True
 except Exception:  # pragma: no cover - fallback
@@ -52,7 +54,7 @@ logger = logging.getLogger("btc_7d_forecast")
 class Config:
     days_back: int = 90                # Rolling window length (in days)
     horizon_hours: int = 168           # 7 days forward
-    topic_id: int = int(os.getenv("ALLORA_TOPIC_ID", "67"))
+    topic_id: int = int(os.getenv("TOPIC_ID", "67"))
     submit: bool = True                # Attempt blockchain submission
     api_timeout: int = 30              # Seconds for HTTP requests
     min_training_rows: int = 500       # Safety minimum
@@ -66,32 +68,46 @@ def fetch_btcusd_hourly(days_back: int) -> pd.DataFrame:
     Fallback: generate synthetic random walk if API fails.
     Returns DataFrame with columns: ['timestamp', 'close'] (UTC, hourly).
     """
-    logger.info(f"Fetching {days_back}d hourly BTC/USD data from CoinGecko...")
-    url = (
-        "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-        f"?vs_currency=usd&days={days_back}&interval=hourly"
-    )
-    try:
-        resp = requests.get(url, timeout=Config.api_timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        prices = data.get("prices", [])
-        if not prices:
-            raise ValueError("Empty price list from API")
-        rows = []
-        for ts_ms, price in prices:
-            # Align to hour (CoinGecko returns ms timestamps)
-            dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
-            dt_floor = dt.replace(minute=0, second=0, microsecond=0)
-            rows.append((dt_floor, float(price)))
-        df = pd.DataFrame(rows, columns=["timestamp", "close"]).drop_duplicates("timestamp").sort_values("timestamp")
-        logger.info(f"Fetched {len(df)} hourly rows")
-        return df
-    except Exception as e:
-        logger.warning(f"API fetch failed ({e}); generating synthetic random walk.")
+    logger.info(f"Fetching {days_back}d hourly BTC/USD data from Tiingo...")
+    tkey = os.getenv("TIINGO_API_KEY", "").strip()
+    if not tkey:
+        logger.warning("TIINGO_API_KEY not set; generating synthetic random walk.")
+    else:
+        try:
+            # Tiingo expects startDate in ISO date and tickers like btcusd
+            url = "https://api.tiingo.com/tiingo/crypto/prices"
+            params = {
+                "tickers": "btcusd",
+                "startDate": (datetime.now(timezone.utc) - pd.Timedelta(days=days_back)).strftime("%Y-%m-%d"),
+                "resampleFreq": "1hour",
+                "token": tkey,
+            }
+            r = requests.get(url, params=params, timeout=Config.api_timeout)
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list) or not data:
+                raise ValueError("Unexpected Tiingo response format")
+            # Tiingo returns a list where first element has priceData list
+            price_data = data[0].get("priceData", [])
+            if not price_data:
+                raise ValueError("No data returned from Tiingo")
+            rows = []
+            for item in price_data:
+                dt = datetime.fromisoformat(item["date"].replace("Z", "+00:00"))
+                rows.append((dt, float(item["close"])))
+            df = pd.DataFrame(rows, columns=["timestamp", "close"]).drop_duplicates("timestamp").sort_values("timestamp")
+            expected_rows = days_back * 24
+            if len(df) < expected_rows * 0.1:  # Less than 10% of expected
+                logger.warning(f"Tiingo returned only {len(df)} rows, expected ~{expected_rows}; using synthetic fallback.")
+                # Fall back to synthetic
+            else:
+                logger.info(f"Fetched {len(df)} hourly rows from Tiingo")
+                return df
+        except Exception as e:
+            logger.warning(f"Tiingo API fetch failed ({e}); generating synthetic random walk.")
         hours = days_back * 24
         base = 40000.0
-        rng = np.random.default_rng(42)
+        rng = np.random.default_rng(int(time.time()))  # Use current time as seed for variation
         returns = rng.normal(0, 0.002, size=hours)  # small hourly drift
         prices: List[float] = []
         current = base
@@ -190,10 +206,10 @@ def predict_forward_log_return(model: object, x_live: np.ndarray) -> float:
 # Submission
 ###############################################################################
 def submit_prediction(value: float, cfg: Config) -> bool:
-    """Submit prediction via Allora CLI if available; always persist a local record.
+    """Submit prediction via Allora SDK if available; fallback to CLI; always persist a local record.
     Expects environment variables for wallet context if required.
     """
-    timestamp = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+    timestamp = datetime.now(timezone.utc).isoformat()
     record = {"timestamp_utc": timestamp, "topic_id": cfg.topic_id, "prediction_log_return_7d": value}
     # Append to local CSV log
     csv_path = "submission_log.csv"
@@ -208,22 +224,99 @@ def submit_prediction(value: float, cfg: Config) -> bool:
     with open("latest_submission.json", "w") as jf:
         json.dump(record, jf, indent=2)
     if not cfg.submit:
-        logger.info("Submission disabled (cfg.submit=False). Skipping CLI call.")
+        logger.info("Submission disabled (cfg.submit=False). Skipping.")
         return False
+    # Get block height
+    block_height = 0
+    pubkey = ""
+    try:
+        from allora_sdk import AlloraRPCClient
+        client = AlloraRPCClient.from_env()
+        block = client.get_latest_block()
+        block_height = block.header.height
+        pubkey = client.public_key.hex()
+    except Exception as e:
+        logger.warning(f"Failed to get block height/pubkey via SDK ({e}); trying REST.")
+        try:
+            import requests
+            rpc_url = os.getenv("RPC_URL", "https://allora-rpc.testnet.allora.network/")
+            r = requests.get(f"{rpc_url}/status", timeout=10)
+            r.raise_for_status()
+            block_height = int(r.json()["result"]["sync_info"]["latest_block_height"])
+            pubkey = ""  # still empty
+        except Exception as e2:
+            logger.warning(f"Failed to get block height via REST ({e2})")
+    # Try SDK submission first
+    if block_height > 0:
+        try:
+            from allora_sdk.protos.emissions.v9 import InsertWorkerPayloadRequest, InputWorkerDataBundle, InputInferenceForecastBundle, InputInference
+            from allora_sdk.protos.emissions.v9._v3__ import Nonce
+            client = AlloraRPCClient.from_env()
+            wallet = client.address
+            nonce = Nonce(block_height=block_height)
+            inference = InputInference(
+                topic_id=cfg.topic_id,
+                block_height=block_height,
+                inferer=wallet,
+                value=str(value),
+                extra_data=b"",
+                proof=""
+            )
+            bundle = InputInferenceForecastBundle(inference=inference)
+            worker_data_bundle = InputWorkerDataBundle(
+                worker=wallet,
+                nonce=nonce,
+                topic_id=cfg.topic_id,
+                inference_forecasts_bundle=bundle,
+                inferences_forecasts_bundle_signature=b"",
+                pubkey=pubkey
+            )
+            request = InsertWorkerPayloadRequest(
+                sender=wallet,
+                worker_data_bundle=worker_data_bundle
+            )
+            tx_response = client.tx_manager.send_tx(request)
+            logger.info("✅ Submission via SDK success")
+            return True
+        except Exception as e:
+            logger.warning(f"SDK submission failed ({e}); falling back to CLI.")
+    # Fallback to CLI
     cli = shutil.which("allorad") or shutil.which("allora")
     if not cli:
         logger.warning("Allora CLI not found in PATH; skipping on-chain submission.")
         return False
-    cmd = [cli, "submit", "--topic-id", str(cfg.topic_id), "--value", f"{value:.10f}"]
+    wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
+    if not wallet:
+        logger.warning("ALLORA_WALLET_ADDR not set; skipping on-chain submission.")
+        return False
+    # Correct worker_data as JSON of InputWorkerDataBundle
+    worker_data = {
+        "worker": wallet,
+        "nonce": {"block_height": block_height},
+        "topic_id": cfg.topic_id,
+        "inference_forecasts_bundle": {
+            "inference": {
+                "topic_id": cfg.topic_id,
+                "block_height": block_height,
+                "inferer": wallet,
+                "value": str(value),
+                "extra_data": "",
+                "proof": ""
+            }
+        },
+        "inferences_forecasts_bundle_signature": "",
+        "pubkey": pubkey
+    }
+    cmd = [cli, "tx", "emissions", "insert-worker-payload", wallet, json.dumps(worker_data), "--yes", "--keyring-backend", "test", "--node", "https://allora-rpc.testnet.allora.network/", "--chain-id", "allora-testnet-1"]
     logger.info("Submitting via CLI: %s", " ".join(cmd))
     try:
-        proc = shutil.which("bash") and __import__("subprocess").run(cmd, capture_output=True, text=True, timeout=60)
-        if proc and proc.returncode == 0:
+        import subprocess
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode == 0:
             logger.info("✅ Submission CLI success")
             return True
         else:
-            if proc:
-                logger.error(f"Submission CLI failed (rc={proc.returncode}): {proc.stdout} {proc.stderr}")
+            logger.error(f"Submission CLI failed (rc={proc.returncode}): {proc.stdout} {proc.stderr}")
             return False
     except Exception as e:
         logger.error(f"CLI submission error: {e}")
