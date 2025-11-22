@@ -73,6 +73,52 @@ print(f"Topic ID: {COMPETITION_TOPIC_ID}")
 print(f"Submission Interval: Every {SUBMISSION_INTERVAL_HOURS} hour")
 print("=" * 70)
 
+# ============================================================================
+# PREDICTION VALIDATION
+# ============================================================================
+def validate_predictions(prediction: float, name: str = "Prediction") -> bool:
+    """
+    Validate a prediction value before submission to the leaderboard.
+    
+    Args:
+        prediction: The prediction value (float) to validate
+        name: Name of the prediction for logging purposes
+    
+    Returns:
+        True if prediction is valid, raises ValueError otherwise
+    
+    Raises:
+        ValueError: If prediction fails validation
+    """
+    logger.info(f"🔍 Validating {name}...")
+    
+    # Check if value is numeric
+    try:
+        pred_value = float(prediction)
+    except (TypeError, ValueError):
+        raise ValueError(f"❌ {name} is not numeric: {prediction}")
+    
+    # Check for NaN
+    if np.isnan(pred_value):
+        raise ValueError(f"❌ {name} contains NaN value")
+    
+    # Check for infinity
+    if np.isinf(pred_value):
+        raise ValueError(f"❌ {name} contains infinite value")
+    
+    # Check for extreme values (outside typical prediction range for log-returns)
+    # Log-returns typically range from -5 to +5 for crypto assets
+    if np.abs(pred_value) > 10:
+        logger.warning(f"⚠️  {name} is outside typical range: {pred_value:.6f}")
+        logger.warning(f"    Expected range for BTC/USD 7-day log-return: [-5, 5]")
+    
+    # Check for reasonable values
+    if np.abs(pred_value) > 50:
+        raise ValueError(f"❌ {name} is too extreme: {pred_value:.6f}")
+    
+    logger.info(f"✅ {name} passed validation: {pred_value:.8f}")
+    return True
+
 
 def _load_pipeline_config(root_dir: str) -> dict:
     """Load pipeline config from YAML."""
@@ -429,6 +475,30 @@ def run_competition_pipeline(root_dir: str, once: bool = False, dry_run: bool = 
         try:
             # Train model
             model, metrics, prediction = train_model(root_dir, force_retrain=True)
+            
+            # Validate prediction BEFORE attempting submission
+            try:
+                validate_predictions(prediction, name="BTC/USD 7-day log-return prediction")
+            except ValueError as e:
+                logger.error(f"❌ Prediction validation failed: {e}")
+                logger.error(f"   Skipping submission this cycle")
+                
+                # Log this as a skipped submission
+                _log_submission({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "topic_id": COMPETITION_TOPIC_ID,
+                    "prediction": prediction,
+                    "tx_hash": "VALIDATION_FAILED",
+                    "nonce": None,
+                    "status": "prediction_validation_failed",
+                }, root_dir)
+                
+                if once:
+                    return 1
+                else:
+                    logger.info(f"⏳ Waiting {SUBMISSION_INTERVAL_HOURS} hour until next submission...")
+                    time.sleep(SUBMISSION_INTERVAL_HOURS * 3600)
+                    continue
             
             # Validate submission eligibility BEFORE attempting submission
             logger.info("\n📋 Validating submission eligibility...")

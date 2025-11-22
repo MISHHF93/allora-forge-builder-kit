@@ -1,0 +1,147 @@
+version: '3.8'
+
+services:
+  allora-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    
+    # Image name and tag
+    image: allora-pipeline:latest
+    container_name: allora-competition-pipeline
+    
+    # Environment variables loaded from .env file
+    env_file: .env
+    
+    # Environment variables set directly (override .env if needed)
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - TOPIC_ID=67
+    
+    # Volumes for persistent storage
+    volumes:
+      # Persist logs directory on host
+      - ./logs:/app/logs
+      # Mount .env file for credentials
+      - ./.env:/app/.env:ro
+      # Optional: mount data artifacts
+      - ./data:/app/data
+    
+    # Restart policy: restart on failure
+    restart: always
+    
+    # Resource limits (adjust based on your system)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    
+    # Health check configuration
+    healthcheck:
+      test: ["CMD", "test", "-f", "/app/logs/submission.log"]
+      interval: 300s          # Check every 5 minutes
+      timeout: 30s
+      retries: 3
+      start_period: 30s
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    
+    # Run in detached mode (no interactive terminal)
+    stdin_open: false
+    tty: false
+
+  # Optional: log rotation container (runs separately)
+  log-rotator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    
+    image: allora-pipeline:latest
+    container_name: allora-log-rotator
+    
+    # Mount logs directory for rotation
+    volumes:
+      - ./logs:/app/logs
+    
+    # Run the log rotation script hourly
+    command: ["/bin/bash", "-c", "while true; do /app/logs/rotate_logs.sh; sleep 3600; done"]
+    
+    # Restart on failure
+    restart: always
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "test", "-f", "/app/logs/submission.log"]
+      interval: 300s
+      timeout: 30s
+      retries: 3
+      start_period: 30s
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "2"
+    
+    # Don't need environment
+    stdin_open: false
+    tty: false
+
+  # Optional: health monitoring container (runs separately)
+  health-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    
+    image: allora-pipeline:latest
+    container_name: allora-health-monitor
+    
+    # Mount logs directory for monitoring
+    volumes:
+      - ./logs:/app/logs
+    
+    # Run the healthcheck script every 10 minutes
+    command: ["/bin/bash", "-c", "while true; do /app/logs/healthcheck.sh; sleep 600; done"]
+    
+    # Restart on failure
+    restart: always
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "test", "-f", "/app/logs/healthcheck_status.log"]
+      interval: 300s
+      timeout: 30s
+      retries: 3
+      start_period: 30s
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "2"
+    
+    # Don't need environment
+    stdin_open: false
+    tty: false
+
+# Named volume for data persistence (optional)
+volumes:
+  allora-data:
+    driver: local
+
+# Network for inter-container communication (optional)
+networks:
+  allora-net:
+    driver: bridge
