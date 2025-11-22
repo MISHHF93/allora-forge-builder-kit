@@ -15,6 +15,12 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
+# Verify all dependencies installed successfully
+python -c "
+import xgboost, pandas, numpy, scikit_learn, requests, allora_sdk
+print('✅ All core dependencies verified')
+"
+
 # 4. Install Allora CLI (CORRECT WAY)
 # Download the correct binary for your architecture
 # Check: uname -m (should be x86_64 for AWS instances)
@@ -167,7 +173,9 @@ Before running the pipeline, verify:
 
 - [ ] Python 3.9+ installed: `python --version`
 - [ ] Virtual environment activated: `which python` (should show .venv)
-- [ ] XGBoost installed: `python -c "import xgboost; print(xgboost.__version__)"`
+- [ ] Dependencies installed: `pip list | grep -E "xgboost|pandas|numpy|allora-sdk"`
+- [ ] Core imports work: `python -c "import xgboost, pandas, numpy, requests, allora_sdk; print('✅ All imports verified')"`
+- [ ] XGBoost available: `python -c "import xgboost; print(xgboost.__version__)"`
 - [ ] Allora CLI installed: `allorad version`
 - [ ] Allora CLI is correct architecture: `file $(which allorad)`
 - [ ] .env file exists with all keys: `cat .env`
@@ -177,15 +185,32 @@ Before running the pipeline, verify:
 
 ## Requirements.txt
 
-Ensure your `requirements.txt` includes:
-```
-xgboost>=2.0.0
-scikit-learn>=1.0.0
-pandas>=1.3.0
-numpy>=1.20.0
-requests>=2.26.0
-python-dotenv>=0.19.0
-joblib>=1.0.0
+The `requirements.txt` contains all 81 dependencies including:
+
+**Core ML Stack:**
+- xgboost==3.1.2 (gradient boosting for predictions)
+- scikit-learn==1.7.2 (feature scaling, model utilities)
+- pandas==2.3.3 (data manipulation)
+- numpy==2.3.5 (numerical computations)
+- scipy==1.16.3 (statistical functions)
+
+**API & HTTP:**
+- requests==2.32.5 (Tiingo API calls)
+- python-dotenv==1.2.1 (environment variables)
+- joblib==1.5.2 (model serialization)
+
+**Blockchain & Allora SDK:**
+- allora_sdk==1.0.6 (prediction submission)
+- cosmpy==0.11.2 (blockchain integration)
+- grpcio==1.76.0, grpcio-tools==1.76.0 (protocol buffers)
+- protobuf==5.29.5 (message serialization)
+
+**Supporting Libraries:**
+- matplotlib==3.10.7, lightgbm==4.6.0, pycryptodome==3.23.0, mnemonic==0.21, PyNaCl==1.6.0 (crypto & visualization)
+
+To install all dependencies on a fresh Ubuntu instance:
+```bash
+pip install -r requirements.txt
 ```
 
 ## Running on Instance
