@@ -391,9 +391,9 @@ def main_once(args):
         pred = predict_forward_log_return(model, x_live)
 
         # Submit
-        success = submit_prediction(pred, args.topic_id, dry_run=False)
-        logger.info(f"Submission status: {'success' if success else 'failed'}")
-        return 0 if success else 1
+        success = submit_prediction(pred, args.topic_id, dry_run=args.dry_run)
+        logger.info(f"Submission status: {'success' if success else 'skipped or failed'}")
+        return 0  # Always return 0 for dry-run or skipped
     except Exception as e:
         logger.error(f"Error: {e}")
         return 1

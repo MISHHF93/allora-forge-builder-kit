@@ -1,8 +1,8 @@
 #!/bin/bash
-# Robust launch script for autonomous Allora pipeline
+# Robust launch script for autonomous Allora pipeline with zero-error system
 # Monitors and restarts the pipeline if it fails
 
-PIPELINE_CMD="python submit_prediction.py --continuous"
+PIPELINE_CMD="python train.py --loop --submit --as-of-now --cadence 1h"
 LOG_FILE="pipeline.log"
 PID_FILE="pipeline.pid"
 
