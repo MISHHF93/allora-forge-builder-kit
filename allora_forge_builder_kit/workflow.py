@@ -105,14 +105,16 @@ class AlloraMLWorkflow:
         try:
             resp = requests.get(url, headers=headers, params={"tickers": ticker, "from_month": from_month}, timeout=30)
         except requests_exceptions.RequestException as exc:
-            raise RuntimeError(f"Network error when listing buckets for {ticker}: {exc}") from exc
+            print(f"Warning: Network error when listing buckets for {ticker}: {exc}. Using offline data.")
+            return []
         if resp.status_code == 401:
             # Provide a clear message for auth issues
             try:
                 detail = resp.json()
             except ValueError:
                 detail = resp.text
-            raise RuntimeError(f"Unauthorized (401) when listing buckets. Check ALLORA_API_KEY. Detail: {detail}")
+            print(f"Warning: Unauthorized (401) when listing buckets. Check ALLORA_API_KEY. Detail: {detail}. Using offline data.")
+            return []
         resp.raise_for_status()
         buckets = resp.json()["data"]["data"]
         return [b for b in buckets if b["state"] == "ready"]
@@ -201,7 +203,8 @@ class AlloraMLWorkflow:
                     detail = response.json()
                 except ValueError:
                     detail = response.text
-                raise RuntimeError(f"Unauthorized (401) when fetching OHLC. Check ALLORA_API_KEY. Detail: {detail}")
+                print(f"Warning: Unauthorized (401) when fetching OHLC for {ticker}. Check ALLORA_API_KEY. Detail: {detail}. Falling back to offline data.")
+                return self._offline_ohlcv_from_local(ticker, from_date)
             response.raise_for_status()
             payload = response.json()
             if not payload.get("status", False):
