@@ -150,16 +150,24 @@ def predict_forward_log_return(model, x_live: np.ndarray) -> float:
     return pred
 
 ###############################################################################
-# Get Block Height
+# Get Account Sequence
 ###############################################################################
-def get_block_height() -> int:
+def get_account_sequence(wallet: str) -> int:
+    cli = shutil.which("allorad") or shutil.which("allora")
+    if not cli:
+        logger.error("Allora CLI not found")
+        return 0
+    cmd = [cli, "query", "auth", "account", wallet, "--output", "json"]
     try:
-        rpc_url = os.getenv("RPC_URL", "https://allora-rpc.testnet.allora.network/")
-        r = requests.get(f"{rpc_url}/status", timeout=10)
-        r.raise_for_status()
-        return int(r.json()["result"]["sync_info"]["latest_block_height"])
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout)
+            return int(data["account"]["value"]["sequence"])
+        else:
+            logger.error(f"Query failed: {proc.stderr}")
+            return 0
     except Exception as e:
-        logger.error(f"Failed to get block height: {e}")
+        logger.error(f"Query error: {e}")
         return 0
 
 ###############################################################################
@@ -171,7 +179,6 @@ def get_unfulfilled_nonce(topic_id: int) -> int:
         logger.error("Allora CLI not found")
         return 0
     cmd = [cli, "query", "emissions", "unfulfilled-worker-nonces", str(topic_id),
-           "--node", "https://allora-rpc.testnet.allora.network/",
            "--output", "json"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -180,8 +187,26 @@ def get_unfulfilled_nonce(topic_id: int) -> int:
             nonces_data = data.get("nonces", {}).get("nonces", [])
             nonces = [int(item["block_height"]) for item in nonces_data]
             if nonces:
-                # Pick the smallest nonce
-                return min(nonces)
+                # Filter out nonces already submitted by this worker
+                wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
+                filtered_nonces = []
+                for nonce in nonces:
+                    # Check if already submitted
+                    cmd_check = [cli, "query", "emissions", "worker-latest-inference", str(topic_id), wallet, "--output", "json"]
+                    proc_check = subprocess.run(cmd_check, capture_output=True, text=True, timeout=30)
+                    if proc_check.returncode == 0:
+                        data_check = json.loads(proc_check.stdout)
+                        latest_bh = int(data_check.get("latest_inference", {}).get("block_height", 0))
+                        if latest_bh != nonce:
+                            filtered_nonces.append(nonce)
+                    else:
+                        # If check fails, assume not submitted
+                        filtered_nonces.append(nonce)
+                if filtered_nonces:
+                    return min(filtered_nonces)
+                else:
+                    logger.warning("All unfulfilled nonces already submitted by this worker")
+                    return 0
             else:
                 logger.warning("No unfulfilled nonces found")
                 return 0
@@ -200,7 +225,12 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
     wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
     block_height = get_unfulfilled_nonce(topic_id)
     if block_height == 0:
-        logger.error("No unfulfilled nonce available")
+        logger.warning("No unfulfilled nonce available, skipping submission")
+        return False
+
+    sequence = get_account_sequence(wallet)
+    if sequence == 0:
+        logger.error("Cannot get account sequence")
         return False
 
     # Create wallet for signing
@@ -261,7 +291,7 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
 
     cmd = [cli, "tx", "emissions", "insert-worker-payload", wallet, json.dumps(worker_data),
            "--yes", "--keyring-backend", "test", "--node", "https://allora-rpc.testnet.allora.network/",
-           "--chain-id", "allora-testnet-1", "--fees", "2500000uallo", "--broadcast-mode", "sync", "--gas", "250000", "--output", "json"]
+           "--chain-id", "allora-testnet-1", "--fees", "2500000uallo", "--broadcast-mode", "sync", "--gas", "250000", "--sequence", str(sequence), "--output", "json"]
     if dry_run:
         cmd.append("--dry-run")
         logger.info("Dry-run mode: simulating submission")
