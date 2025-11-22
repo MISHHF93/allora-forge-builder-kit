@@ -18,6 +18,8 @@ import time
 import json
 import shutil
 import logging
+import pickle
+import joblib
 from dataclasses import dataclass
 from typing import List, Optional
 from datetime import datetime, timezone
@@ -160,7 +162,7 @@ def add_forward_log_return_target(df: pd.DataFrame, horizon_hours: int) -> pd.Da
 # Model Training
 ###############################################################################
 def train_model(df: pd.DataFrame) -> tuple[object, List[str]]:
-    """Train XGBoost (if available) else Ridge regression."""
+    """Train XGBoost (if available) else Ridge regression. Save model explicitly via pickle and joblib."""
     feature_cols = [c for c in df.columns if c not in {"timestamp", "close", "target"}]
     X = df[feature_cols].values
     y = df["target"].values
@@ -188,6 +190,21 @@ def train_model(df: pd.DataFrame) -> tuple[object, List[str]]:
     # Manual RMSE to avoid version incompatibilities
     rmse = float(np.sqrt(np.mean((y - preds_in_sample) ** 2)))
     logger.info(f"In-sample RMSE: {rmse:.6f}")
+    
+    # Explicitly save model using both pickle and joblib for reliability
+    try:
+        with open("model.pkl", "wb") as f:
+            pickle.dump(model, f)
+        logger.info("✅ Model saved via pickle.dump() to model.pkl")
+    except Exception as e:
+        logger.error(f"❌ pickle.dump() failed: {e}")
+    
+    try:
+        joblib.dump(model, "model.pkl")
+        logger.info("✅ Model saved via joblib.dump() to model.pkl")
+    except Exception as e:
+        logger.error(f"❌ joblib.dump() failed: {e}")
+    
     return model, feature_cols
 
 ###############################################################################
@@ -332,6 +349,18 @@ def run(cfg: Config) -> int:
         feats = generate_features(raw)
         labeled = add_forward_log_return_target(feats, cfg.horizon_hours)
         model, cols = train_model(labeled)
+        
+        # Verify model.pkl exists
+        if not os.path.exists("model.pkl"):
+            logger.error("CRITICAL: model.pkl was not saved. Aborting.")
+            return 1
+        logger.info("✅ model.pkl verified to exist.")
+        
+        # Save features for later use
+        with open("features.json", "w") as f:
+            json.dump(cols, f)
+        logger.info(f"Features saved to features.json ({len(cols)} columns)")
+        
         x_live = prepare_latest_features(feats, cols)  # use freshest feature row
         pred = predict_forward_log_return(model, x_live)
         submitted = submit_prediction(pred, cfg)
