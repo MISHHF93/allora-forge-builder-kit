@@ -2717,8 +2717,11 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
             mnemonic = kf.read().strip()
         if not mnemonic or len(mnemonic.split()) < 12:
             raise RuntimeError("Invalid mnemonic in .allora_key")
+        
+        print(f"DEBUG: Loading mnemonic from {key_path}, words={len(mnemonic.split())}", file=sys.stderr)
 
         wallet_obj = LocalWallet.from_mnemonic(mnemonic, prefix="allo")
+        print(f"DEBUG: LocalWallet created successfully", file=sys.stderr)
         # Try to get canonical address string from wallet_obj if available
         try:
             wal_addr = getattr(wallet_obj, "address", None)
@@ -2726,14 +2729,17 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
                 wal_addr = wal_addr()  # some versions expose address() method
             if isinstance(wal_addr, str) and wal_addr:
                 wallet = wal_addr
-        except Exception:
-            pass
+                print(f"DEBUG: Wallet address: {wallet}", file=sys.stderr)
+        except Exception as e:
+            print(f"DEBUG: Failed to extract wallet address: {e}", file=sys.stderr)
 
         # Build REST clients against the REST base URL (not RPC)
         base_url = _derive_rest_base_from_rpc(DEFAULT_RPC)
+        print(f"DEBUG: REST base URL: {base_url}", file=sys.stderr)
         tx_client = CosmosTxV1Beta1RestServiceClient(base_url)
         auth_client = CosmosAuthV1Beta1RestQueryClient(base_url)
         bank_client = CosmosBankV1Beta1RestQueryClient(base_url)
+        print(f"DEBUG: REST clients initialized", file=sys.stderr)
 
         # Network config (fee params, chain id)
         # Use Lavender Five endpoints for better reliability
@@ -2757,18 +2763,23 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
                 fee_denom="uallo",
                 fee_minimum_gas_price=10.0,
             )
+        
+        print(f"DEBUG: Network config created for chain_id={CHAIN_ID}, fee_denom={net_cfg.fee_denom}, gas_price={net_cfg.fee_minimum_gas_price}", file=sys.stderr)
 
         # Construct TxManager and EmissionsTxs
         tm = TxManager(wallet=wallet_obj, tx_client=tx_client, auth_client=auth_client, bank_client=bank_client, config=net_cfg)
+        print(f"DEBUG: TxManager initialized with wallet={wallet}", file=sys.stderr)
         # Prefer block broadcast to get a synchronous tx response containing txhash; try multiple variants for compatibility
         def _try_set_bcast(mode: str) -> None:
             try:
                 if hasattr(tm, "set_broadcast_mode") and callable(getattr(tm, "set_broadcast_mode")):
                     tm.set_broadcast_mode(mode)  # type: ignore
+                    print(f"DEBUG: Set broadcast_mode method to {mode}", file=sys.stderr)
                 elif hasattr(tm, "broadcast_mode"):
                     setattr(tm, "broadcast_mode", mode)
-            except Exception:
-                pass
+                    print(f"DEBUG: Set broadcast_mode attribute to {mode}", file=sys.stderr)
+            except Exception as e:
+                print(f"DEBUG: Failed to set broadcast mode {mode}: {e}", file=sys.stderr)
         for m in ("block", "BROADCAST_MODE_BLOCK"):
             _try_set_bcast(m)
         # Best-effort fee defaults if supported
@@ -2776,11 +2787,15 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
             try:
                 if hasattr(tm, attr):
                     setattr(tm, attr, val)  # type: ignore
+                    print(f"DEBUG: Set TxManager.{attr}={val}", file=sys.stderr)
             except Exception:
                 pass
         txs = EmissionsTxs(tm)
+        print(f"DEBUG: EmissionsTxs initialized", file=sys.stderr)
     except Exception as e:
-        print(f"ERROR: client-based xgb submit failed: {e}", file=sys.stderr)
+        print(f"ERROR: client-based xgb submit failed during setup: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
         ws = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
         _log_submission(root_dir, ws, topic_id, xgb_val if 'xgb_val' in locals() else None, wallet, None, None, False, 1, "client_submit_exception", pre_log10_loss)
         return 1
@@ -2877,14 +2892,17 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
             try:
                 if hasattr(tm, "set_broadcast_mode") and callable(getattr(tm, "set_broadcast_mode")):
                     tm.set_broadcast_mode(bmode)  # type: ignore
+                    print(f"DEBUG: Set broadcast_mode to {bmode}", file=sys.stderr)
                 elif hasattr(tm, "broadcast_mode"):
                     setattr(tm, "broadcast_mode", bmode)
-            except Exception:
-                pass
+                    print(f"DEBUG: Set broadcast_mode attr to {bmode}", file=sys.stderr)
+            except Exception as e:
+                print(f"DEBUG: Failed to set broadcast mode {bmode}: {e}", file=sys.stderr)
             # SDKs have varied argument names across versions.
             # Try with forecast_elements first; if signature mismatch, retry with forecast.
             try:
                 try:
+                    print(f"DEBUG: Calling insert_worker_payload with forecast_elements (bmode={bmode})", file=sys.stderr)
                     pending = await txs.insert_worker_payload(
                         topic_id=int(topic_id),
                         inference_value=str(xgb_val),
@@ -2893,7 +2911,9 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
                         extra_data=extra_data,
                         proof="",
                     )
-                except TypeError:
+                    print(f"DEBUG: insert_worker_payload returned pending={pending}", file=sys.stderr)
+                except TypeError as te:
+                    print(f"DEBUG: TypeError with forecast_elements, retrying with forecast: {te}", file=sys.stderr)
                     pending = await txs.insert_worker_payload(
                         topic_id=int(topic_id),
                         inference_value=str(xgb_val),
@@ -2902,31 +2922,46 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
                         extra_data=extra_data,
                         proof="",
                     )
+                    print(f"DEBUG: insert_worker_payload (forecast) returned pending={pending}", file=sys.stderr)
                 try:
+                    print(f"DEBUG: Awaiting pending transaction...", file=sys.stderr)
                     last_tx_resp = await pending
+                    print(f"DEBUG: Pending resolved to: {last_tx_resp}", file=sys.stderr)
                     tx_hash = _extract_tx_hash(last_tx_resp)
-                except Exception:
+                    print(f"DEBUG: Extracted tx_hash from response: {tx_hash}", file=sys.stderr)
+                except Exception as e:
+                    print(f"DEBUG: Exception waiting for pending: {e}", file=sys.stderr)
                     # If wait failed, try to extract from pending or manager state
                     try:
                         tx_hash = tx_hash or getattr(pending, "last_tx_hash", None)
-                    except Exception:
-                        pass
+                        if tx_hash:
+                            print(f"DEBUG: Got tx_hash from pending.last_tx_hash: {tx_hash}", file=sys.stderr)
+                    except Exception as ex:
+                        print(f"DEBUG: Failed to get last_tx_hash: {ex}", file=sys.stderr)
                     try:
-                        tx_hash = tx_hash or _extract_tx_hash(getattr(pending, "tx_response", None))
-                    except Exception:
-                        pass
+                        tx_resp = getattr(pending, "tx_response", None)
+                        if tx_resp:
+                            print(f"DEBUG: Found pending.tx_response: {tx_resp}", file=sys.stderr)
+                            tx_hash = tx_hash or _extract_tx_hash(tx_resp)
+                    except Exception as ex:
+                        print(f"DEBUG: Failed to get tx_response: {ex}", file=sys.stderr)
                     try:
                         mgr = getattr(txs, "tx_manager", None)
                         if mgr is not None:
+                            print(f"DEBUG: Found tx_manager: {mgr}", file=sys.stderr)
                             tx_hash = tx_hash or _extract_tx_hash(mgr)
-                    except Exception:
-                        pass
-            except Exception:
+                    except Exception as ex:
+                        print(f"DEBUG: Failed to extract from tx_manager: {ex}", file=sys.stderr)
+            except Exception as e:
                 # Try next mode
+                print(f"DEBUG: insert_worker_payload failed for mode {bmode}: {e}", file=sys.stderr)
                 tx_hash = None
             # Stop if we have a hash
             if tx_hash:
+                print(f"DEBUG: Got tx_hash {tx_hash}, stopping broadcast mode loop", file=sys.stderr)
                 break
+            else:
+                print(f"DEBUG: No tx_hash obtained with broadcast_mode {bmode}, trying next", file=sys.stderr)
         nonce_out: Optional[int] = int(nonce_h) if nonce_h else None
 
         # Enrich: attempt to extract EMA score and reward from the committed tx, else fall back to queries
@@ -3131,11 +3166,14 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
         
         print(f"submit(client): nonce={nonce_dbg} tx_hash={tx_hash or 'null'} code={(chain_code if chain_code is not None else 'n/a')} status={status_msg}")
         if not tx_hash:
-            # Print a short hint to aid future debugging without leaking sensitive data
-            try:
-                print("submit(client): hint=hash_missing_check_broadcast_mode_and_signature")
-            except Exception:
-                pass
+            # Print detailed diagnostics to aid debugging
+            print(f"submit(client): ERROR_DETAIL=no_tx_hash_obtained", file=sys.stderr)
+            print(f"submit(client): Check 1: pending type was {type(pending) if 'pending' in locals() else 'pending not in scope'}", file=sys.stderr)
+            print(f"submit(client): Check 2: last_tx_resp = {last_tx_resp}", file=sys.stderr)
+            print(f"submit(client): Check 3: Verify wallet is properly initialized with mnemonic", file=sys.stderr)
+            print(f"submit(client): Check 4: Verify wallet has sufficient ALLO balance for gas", file=sys.stderr)
+            print(f"submit(client): Check 5: Verify broadcast_mode was set correctly (attempted: {', '.join(broadcast_modes_to_try)})", file=sys.stderr)
+            print(f"submit(client): Diagnostic hint: Transaction may not be signed or broadcasted properly. Check SDK signer configuration.", file=sys.stderr)
         if score_final is not None:
             print(f"submit(client): ema_score={score_final}")
         if isinstance(reward_final, (int, float)):
