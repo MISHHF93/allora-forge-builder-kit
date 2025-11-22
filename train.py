@@ -3449,6 +3449,18 @@ def resolve_wallet() -> None:
 
 
 def run_pipeline(args, cfg, root_dir) -> int:
+    # ===== FRESH RETRAINING: DELETE CACHED MODELS ON STARTUP =====
+    # This ensures the model is retrained from scratch every run with fresh data
+    models_dir = os.path.join(root_dir, "models")
+    bundle_path = os.path.join(models_dir, "xgb_model.pkl")
+    if os.path.exists(bundle_path):
+        try:
+            os.remove(bundle_path)
+            print(f"🗑️  [FRESH RETRAINING] Removed cached model: {bundle_path}")
+            print(f"    → Next run will train model from scratch with latest data")
+        except OSError as e:
+            print(f"⚠️  [FRESH RETRAINING] Failed to remove cached model: {e}")
+    
     data_cfg: Dict[str, Any] = cfg.get("data", {})
     from_month = getattr(args, "from_month", str(data_cfg.get("from_month", "2025-10")))
     non_overlap_hours = max(1, int(data_cfg.get("non_overlap_hours", 48)))

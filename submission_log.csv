@@ -23,3 +23,4 @@ timestamp_utc,topic_id,value,wallet,nonce,tx_hash,success,exit_code,status,log10
 2025-11-21T00:00:00Z,67,0.030005587265,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6612715,null,false,1,no_tx_hash,-1.324888,0,0
 2025-11-21T02:00:00Z,67,0.003795334138,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6613435,null,false,1,no_tx_hash,-2.14555,0,0
 2025-11-22T01:00:00Z,67,0.003795334138,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6628555,8F1DA4588AA99B5799D7ED402A0DDDAD5FC540730A9015892A1CB99B3D8E0CD2,true,0,submitted,-2.14555,0,0
+2025-11-22T02:00:00Z,67,-0.009395102039,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,null,false,0,skipped_window,0,0,0

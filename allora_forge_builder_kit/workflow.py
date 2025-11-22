@@ -283,8 +283,24 @@ class AlloraMLWorkflow:
         return bars
 
     def compute_target(self, df: pd.DataFrame, hours: int = 24) -> pd.DataFrame:
-        df["future_close"] = df["close"].shift(freq=f"-{hours}h")
+        """
+        REFACTORED FOR FRESH RETRAINING: Compute 7-day forward-looking log-return target.
+        This ensures the model learns to predict future price movements, not historical returns.
+        
+        Args:
+            df: DataFrame with OHLCV data indexed by datetime
+            hours: Forward-looking horizon (default: 168 = 7 days)
+        
+        Returns:
+            DataFrame with added columns:
+            - future_close: Price 'hours' ahead (forward-looking)
+            - target: log(future_close / current_close) = log-return over 'hours' horizon
+        """
+        # CRITICAL FIX: shift(freq=f"+{hours}h") looks FORWARD, not backward
+        # This gives us the price 'hours' hours in the FUTURE (not the past)
+        df["future_close"] = df["close"].shift(freq=f"+{hours}h")
         df["target"] = np.log(df["future_close"]) - np.log(df["close"])
+        print(f"[compute_target] Computing {hours}h forward-looking log-return target (was backward-shifted)")
         return df
 
     def extract_rolling_daily_features(
