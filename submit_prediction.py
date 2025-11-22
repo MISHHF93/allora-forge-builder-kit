@@ -296,10 +296,11 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
         logger.error("Allora CLI not found")
         return False
 
-    # Use --from flag with wallet address instead of positional argument
+    # allorad expects: insert-worker-payload [sender] [worker_data] [flags]
     cmd = [cli, "tx", "emissions", "insert-worker-payload",
-           json.dumps(worker_data),
-           "--from", wallet,
+           wallet,                          # positional arg 1: sender
+           json.dumps(worker_data),         # positional arg 2: worker_data
+           "--from", wallet,                # flag: signing wallet
            "--yes",
            "--keyring-backend", "test",
            "--node", "https://allora-rpc.testnet.allora.network/",
