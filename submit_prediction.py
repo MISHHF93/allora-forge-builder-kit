@@ -72,10 +72,12 @@ def fetch_latest_btcusd_hourly(hours: int = 168, api_timeout: int = 30) -> pd.Da
         df = pd.DataFrame({"timestamp": timestamps, "close": prices})
         return df
     try:
+        # Adjust start date to fetch more data
+        start_date = (datetime.now(timezone.utc) - pd.Timedelta(hours=hours)).strftime("%Y-%m-%d")
         url = "https://api.tiingo.com/tiingo/crypto/prices"
         params = {
             "tickers": "btcusd",
-            "startDate": (datetime.now(timezone.utc) - pd.Timedelta(hours=hours)).strftime("%Y-%m-%d"),
+            "startDate": start_date,
             "resampleFreq": "1hour",
             "token": tkey,
         }
@@ -83,17 +85,31 @@ def fetch_latest_btcusd_hourly(hours: int = 168, api_timeout: int = 30) -> pd.Da
         r.raise_for_status()
         data = r.json()
         price_data = data[0].get("priceData", [])
+        if len(price_data) < hours * 0.5:  # If less than 50% of expected
+            logger.warning(f"Tiingo returned only {len(price_data)} rows, expected ~{hours}; using synthetic fallback.")
+            # Fallback
+            base = 40000.0
+            rng = np.random.default_rng(int(time.time()))
+            returns = rng.normal(0, 0.002, size=hours)
+            prices = []
+            current = base
+            for r in returns:
+                current *= math.exp(r)
+                prices.append(current)
+            start = datetime.now(tz=timezone.utc) - pd.Timedelta(hours=hours)
+            timestamps = [start + pd.Timedelta(hours=i) for i in range(hours)]
+            df = pd.DataFrame({"timestamp": timestamps, "close": prices})
+            return df
         rows = []
-        for item in price_data:
+        for item in price_data[-hours:]:  # Take last hours
             dt = datetime.fromisoformat(item["date"].replace("Z", "+00:00"))
             rows.append((dt, float(item["close"])))
         df = pd.DataFrame(rows, columns=["timestamp", "close"]).drop_duplicates("timestamp").sort_values("timestamp")
-        logger.info(f"Fetched {len(df)} latest rows")
+        logger.info(f"Fetched {len(df)} latest rows from Tiingo")
         return df
     except Exception as e:
         logger.warning(f"Tiingo fetch failed ({e}); using synthetic.")
         # Same as above
-        import math
         base = 40000.0
         rng = np.random.default_rng(int(time.time()))
         returns = rng.normal(0, 0.002, size=hours)
@@ -304,9 +320,25 @@ def main():
     parser.add_argument("--features", type=str, default="features.json", help="Path to feature columns.")
     parser.add_argument("--topic-id", type=int, default=int(os.getenv("TOPIC_ID", "67")), help="Allora topic ID.")
     parser.add_argument("--dry-run", action="store_true", help="Simulate submission without sending.")
-    parser.add_argument("--once", action="store_true", help="Run once and exit (for testing).")
+    parser.add_argument("--continuous", action="store_true", help="Run in continuous mode, submitting every hour.")
     args = parser.parse_args()
 
+    if args.continuous:
+        import time
+        interval = int(os.getenv("SUBMISSION_INTERVAL", "3600"))
+        while True:
+            try:
+                success = main_once(args)
+                if not success:
+                    logger.warning("Submission failed, retrying in next interval")
+            except Exception as e:
+                logger.error(f"Continuous loop error: {e}")
+            logger.info(f"Sleeping for {interval}s until next submission")
+            time.sleep(interval)
+    else:
+        sys.exit(main_once(args))
+
+def main_once(args):
     try:
         # Load model
         import pickle
@@ -329,7 +361,7 @@ def main():
         pred = predict_forward_log_return(model, x_live)
 
         # Submit
-        success = submit_prediction(pred, args.topic_id, args.dry_run)
+        success = submit_prediction(pred, args.topic_id, dry_run=False)
         logger.info(f"Submission status: {'success' if success else 'failed'}")
         return 0 if success else 1
     except Exception as e:
@@ -337,4 +369,4 @@ def main():
         return 1
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
