@@ -1,4 +1,3 @@
-print("Executing train.py NOW")
 import os
 import sys
 import json
@@ -44,40 +43,74 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%SZ'
 )
 
+# --- Prediction Validation Functions -----------------------------------------
+
+def validate_predictions(predictions: Any) -> bool:
+    """
+    Validate prediction array before submission.
+    
+    Checks:
+    - Type: must be list, numpy array, or pandas Series
+    - NaNs: no missing/NaN values
+    - Infinities: no infinite values
+    - Range: warn if outside typical log-return range [-10, 10]
+    
+    Args:
+        predictions: Array-like of prediction values
+        
+    Returns:
+        bool: True if valid, raises ValueError if invalid
+        
+    Raises:
+        ValueError: If predictions fail validation
+    """
+    try:
+        # Type check
+        if not isinstance(predictions, (np.ndarray, list, pd.Series)):
+            raise ValueError(f"Predictions must be list/array/Series, got {type(predictions)}")
+        
+        # Convert to numpy for checks
+        pred_array = np.asarray(predictions, dtype=float)
+        
+        # Check for NaNs
+        if np.isnan(pred_array).any():
+            raise ValueError("Predictions contain NaNs - invalid for submission")
+        
+        # Check for infinities
+        if np.isinf(pred_array).any():
+            raise ValueError("Predictions contain infinite values - invalid for submission")
+        
+        # Warn if predictions are out of typical log-return range
+        # Log-returns for BTC typically in range [-5, 5]
+        if np.any(np.abs(pred_array) > 10):
+            logging.warning(
+                f"⚠️  Predictions may be out of expected range: "
+                f"min={np.min(pred_array):.6f}, max={np.max(pred_array):.6f}, "
+                f"mean={np.mean(pred_array):.6f}, std={np.std(pred_array):.6f}"
+            )
+        
+        # Log basic statistics
+        logging.info(
+            f"✅ Predictions valid: shape={pred_array.shape}, "
+            f"mean={np.mean(pred_array):.6f}, std={np.std(pred_array):.6f}, "
+            f"min={np.min(pred_array):.6f}, max={np.max(pred_array):.6f}"
+        )
+        return True
+        
+    except ValueError as e:
+        logging.error(f"❌ Prediction validation failed: {e}")
+        raise
+    except Exception as e:
+        logging.error(f"❌ Unexpected error during prediction validation: {e}")
+        raise ValueError(f"Prediction validation error: {e}")
+
+
 # --- Timezone helpers ---------------------------------------------------------
 # NumPy datetime64 does not preserve timezone information. To avoid warnings
 # like "no explicit representation of timezones available for np.datetime64"
 # and to keep the competition cadence strictly in UTC, we normalize all
 # datetime values to NAIVE UTC (tz stripped) before any NumPy conversion.
 # (removed unused timezone alias)
-
-def _find_num(obj: Any) -> Optional[float]:
-    """Recursively search JSON-like object for a numeric value, preferring known keys."""
-    if isinstance(obj, (int, float)) and math.isfinite(obj):
-        return float(obj)
-    if isinstance(obj, str):
-        try:
-            v = float(obj)
-            return v if math.isfinite(v) else None
-        except Exception:
-            return None
-    if isinstance(obj, dict):
-        # Prefer known keys
-        for k in ("score", "ema", "score_ema", "inferer_score_ema", "value", "result"):
-            if k in obj:
-                v = _find_num(obj[k])
-                if v is not None:
-                    return v
-        for v in obj.values():
-            r = _find_num(v)
-            if r is not None:
-                return r
-    if isinstance(obj, (list, tuple)):
-        for item in obj:
-            r = _find_num(item)
-            if r is not None:
-                return r
-    return None
 
 def _to_naive_utc_index(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
     """Return a DatetimeIndex normalized to naive UTC (tz stripped).
@@ -208,11 +241,11 @@ def _load_pipeline_config(root_dir: str) -> Dict[str, Any]:
 
 CHAIN_ID = os.getenv("ALLORA_CHAIN_ID", "allora-testnet-1")
 DEFAULT_TOPIC_ID = 67
-# Allora Testnet Endpoints
-DEFAULT_RPC = os.getenv("ALLORA_RPC_URL") or os.getenv("ALLORA_NODE") or "https://rpc.ankr.com/allora_testnet"
-DEFAULT_GRPC = os.getenv("ALLORA_GRPC_URL") or "grpc+https://allora-rpc.testnet.allora.network/"
-DEFAULT_REST = os.getenv("ALLORA_REST_URL") or "https://allora-rpc.testnet.allora.network/"
-DEFAULT_WEBSOCKET = os.getenv("ALLORA_WS_URL") or "wss://allora-rpc.testnet.allora.network/websocket"
+# Lavender Five Testnet Endpoints
+DEFAULT_RPC = os.getenv("ALLORA_RPC_URL") or os.getenv("ALLORA_NODE") or "https://testnet-rpc.lavenderfive.com:443/allora/"
+DEFAULT_GRPC = os.getenv("ALLORA_GRPC_URL") or "grpc+https://testnet-allora.lavenderfive.com:443"
+DEFAULT_REST = os.getenv("ALLORA_REST_URL") or "https://testnet-rest.lavenderfive.com:443/allora/"
+DEFAULT_WEBSOCKET = os.getenv("ALLORA_WS_URL") or "wss://testnet-rpc.lavenderfive.com:443/allora/websocket"
 
 # Cache expensive topic configuration fetches so repeated lifecycle checks do not
 # overwhelm the node. This is intentionally simple – the configuration is
@@ -223,9 +256,9 @@ _TOPIC_CONFIG_CACHE: Dict[int, Dict[str, Any]] = {}
 def _derive_rest_base_from_rpc(rpc_url: str) -> str:
     """Best-effort derive REST base URL from an RPC URL.
     Known patterns:
-      - Allora Testnet:
-        RPC: https://rpc.ankr.com/allora_testnet
-        REST: https://allora-rpc.testnet.allora.network/
+      - Lavender Five Testnet:
+        RPC: https://testnet-rpc.lavenderfive.com:443/allora/
+        REST: https://testnet-rest.lavenderfive.com:443/allora/
       - Legacy patterns:
         https://allora-rpc.testnet.allora.network -> https://allora-api.testnet.allora.network
         https://allora-rpc.mainnet.allora.network -> https://allora-api.mainnet.allora.network
@@ -235,21 +268,16 @@ def _derive_rest_base_from_rpc(rpc_url: str) -> str:
     if env_rest:
         return env_rest.rstrip('/')
     
-    # Use Allora testnet REST endpoint by default
+    # Use Lavender Five REST endpoint by default
     if not rpc_url or rpc_url.strip() == "":
         return DEFAULT_REST.rstrip('/')
     
     try:
         u = str(rpc_url or "").strip()
-        # Handle Allora network endpoints
-        if "allora-rpc.testnet.allora.network" in u:
-            return "https://allora-rpc.testnet.allora.network/"
-        if "allora-rpc.mainnet.allora.network" in u:
-            return "https://allora-api.mainnet.allora.network/"
-        # Handle legacy Lavender Five endpoints
+        # Handle Lavender Five endpoints
         if "lavenderfive.com" in u:
             if "testnet-rpc" in u:
-                return "https://allora-rpc.testnet.allora.network/"
+                return "https://testnet-rest.lavenderfive.com:443/allora/"
             elif "mainnet-rpc" in u:
                 return "https://mainnet-rest.lavenderfive.com:443/allora/"
         # Generic replacements for legacy hostnames
@@ -642,6 +670,8 @@ def _current_block_height(timeout: int = 15) -> Optional[int]:
     """Query current block height from the configured RPC via allorad status."""
     cmd = [
         "allorad", "status",
+        "--node", str(DEFAULT_RPC),
+        "--output", "json",
         "--trace",
     ]
     try:
@@ -688,34 +718,14 @@ def _current_block_height(timeout: int = 15) -> Optional[int]:
 # --- Topic lifecycle and emissions params helpers ---------------------------------
 def _run_allorad_json(args: List[str], timeout: int = 20, label: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Run an allorad CLI query with JSON output, --node and --trace, return parsed JSON or None.
-    This is a best-effort helper with improved error handling for connection issues."""
-    # Use proper RPC endpoint for CLI queries
-    cmd = ["allorad"] + [str(a) for a in args] + ["--output", "json", "--trace"]
+    This is a best-effort helper and will not raise on failures."""
+    cmd = ["allorad"] + [str(a) for a in args] + ["--node", str(DEFAULT_RPC), "--output", "json", "--trace"]
     label = label or " ".join(str(a) for a in args)
     try:
         cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
         out = (cp.stdout or cp.stderr or "").strip()
-        
-        # Enhanced error handling for common connectivity issues
-        out_lower = out.lower()
-        if any(err in out_lower for err in ["connection refused", "dial tcp", "no route to host", "network unreachable"]):
-            # Downgrade connection errors to debug level - expected in many environments
-            logging.debug("allorad query (%s): Network connectivity issue, using fallback values", label)
-            return None
-        if any(err in out_lower for err in ["post failed", "failed to query", "rpc error"]):
-            logging.debug("allorad query (%s): RPC communication failed, using fallback values", label)
-            return None
-        if any(err in out_lower for err in ["unknown command", "unknown query", "command not found"]):
-            logging.debug("allorad query (%s): Command not available in this version, using fallback", label)
-            return None
-            
         if cp.returncode not in (0, None):
-            stderr = (cp.stderr or "").strip()
-            msg = stderr.lower()
-            if "unknown command" in msg or "unknown query path" in msg:
-                logging.error("allorad query unsupported (%s): %s", label, stderr)
-            else:
-                logging.warning("allorad query failed (%s): rc=%s stderr=%s", label, cp.returncode, stderr)
+            logging.warning("allorad query failed (%s): rc=%s stderr=%s", label, cp.returncode, (cp.stderr or "").strip())
         if not out:
             logging.debug("allorad query produced no output (%s)", label)
             return None
@@ -730,22 +740,15 @@ def _run_allorad_json(args: List[str], timeout: int = 20, label: Optional[str] =
                 logging.debug("allorad query parsed from stderr (%s) keys=%s", label, list(data.keys()) if isinstance(data, dict) else type(data))
                 return data
             except Exception as exc:
-                # Don't warn for expected connection failures or empty responses
-                if not any(err in out.lower() for err in ["connection refused", "post failed", "dial tcp"]):
-                    if "expecting value: line 1 column 1" in str(exc).lower():
-                        logging.debug("allorad query (%s): Empty response, using fallback values", label)
-                    else:
-                        logging.warning("Failed to parse allorad JSON (%s): %s", label, str(exc)[:200])
+                logging.warning("Failed to parse allorad JSON (%s): %s", label, exc)
                 return None
     except FileNotFoundError:
-        if not getattr(_run_allorad_json, "_warned_missing", False):
-            setattr(_run_allorad_json, "_warned_missing", True)
-            msg = "Warning: allorad CLI not found; lifecycle checks limited"
-            logging.warning(msg)
-            print(msg)
+        msg = "Warning: allorad CLI not found; lifecycle checks limited"
+        logging.warning(msg)
+        print(msg)
         return None
     except subprocess.TimeoutExpired as exc:
-        logging.debug("allorad query timeout (%s): %ss", label, exc.timeout)
+        logging.warning("allorad query timeout (%s): %ss", label, exc.timeout)
         return None
     except Exception as exc:
         logging.warning("allorad query error (%s): %s", label, exc)
@@ -847,34 +850,6 @@ def _get_emissions_params() -> Dict[str, Any]:
     return out
 
 
-def _list_available_topic_ids() -> List[int]:
-    """Return a sorted list of topic IDs visible to the CLI."""
-    payload = _run_allorad_json(["q", "emissions", "topics"], label="topics:list") or {}
-    found: Set[int] = set()
-
-    def _collect(node: Any) -> None:
-        if isinstance(node, dict):
-            # Topics may be keyed by id or be in a list under a key
-            tid = node.get("id") or node.get("topic_id") or node.get("topicId")
-            if tid is not None:
-                try:
-                    found.add(int(tid))
-                except Exception:
-                    pass
-            for v in node.values():
-                _collect(v)
-        elif isinstance(node, list):
-            for it in node:
-                _collect(it)
-
-    _collect(payload)
-
-    if not found and payload:
-        logging.warning("Failed to extract topic IDs from emissions topics payload: %s", list(payload.keys()))
-
-    return sorted(found)
-
-
 def _get_topic_info(topic_id: int) -> Dict[str, Any]:
     """Query topic status/info, normalizing effective_revenue, delegated_stake, reputers_count, weight, last_update."""
 
@@ -907,31 +882,17 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
             entry["status"] = "empty"
         cli_debug.append(entry)
 
-    # If nothing came back from the CLI, surface available topics to aid misconfiguration triage
-    if not cli_results:
-        available_topics = _list_available_topic_ids()
-        if available_topics:
-            cli_results["available_topics"] = available_topics
-            logging.error(
-                "allorad returned no topic data for %s; available topics per CLI: %s",
-                topic_str,
-                available_topics,
-            )
-
     rest_results: Dict[str, Any] = {}
     rest_debug: List[Dict[str, Any]] = []
-    rest_base_raw = _derive_rest_base_from_rpc(DEFAULT_RPC).rstrip("/")
-    rest_prefix = rest_base_raw
-    if rest_prefix and not rest_prefix.endswith("/allora"):
-        rest_prefix = f"{rest_prefix}/allora"
+    rest_base = _derive_rest_base_from_rpc(DEFAULT_RPC)
     rest_paths: List[Tuple[str, str]] = []
-    if rest_prefix:
+    if rest_base:
         rest_paths = [
-            ("rest_topic", f"{rest_prefix}/emissions/topic/{topic_str}"),
-            ("rest_topic_status", f"{rest_prefix}/emissions/topic/{topic_str}/status"),
-            ("rest_topic_stake", f"{rest_prefix}/emissions/topic/{topic_str}/stake"),
-            ("rest_topic_reputers", f"{rest_prefix}/emissions/topic/{topic_str}/reputers"),
-            ("rest_topic_summary", f"{rest_prefix}/emissions/topic/{topic_str}"),
+            ("rest_topic", f"{rest_base}/allora/emissions/topic/{topic_str}"),
+            ("rest_topic_status", f"{rest_base}/allora/emissions/topic/{topic_str}/status"),
+            ("rest_topic_stake", f"{rest_base}/allora/emissions/topic/{topic_str}/stake"),
+            ("rest_topic_reputers", f"{rest_base}/allora/emissions/topic/{topic_str}/reputers"),
+            ("rest_topic_summary", f"{rest_base}/emissions/topic/{topic_str}"),
         ]
 
     # Track 501 errors for throttling
@@ -945,16 +906,16 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
                 resp = requests.get(url, timeout=8)
                 attempt_entry.setdefault("attempts", []).append({"attempt": attempt + 1, "status_code": resp.status_code})
                 if resp.status_code != 200:
-                    # Handle 501 (Not Implemented) and 500 (Server Error) gracefully - downgrade to INFO
-                    if resp.status_code in (501, 500):
+                    # Handle 501 (Not Implemented) gracefully - downgrade to INFO
+                    if resp.status_code == 501:
                         rest_501_count += 1
                         rest_501_endpoints.add(label)
                         # Only log first occurrence per endpoint at INFO level
                         if attempt == 0:
-                            logging.info("REST endpoint not implemented/server error (%s): status=%s (using fallback)", label, resp.status_code)
-                        attempt_entry["status"] = "not_implemented" if resp.status_code == 501 else "server_error"
+                            logging.info("REST endpoint not implemented (%s): status=501 (using fallback)", label)
+                        attempt_entry["status"] = "not_implemented"
                         attempt_entry["fallback"] = True
-                        break  # Don't retry 5xx errors - they won't succeed
+                        break  # Don't retry 501s - they won't succeed
                     else:
                         logging.warning("REST query non-200 (%s): status=%s", label, resp.status_code)
                     continue
@@ -1277,18 +1238,22 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
         # Check if topic-quantile-reputer-score command returned data
         quantile_result = None
         try:
-            quantile_payload = _run_allorad_json(
-                ["q", "emissions", "topic-quantile-reputer-score", topic_str],
-                label=f"topic_quantile_reputer_score:{topic_str}",
+            # Try the quantile query that we know works
+            node_param = "--node https://allora-testnet-rpc.polkachu.com:443"
+            cmd = f"allorad q emissions topic-quantile-reputer-score {topic_str} {node_param}"
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=15
             )
-            quantile_value = None
-            if isinstance(quantile_payload, dict):
-                quantile_value = _deep_find_any(quantile_payload, ["value", "score", "quantile"])
-            qf = _to_float(quantile_value)
-            if qf is not None and qf > 0:
-                quantile_result = True
-        except Exception as exc:
-            logging.debug("Quantile reputer score probe failed for topic %s: %s", topic_str, exc)
+            if result.returncode == 0 and result.stdout.strip():
+                import json
+                try:
+                    quantile_data = json.loads(result.stdout.strip())
+                    if quantile_data.get("value") and float(quantile_data["value"]) > 0:
+                        quantile_result = True
+                except:
+                    pass
+        except Exception:
+            pass
         
         # Estimate reputer count based on evidence
         if quantile_result or (active_reputer_quantile and _to_float(active_reputer_quantile) > 0):
@@ -1375,7 +1340,6 @@ def _get_topic_info(topic_id: int) -> Dict[str, Any]:
         "required_delegated_stake": _to_float(required_delegate_candidate),
         "min_delegated_stake": _first_positive_float(min_stake_candidate, required_delegate_candidate, min_stake_env, network_min_stake),
         "query_debug": combined.get("query_debug"),
-        "available_topics": cli_results.get("available_topics"),
         "fallback_mode": {
             "rest_501_count": rest_501_count,
             "rest_501_endpoints": list(rest_501_endpoints),
@@ -1422,25 +1386,7 @@ def _fetch_topic_config(topic_id: int) -> Dict[str, Any]:
     (fields may be None if not present)."""
     # Try dedicated topic queries first
     j1 = _run_allorad_json(["q", "emissions", "topic", str(int(topic_id))]) or {}
-    j2 = _run_allorad_json(["q", "emissions", "topic", str(int(topic_id))]) or {}
-    
-    # Check if we got empty responses (CLI connectivity issues)
-    if not j1 and not j2:
-        logging.debug(f"Topic {topic_id}: CLI queries returned empty, using fallback configuration")
-        # Return sensible defaults when CLI is unavailable
-        return {
-            "metadata": "BTC/USD 7-day prediction (fallback)",
-            "loss_method": "ptanh",
-            "epoch_length": 3600,  # 1 hour
-            "ground_truth_lag": 3600,  # 1 hour  
-            "worker_submission_window": 600,  # 10 minutes
-            "p_norm": 3.0,
-            "alpha_regret": 0.1,
-            "allow_negative": True,
-            "epsilon": 1e-6,
-            "_fallback": True,
-            "raw": {}
-        }
+    j2 = _run_allorad_json(["q", "emissions", "topic-info", str(int(topic_id))]) or {}
     merged: Dict[str, Any] = {"a": j1, "b": j2}
     def _deep_find(obj: Any, *names: str) -> Optional[Any]:
         names_l = [n for n in names if n]
@@ -1506,59 +1452,42 @@ def _validate_topic_creation_and_funding(topic_id: int, expected: Dict[str, Any]
     spec = _fetch_topic_config(topic_id)
     info = _get_topic_info(topic_id)
     mismatches: List[str] = []
-    
-    # Check if we're in fallback mode (CLI/REST endpoints failing)
-    fallback_info = info.get("fallback_mode", {}) if isinstance(info, dict) else {}
-    in_fallback_mode = False
-    is_config_fallback = spec.get("_fallback", False)
-    if isinstance(fallback_info, dict):
-        cli_failed = fallback_info.get("cli_count", 0) > 0
-        rest_501_count = fallback_info.get("rest_501_count", 0) > 0
-        in_fallback_mode = cli_failed or rest_501_count or is_config_fallback
-    
-    if in_fallback_mode:
-        logging.info(f"Topic {topic_id}: Operating in fallback mode - CLI/REST data unavailable")
-    
     # ID check
     try:
         if int(expected.get("topic_id", topic_id)) != int(topic_id):
             mismatches.append("topic_id_mismatch")
     except Exception:
         pass
-        
-    # Skip detailed validation checks if in fallback mode - we can't reliably validate
-    if not in_fallback_mode:
-        # Metadata contains
-        metas = expected.get("metadata_substr") or []
-        if metas and isinstance(spec.get("metadata"), str):
-            txt = spec.get("metadata") or ""
-            for sub in metas:
-                if str(sub).lower() not in txt.lower():
-                    mismatches.append(f"metadata_missing:{sub}")
-        # Loss method
-        lm_ok = False
-        lm = (spec.get("loss_method") or "").lower() if spec.get("loss_method") else ""
-        exp_lm: List[str] = [s.lower() for s in (expected.get("loss_method") or [])]
-        if lm and exp_lm:
-            lm_ok = any(e in lm for e in exp_lm)
-            if not lm_ok:
-                mismatches.append(f"loss_method:{lm}")
-        # p-norm
-        pn = spec.get("p_norm")
-        if pn is not None and expected.get("p_norm") is not None and abs(float(pn) - float(expected["p_norm"])) > 1e-6:
-            mismatches.append(f"p_norm:{pn}")
-        # allow_negative
-        an = spec.get("allow_negative")
-        if an is not None and expected.get("allow_negative") is not None and bool(an) != bool(expected["allow_negative"]):
-            mismatches.append(f"allow_negative:{an}")
-        # presence checks
-        if expected.get("require_epoch_length") and not spec.get("epoch_length"):
-            mismatches.append("missing:epoch_length")
-        if expected.get("require_ground_truth_lag") and not spec.get("ground_truth_lag"):
-            mismatches.append("missing:ground_truth_lag")
-        if expected.get("require_worker_submission_window") and not spec.get("worker_submission_window"):
-            mismatches.append("missing:worker_submission_window")
-    
+    # Metadata contains
+    metas = expected.get("metadata_substr") or []
+    if metas and isinstance(spec.get("metadata"), str):
+        txt = spec.get("metadata") or ""
+        for sub in metas:
+            if str(sub).lower() not in txt.lower():
+                mismatches.append(f"metadata_missing:{sub}")
+    # Loss method
+    lm_ok = False
+    lm = (spec.get("loss_method") or "").lower() if spec.get("loss_method") else ""
+    exp_lm: List[str] = [s.lower() for s in (expected.get("loss_method") or [])]
+    if lm and exp_lm:
+        lm_ok = any(e in lm for e in exp_lm)
+        if not lm_ok:
+            mismatches.append(f"loss_method:{lm}")
+    # p-norm
+    pn = spec.get("p_norm")
+    if pn is not None and expected.get("p_norm") is not None and abs(float(pn) - float(expected["p_norm"])) > 1e-6:
+        mismatches.append(f"p_norm:{pn}")
+    # allow_negative
+    an = spec.get("allow_negative")
+    if an is not None and expected.get("allow_negative") is not None and bool(an) != bool(expected["allow_negative"]):
+        mismatches.append(f"allow_negative:{an}")
+    # presence checks
+    if expected.get("require_epoch_length") and not spec.get("epoch_length"):
+        mismatches.append("missing:epoch_length")
+    if expected.get("require_ground_truth_lag") and not spec.get("ground_truth_lag"):
+        mismatches.append("missing:ground_truth_lag")
+    if expected.get("require_worker_submission_window") and not spec.get("worker_submission_window"):
+        mismatches.append("missing:worker_submission_window")
     # Funding / incentives check (effective_revenue > 0)
     funded = False
     try:
@@ -1566,22 +1495,7 @@ def _validate_topic_creation_and_funding(topic_id: int, expected: Dict[str, Any]
         funded = bool(eff is not None and float(eff) > 0.0)
     except Exception:
         funded = False
-    
-    # In fallback mode, be very permissive to prevent blocking submissions
-    if in_fallback_mode:
-        # Always assume OK in fallback mode unless there are critical issues
-        ok = True  # Be permissive - we have fallback config
-        # For funding, assume funded in fallback mode
-        if not funded:
-            funded = True  # Assume funded when we can't determine
-            logging.info(f"Topic {topic_id}: Assuming funded in fallback mode (revenue/validation data unavailable)")
-        # Clear mismatches in fallback mode as they're likely due to missing data
-        if mismatches:
-            logging.debug(f"Topic {topic_id}: Ignoring validation mismatches in fallback mode: {mismatches}")
-            mismatches = []  # Clear mismatches to allow submission
-    else:
-        ok = (len(mismatches) == 0) and funded
-    
+    ok = (len(mismatches) == 0) and funded
     result = {
         "ok": bool(ok),
         "funded": bool(funded),
@@ -1746,7 +1660,7 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
         "last_epoch_end": last_epoch_end,
         "current_block": current_block_height,
         "blocks_since_last_epoch_end": blocks_since_epoch,
-               "epoch_progress": epoch_progress,
+        "epoch_progress": epoch_progress,
         "blocks_remaining_in_epoch": blocks_remaining,
         "confidence": bool(window_confident),
         "is_open": window_open if window_open is not None else None,
@@ -1776,7 +1690,7 @@ def _compute_lifecycle_state(topic_id: int) -> Dict[str, Any]:
     inactive_reasons: List[str] = []
     inactive_codes: List[str] = []
     
-    # Check if we're in fallback mode (REST endpoints returned 501 or 500)
+    # Check if we're in fallback mode (REST endpoints returned 501)
     fallback_info = info.get("fallback_mode", {})
     in_fallback_mode = fallback_info.get("rest_501_count", 0) > 0
     
@@ -1978,146 +1892,6 @@ def _is_nullish(x: Any) -> bool:
     return False
 
 
-def _query_ema_score(topic: int, wallet: Optional[str], retries: int = 3, delay_s: float = 2.0, timeout: int = 15) -> Optional[float]:
-    """Best-effort query of EMA score via allorad CLI. Returns float or None on failure.
-    Tries JSON parsing first, then regex fallback. Retries a couple times for eventual consistency.
-    """
-    if not wallet:
-        return None
-    cmd = [
-        "allorad", "q", "emissions", "inferer-score-ema", str(int(topic)), str(wallet),
-        "--trace",
-    ]
-    def _try_once() -> Optional[float]:
-        try:
-            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        except FileNotFoundError:
-            return None
-        except Exception:
-            return None
-        out = (cp.stdout or "").strip()
-        if cp.returncode != 0 and not out:
-            out = (cp.stderr or "").strip()
-        # Attempt JSON parse
-        try:
-            j = json.loads(out)
-            return _find_num(j)
-        except Exception:
-            pass
-        # Regex fallback
-        for pat in [r"score[^0-9\-]*([0-9\-\.e\+]+)", r"ema[^0-9\-]*([0-9\-\.e\+]+)", r"([0-9\-\.e\+]+)"]:
-            m = re.search(pat, out, re.IGNORECASE)
-            if m:
-                try:
-                    v = float(m.group(1))
-                    return v if np.isfinite(v) else None
-                except Exception:
-                    continue
-        return None
-
-    for _ in range(max(1, int(retries) + 1)):
-        val = _try_once()
-        if val is not None:
-            return val
-        try:
-            time.sleep(float(delay_s))
-        except Exception:
-            pass
-    return None
-
-
-def _query_reward_for_tx(wallet: Optional[str], tx_hash: Optional[str], denom_hint: Optional[str] = None, retries: int = 2, delay_s: float = 2.0, timeout: int = 20) -> Optional[float]:
-    """Query the transaction by hash and extract reward tokens received by the wallet.
-    Heuristics:
-      - Inspect transfer/coin_received events with recipient==wallet
-      - Parse amounts like '123uallo' (Cosmos SDK coin string), sum matching 'allo' denoms
-      - Convert micro-denoms (prefix 'u') to base by dividing by 1e6
-    Returns amount in base units (e.g., ALLO), or None if not found yet.
-    """
-    if not wallet or not tx_hash:
-        return None
-    cmd = ["allorad", "q", "tx", str(tx_hash), "--trace"]
-
-    def _parse_amounts(s: str) -> float:
-        # Supports comma-separated coins
-        total = 0.0
-        for part in re.split(r"[,\s]+", s.strip()):
-            if not part:
-                continue
-            m = re.match(r"^([0-9]+)([a-zA-Z/\.]+)$", part)
-            if not m:
-                # Try float amount then unit
-                m2 = re.match(r"^([0-9]*\.?[0-9]+)([a-zA-Z/\.]+)$", part)
-                if not m2:
-                    continue
-                amt = float(m2.group(1))
-                unit = m2.group(2)
-            else:
-                amt = float(m.group(1))
-                unit = m.group(2)
-            unit_low = unit.lower()
-            if denom_hint and denom_hint.lower() in unit_low:
-                scale = 1e6 if unit_low.startswith("u") else 1.0
-                total += (amt / scale)
-            elif "allo" in unit_low:
-                scale = 1e6 if unit_low.startswith("u") else 1.0
-                total += (amt / scale)
-        return total
-
-    def _try_once() -> Optional[float]:
-        try:
-            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        except FileNotFoundError:
-            return None
-        except Exception:
-            return None
-        out = (cp.stdout or "").strip()
-        if not out:
-            out = (cp.stderr or "").strip()
-        try:
-            j = json.loads(out)
-        except Exception:
-            # regex amount fallback if any
-            return None
-        # Cosmos tx JSON usually has logs -> [ { events: [ {type, attributes:[{key,value}]} ] } ]
-        try:
-            logs = j.get("logs") or []
-            acc = 0.0
-            for lg in logs:
-                events = lg.get("events") or []
-                for ev in events:
-                    et = (ev.get("type") or "").lower()
-                    attrs = ev.get("attributes") or []
-                    # Build a small dict of attributes
-                    ad: Dict[str, List[str]] = {}
-                    for a in attrs:
-                        k = str(a.get("key", "")).lower()
-                        v = str(a.get("value", ""))
-                        ad.setdefault(k, []).append(v)
-                    recipients = [r for r in ad.get("recipient", []) if r]
-                    amounts = ad.get("amount", [])
-                    # Both transfer and coin_received are relevant in Cosmos
-                    if (et in ("transfer", "coin_received") or "reward" in et) and recipients:
-                        if wallet in recipients:
-                            for am in amounts:
-                                acc += _parse_amounts(am)
-            if acc > 0:
-                return float(acc)
-        except Exception:
-            return None
-        return None
-
-    for _ in range(max(1, int(retries) + 1)):
-        val = _try_once()
-        if val is not None:
-            return val
-        try:
-            time.sleep(float(delay_s))
-        except Exception:
-            pass
-    return None
-
-
 def _post_submit_backfill(root_dir: str, tail: int = 20, attempts: int = 3, delay_s: float = 2.0) -> None:
     """After a successful submit, backfill score/reward directly by querying REST API and updating CSV.
     Non-fatal on failures; best-effort with retries for eventual consistency."""
@@ -2177,6 +1951,7 @@ def _post_submit_backfill(root_dir: str, tail: int = 20, attempts: int = 3, dela
                         if topic and wallet:
                             cmd = [
                                 "allorad", "q", "emissions", "inferer-score-ema", str(int(float(topic))), str(wallet),
+                                "--node", str(DEFAULT_RPC), "--output", "json",
                             ]
                             try:
                                 cp = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
@@ -2184,6 +1959,31 @@ def _post_submit_backfill(root_dir: str, tail: int = 20, attempts: int = 3, dela
                                 got_val: Optional[float] = None
                                 try:
                                     j = json.loads(out_text)
+                                    def _find_num(obj: Any) -> Optional[float]:
+                                        if isinstance(obj, (int, float)) and math.isfinite(obj):
+                                            return float(obj)
+                                        if isinstance(obj, str):
+                                            try:
+                                                v = float(obj)
+                                                return v if math.isfinite(v) else None
+                                            except Exception:
+                                                return None
+                                        if isinstance(obj, dict):
+                                            for k in ("score", "ema", "score_ema", "inferer_score_ema", "value", "result"):
+                                                if k in obj:
+                                                    v = _find_num(obj[k])
+                                                    if v is not None:
+                                                        return v
+                                            for v in obj.values():
+                                                r2 = _find_num(v)
+                                                if r2 is not None:
+                                                    return r2
+                                        if isinstance(obj, (list, tuple)):
+                                            for v in obj:
+                                                r2 = _find_num(v)
+                                                if r2 is not None:
+                                                    return r2
+                                        return None
                                     got_val = _find_num(j)
                                 except Exception:
                                     got_val = None
@@ -2260,7 +2060,170 @@ async def _submit_with_sdk(topic_id: int, value: float, timeout_s: int, max_retr
     intended_env = os.getenv("ALLORA_WALLET_ADDR", "").strip() or None
     wallet_str: Optional[str] = intended_env
 
+    def _query_ema_score(topic: int, wallet: Optional[str], retries: int = 2, delay_s: float = 2.0, timeout: int = 15) -> Optional[float]:
+        """Best-effort query of EMA score via allorad CLI. Returns float or None on failure.
+        Tries JSON parsing first, then regex fallback. Retries a couple times for eventual consistency.
+        """
+        if not wallet:
+            return None
+        cmd = [
+            "allorad", "q", "emissions", "inferer-score-ema", str(int(topic)), str(wallet),
+            "--node", str(DEFAULT_RPC), "--chain-id", str(CHAIN_ID), "--output", "json", "--trace",
+        ]
+        def _try_once() -> Optional[float]:
+            try:
+                cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            except FileNotFoundError:
+                return None
+            except Exception:
+                return None
+            out = (cp.stdout or "").strip()
+            if cp.returncode != 0 and not out:
+                out = (cp.stderr or "").strip()
+            # Attempt JSON parse
+            try:
+                j = json.loads(out)
+                def _find_num(obj: Any) -> Optional[float]:
+                    if isinstance(obj, (int, float)) and np.isfinite(obj):
+                        return float(obj)
+                    if isinstance(obj, str):
+                        try:
+                            v = float(obj)
+                            return v if np.isfinite(v) else None
+                        except Exception:
+                            return None
+                    if isinstance(obj, dict):
+                        # Prefer known keys
+                        for k in ("score", "ema", "score_ema", "inferer_score_ema", "value", "result"):
+                            if k in obj:
+                                v = _find_num(obj[k])
+                                if v is not None:
+                                    return v
+                        for v in obj.values():
+                            r = _find_num(v)
+                            if r is not None:
+                                return r
+                    if isinstance(obj, (list, tuple)):
+                        for v in obj:
+                            r = _find_num(v)
+                            if r is not None:
+                                return r
+                    return None
+                val = _find_num(j)
+                if val is not None and np.isfinite(val):
+                    return float(val)
+            except Exception:
+                pass
+            # Regex fallback
+            m = re.search(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", out)
+            if m:
+                try:
+                    v = float(m.group(1))
+                    return v if np.isfinite(v) else None
+                except Exception:
+                    return None
+            return None
+        # Retry loop
+        for i in range(max(1, int(retries) + 1)):
+            val = _try_once()
+            if val is not None:
+                return val
+            try:
+                time.sleep(float(delay_s))
+            except Exception:
+                pass
+        return None
 
+    def _query_reward_for_tx(wallet: Optional[str], tx_hash: Optional[str], denom_hint: Optional[str] = None, retries: int = 2, delay_s: float = 2.0, timeout: int = 20) -> Optional[float]:
+        """Query the transaction by hash and extract reward tokens received by the wallet.
+        Heuristics:
+          - Inspect transfer/coin_received events with recipient==wallet
+          - Parse amounts like '123uallo' (Cosmos SDK coin string), sum matching 'allo' denoms
+          - Convert micro-denoms (prefix 'u') to base by dividing by 1e6
+        Returns amount in base units (e.g., ALLO), or None if not found yet.
+        """
+        if not wallet or not tx_hash:
+            return None
+        cmd = ["allorad", "q", "tx", str(tx_hash), "--node", str(DEFAULT_RPC), "--output", "json", "--trace"]
+
+        def _parse_amounts(s: str) -> float:
+            # Supports comma-separated coins
+            total = 0.0
+            for part in re.split(r"[,\s]+", s.strip()):
+                if not part:
+                    continue
+                m = re.match(r"^([0-9]+)([a-zA-Z/\.]+)$", part)
+                if not m:
+                    # Try float amount then unit
+                    m2 = re.match(r"^([0-9]*\.?[0-9]+)([a-zA-Z/\.]+)$", part)
+                    if not m2:
+                        continue
+                    amt = float(m2.group(1))
+                    unit = m2.group(2)
+                else:
+                    amt = float(m.group(1))
+                    unit = m.group(2)
+                unit_low = unit.lower()
+                if denom_hint and denom_hint.lower() in unit_low:
+                    scale = 1e6 if unit_low.startswith("u") else 1.0
+                    total += (amt / scale)
+                elif "allo" in unit_low:
+                    scale = 1e6 if unit_low.startswith("u") else 1.0
+                    total += (amt / scale)
+            return total
+
+        def _try_once() -> Optional[float]:
+            try:
+                cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            except FileNotFoundError:
+                return None
+            except Exception:
+                return None
+            out = (cp.stdout or "").strip()
+            if not out:
+                out = (cp.stderr or "").strip()
+            try:
+                j = json.loads(out)
+            except Exception:
+                # regex amount fallback if any
+                return None
+            # Cosmos tx JSON usually has logs -> [ { events: [ {type, attributes:[{key,value}]} ] } ]
+            try:
+                logs = j.get("logs") or []
+                acc = 0.0
+                for lg in logs:
+                    events = lg.get("events") or []
+                    for ev in events:
+                        et = (ev.get("type") or "").lower()
+                        attrs = ev.get("attributes") or []
+                        # Build a small dict of attributes
+                        ad: Dict[str, List[str]] = {}
+                        for a in attrs:
+                            k = str(a.get("key", "")).lower()
+                            v = str(a.get("value", ""))
+                            ad.setdefault(k, []).append(v)
+                        recipients = [r for r in ad.get("recipient", []) if r]
+                        amounts = ad.get("amount", [])
+                        # Both transfer and coin_received are relevant in Cosmos
+                        if (et in ("transfer", "coin_received") or "reward" in et) and recipients:
+                            if wallet in recipients:
+                                for am in amounts:
+                                    acc += _parse_amounts(am)
+                if acc > 0:
+                    return float(acc)
+            except Exception:
+                return None
+            return None
+
+        for _ in range(max(1, int(retries) + 1)):
+            val = _try_once()
+            if val is not None:
+                return val
+            try:
+                time.sleep(float(delay_s))
+            except Exception:
+                pass
+        return None
 
     while attempt <= max_retries:
         attempt += 1
@@ -2424,7 +2387,7 @@ async def _submit_with_sdk(topic_id: int, value: float, timeout_s: int, max_retr
                     if not done:
                         # timed out overall
                         ws = _window_start_utc(cadence_s=cadence_s)
-                        _log_submission(root_dir, ws, topic_id, value, wallet_str, None, None, False, 2, "timeout", last_loss, last_score, last_reward)
+                        _log_submission(root_dir, ws, topic_id, value, wallet_str, last_nonce, last_tx, False, 2, "timeout", last_loss, last_score, last_reward)
                         return 2
                     for fut in done:
                         try:
@@ -2620,37 +2583,12 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
     # Resolve wallet (env/log placeholder until we construct LocalWallet below)
     wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip() or _resolve_wallet_for_logging(root_dir)
 
-    # Get topic info for epoch nonce
-    info = _get_topic_info(topic_id)
-    raw_info = info.get("raw") if isinstance(info, dict) else None
-    last_epoch_candidate = None
-    if isinstance(raw_info, dict):
-        last_epoch_candidate = _deep_find_any(
-            raw_info,
-            [
-                "epoch_last_ended",
-                "epochLastEnded",
-                "last_epoch_ended",
-                "lastEpochEnded",
-                "epoch_last_end",
-                "epochLastEnd",
-                "last_epoch",
-                "epoch_last",
-            ],
-        )
-    last_epoch_end = None
-    try:
-        last_epoch_end = int(str(last_epoch_candidate)) if last_epoch_candidate is not None else None
-    except Exception:
-        last_epoch_end = None
-    epoch_nonce = last_epoch_end if last_epoch_end is not None else None
-
     # Resolve nonce helpers. We'll poll for the worker window to open via can-submit,
     # then select the fresh unfulfilled nonce for this topic. Fallback to current height.
     def _query_unfulfilled_nonce(topic: int, wal: Optional[str], timeout: int = 20) -> Optional[int]:
         cmd = [
             "allorad", "q", "emissions", "unfulfilled-worker-nonces", str(int(topic)),
-            "--trace",
+            "--node", str(DEFAULT_RPC), "--output", "json", "--trace",
         ]
         try:
             cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -2705,7 +2643,7 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
     def _query_topic_last_worker_commit_nonce(topic: int, timeout: int = 15) -> Optional[int]:
         cmd = [
             "allorad", "q", "emissions", "topic-last-worker-commit", str(int(topic)),
-            "--trace",
+            "--node", str(DEFAULT_RPC), "--output", "json", "--trace",
         ]
         try:
             cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -2729,7 +2667,7 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
             return None
         cmd = [
             "allorad", "q", "emissions", "can-submit-worker-payload", str(int(topic)), str(wal),
-            "--trace",
+            "--node", str(DEFAULT_RPC), "--chain-id", str(CHAIN_ID), "--output", "json", "--trace",
         ]
         try:
             cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -2802,10 +2740,10 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
         if str(CHAIN_ID) == "allora-testnet-1":
             net_cfg = AlloraNetworkConfig(
                 chain_id=str(CHAIN_ID),
-                url=base_url,
-                websocket_url=None,
+                url=DEFAULT_GRPC,
+                websocket_url=DEFAULT_WEBSOCKET,
                 fee_denom="uallo",
-                fee_minimum_gas_price=20.0,
+                fee_minimum_gas_price=10.0,
             )
         elif str(CHAIN_ID) == "allora-mainnet-1":
             net_cfg = AlloraNetworkConfig.mainnet()
@@ -2857,11 +2795,8 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
         if isinstance(unf, int) and unf > 0:
             chosen_nonce = int(unf)
             break
-        # If we can submit but unfulfilled list isn't populated yet, use epoch nonce or current height
+        # If we can submit but unfulfilled list isn't populated yet, use current height
         if can_sub is True:
-            if epoch_nonce is not None:
-                chosen_nonce = epoch_nonce
-                break
             h = _current_block_height()
             if isinstance(h, int) and h > 0:
                 chosen_nonce = int(h)
@@ -2876,7 +2811,6 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
     if chosen_nonce is None:
         chosen_nonce = (
             _query_unfulfilled_nonce(int(topic_id), wallet)
-            or epoch_nonce
             or _current_block_height()
             or _query_topic_last_worker_commit_nonce(int(topic_id))
             or 0
@@ -2904,9 +2838,7 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
         def _extract_tx_hash(obj: Any, depth: int = 0) -> Optional[str]:
             if obj is None or depth > 3:
                 return None
-            # Check common transaction hash keys
-            hash_keys = ["txhash", "hash", "tx_hash", "transactionHash", "txHash", "transaction_hash"]
-            for key in hash_keys:
+            for key in ("txhash", "hash", "tx_hash"):
                 try:
                     if isinstance(obj, dict) and key in obj and isinstance(obj[key], str) and len(obj[key]) >= 64:
                         return obj[key]
@@ -2916,7 +2848,6 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
                             return val
                 except Exception:
                     pass
-            # Check nested tx_response
             try:
                 if isinstance(obj, dict) and "tx_response" in obj:
                     r = _extract_tx_hash(obj["tx_response"], depth + 1)
@@ -2931,26 +2862,6 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
                         return r
             except Exception:
                 pass
-            # Check for result or data fields that might contain the hash
-            try:
-                if isinstance(obj, dict):
-                    for key in ["result", "data", "response", "tx"]:
-                        if key in obj:
-                            r = _extract_tx_hash(obj[key], depth + 1)
-                            if r:
-                                return r
-            except Exception:
-                pass
-            # Check if obj is a string that might be the hash
-            try:
-                if isinstance(obj, str) and len(obj) >= 64 and obj.replace("0x", "").isalnum():
-                    # Check if it's a valid hex string
-                    hash_candidate = obj.replace("0x", "")
-                    if len(hash_candidate) == 64 and all(c in "0123456789abcdefABCDEF" for c in hash_candidate):
-                        return hash_candidate
-            except Exception:
-                pass
-            # Regex search for 64-character hex strings
             try:
                 s = str(obj)
                 m = re.search(r"\b([0-9A-Fa-f]{64})\b", s)
@@ -3002,18 +2913,6 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
                         pass
                     try:
                         tx_hash = tx_hash or _extract_tx_hash(getattr(pending, "tx_response", None))
-                    except Exception:
-                        pass
-                    try:
-                        tx_hash = tx_hash or getattr(pending, "hash", None)
-                    except Exception:
-                        pass
-                    try:
-                        tx_hash = tx_hash or getattr(pending, "txhash", None)
-                    except Exception:
-                        pass
-                    try:
-                        tx_hash = tx_hash or getattr(pending, "tx_hash", None)
                     except Exception:
                         pass
                     try:
@@ -3093,7 +2992,60 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
                                         reward_amt = (reward_amt or 0.0) + (amt / scale)
             return score_val, reward_amt
 
-
+        # Reusable EMA score query with retries (inferer role)
+        def _query_ema_score_retry(topic: int, wal: Optional[str], retries: int = 3, delay_s: float = 2.0, timeout: int = 15) -> Optional[float]:
+            if not wal:
+                return None
+            cmd = [
+                "allorad", "q", "emissions", "inferer-score-ema", str(int(topic)), str(wal),
+                "--node", str(DEFAULT_RPC), "--chain-id", str(CHAIN_ID), "--output", "json", "--trace",
+            ]
+            def _try_once() -> Optional[float]:
+                try:
+                    cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                except Exception:
+                    return None
+                out = (cp.stdout or cp.stderr or "").strip()
+                try:
+                    j = json.loads(out)
+                    # Probe common numeric fields; otherwise deep search for first float
+                    for key in ("score", "ema", "score_ema", "inferer_score_ema", "value", "result"):
+                        if key in j:
+                            v = _parse_float_any(j.get(key))
+                            if v is not None:
+                                return v
+                    # Deep search
+                    def _find_num(o: Any) -> Optional[float]:
+                        if isinstance(o, (int, float)) and np.isfinite(o):
+                            return float(o)
+                        if isinstance(o, str):
+                            return _parse_float_any(o)
+                        if isinstance(o, dict):
+                            for v in o.values():
+                                r = _find_num(v)
+                                if r is not None:
+                                    return r
+                        if isinstance(o, (list, tuple)):
+                            for v in o:
+                                r = _find_num(v)
+                                if r is not None:
+                                    return r
+                        return None
+                    return _find_num(j)
+                except Exception:
+                    m = re.search(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", out)
+                    if m:
+                        return _parse_float_any(m.group(1))
+                return None
+            for _ in range(max(1, int(retries) + 1)):
+                val = _try_once()
+                if val is not None:
+                    return val
+                try:
+                    time.sleep(float(delay_s))
+                except Exception:
+                    pass
+            return None
 
         score_final: Optional[float] = None
         reward_final: Any = None
@@ -3104,7 +3056,7 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
             for _ in range(3):
                 try:
                     cp = subprocess.run([
-                        "allorad", "q", "tx", str(tx_hash), "--trace"
+                        "allorad", "q", "tx", str(tx_hash), "--node", str(DEFAULT_RPC), "--output", "json", "--trace"
                     ], capture_output=True, text=True, timeout=25)
                     out = (cp.stdout or cp.stderr or "").strip()
                     j = json.loads(out)
@@ -3129,7 +3081,7 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
                     pass
         # Best-effort fallback for score via EMA query if not in the tx logs yet
         if score_final is None and wallet:
-            score_final = _query_ema_score(int(topic_id), wallet, retries=4, delay_s=2.0, timeout=15)
+            score_final = _query_ema_score_retry(int(topic_id), wallet, retries=4, delay_s=2.0, timeout=15)
         # Reward fallback via tx query helper if not already populated
         if reward_final is None and tx_hash:
             try:
@@ -3182,17 +3134,6 @@ async def _submit_with_client_xgb(topic_id: int, xgb_val: float, root_dir: str, 
             # Print a short hint to aid future debugging without leaking sensitive data
             try:
                 print("submit(client): hint=hash_missing_check_broadcast_mode_and_signature")
-                # Add debug info about the response structure
-                if 'last_tx_resp' in locals() and last_tx_resp is not None:
-                    try:
-                        resp_type = type(last_tx_resp).__name__
-                        if isinstance(last_tx_resp, dict):
-                          keys = list(last_tx_resp.keys())[:10]  # First 10 keys
-                          print(f"submit(client): debug=response_type={resp_type} keys={keys}")
-                        else:
-                          print(f"submit(client): debug=response_type={resp_type} repr={repr(str(last_tx_resp)[:200])}")
-                    except Exception:
-                        print("submit(client): debug=response_structure_unknown")
             except Exception:
                 pass
         if score_final is not None:
@@ -3447,42 +3388,8 @@ def _sleep_until_next_window(cadence_s: int) -> None:
         logging.info(f"[loop] aligning to cadence; sleeping {wait:.1f}s until {next_window.strftime('%Y-%m-%dT%H:%M:%SZ')}")
         try:
             time.sleep(wait)
-        except KeyboardInterrupt:
-            logging.info("[loop] interrupted while aligning to cadence; exiting")
-            raise
-
-
-def _resolve_schedule(args: argparse.Namespace, sched_cfg: Dict[str, Any]) -> Tuple[str, str, str]:
-    """Resolve effective schedule mode/cadence from CLI and config without overlap.
-
-    Returns a tuple of (effective_mode, cadence, reason).
-    - ``--once`` always wins to guarantee a single pass.
-    - ``--loop`` OR ``--schedule-mode loop`` collapse into the same loop mode
-      so callers don't need to provide both; loop mode enforces an hourly cadence.
-    - Otherwise, fall back to provided CLI cadence or config cadence.
-    """
-
-    mode_cfg = str(getattr(args, "schedule_mode", None) or sched_cfg.get("mode", "single"))
-   
-    cadence_cfg = str(getattr(args, "cadence", None) or sched_cfg.get("cadence", "1h"))
-    loop_flag = bool(getattr(args, "loop", False))
-    mode_loop = mode_cfg.lower() == "loop"
-
-    if getattr(args, "once", False):
-        return "once", cadence_cfg, "--once overrides loop/config to ensure single iteration"
-
-    # If both CLI loop and schedule-mode=loop are provided, surface that only one loop path will run.
-    if loop_flag and mode_loop:
-        logging.info("[schedule] --loop and --schedule-mode loop both provided; using single loop path with hourly cadence")
-        return "loop", "1h", "--loop and schedule-mode=loop both set; collapsing to single loop path"
-
-    if loop_flag:
-        return "loop", "1h", "--loop requested; schedule-mode ignored and cadence forced to 1h"
-
-    if mode_loop:
-        return "loop", "1h", "schedule-mode=loop requested; --loop not required; enforcing 1h cadence"
-
-    return mode_cfg, cadence_cfg, "default/config scheduling applied"
+        except Exception:
+            pass
 
 
 def resolve_wallet() -> None:
@@ -3508,12 +3415,6 @@ def run_pipeline(args, cfg, root_dir) -> int:
     from_month = getattr(args, "from_month", str(data_cfg.get("from_month", "2025-10")))
     non_overlap_hours = max(1, int(data_cfg.get("non_overlap_hours", 48)))
     sched_cfg: Dict[str, Any] = cfg.get("schedule", {})
-    schedule_reason = getattr(args, "_schedule_reason", None)
-    if not getattr(args, "_effective_mode", None) or not getattr(args, "_effective_cadence", None):
-        effective_mode, cadence, schedule_reason = _resolve_schedule(args, sched_cfg)
-        setattr(args, "_effective_mode", effective_mode)
-        setattr(args, "_effective_cadence", cadence)
-        setattr(args, "loop", effective_mode.lower() == "loop")
     mode = getattr(args, "_effective_mode", str(getattr(args, "schedule_mode", None) or sched_cfg.get("mode", "single")))
     cadence = getattr(args, "_effective_cadence", str(getattr(args, "cadence", None) or sched_cfg.get("cadence", "1h")))
     start_raw = str(getattr(args, "start_utc", None) or sched_cfg.get("start", "2025-09-16T13:00:00Z"))
@@ -3530,30 +3431,15 @@ def run_pipeline(args, cfg, root_dir) -> int:
             return t.tz_localize("UTC")
         return t.tz_convert("UTC")
 
-    # Initialize workflow with error handling
-    try:
-        workflow = AlloraMLWorkflow(
-            data_api_key=_require_api_key(),
-            tickers=["btcusd"],
-            hours_needed=48,
-            number_of_input_candles=48,
-            target_length=168,
-            sample_spacing_hours=24,
-        )
-    except Exception as e:
-        logging.error(f"Failed to initialize workflow: {e}")
-        print(f"❌ Data workflow initialization failed: {e}")
-        return 1
-    # Load data with comprehensive error handling
-    try:
-        full_data: pd.DataFrame = workflow.get_full_feature_target_dataframe(from_month=from_month)
-        if full_data.empty:
-            raise ValueError("No data available for the specified time period")
-        logging.info(f"Loaded {len(full_data)} data points from {from_month}")
-    except Exception as e:
-        logging.error(f"Data loading failed: {e}")
-        print(f"❌ Data loading failed: {e}")
-        return 1
+    workflow = AlloraMLWorkflow(
+        data_api_key=_require_api_key(),
+        tickers=["btcusd"],
+        hours_needed=48,
+        number_of_input_candles=48,
+        target_length=168,
+        sample_spacing_hours=24,
+    )
+    full_data: pd.DataFrame = workflow.get_full_feature_target_dataframe(from_month=from_month)
     date_index: pd.Index = _to_naive_utc_index(pd.DatetimeIndex(pd.to_datetime(full_data.index.get_level_values("date"))))
     if len(date_index) > 0:
         _min_dt = pd.Timestamp(date_index.min(), tz="UTC")
@@ -3738,9 +3624,16 @@ def run_pipeline(args, cfg, root_dir) -> int:
         end_effective = min(end_naive, _to_naive_utc_ts(pd.Timestamp(last_labeled_dt)))
     if end_effective < end_naive:
         print(
-            "WARNING: Labeled data ends before the competition end. "
+            "WARNING: Labeled data ends before configured end. "
             f"last_labeled={end_effective} < configured_end={end_naive}. Using effective_end={end_effective}."
         )
+    print(f"Effective end for training/inference: {end_effective}")
+    mask_window = (date_index >= start_naive) & (date_index <= end_effective)
+    if not mask_window.all():
+        full_data = full_data.loc[mask_window]
+        date_index = _to_naive_utc_index(pd.DatetimeIndex(full_data.index.get_level_values("date")))
+        _min_dt, _max_dt = date_index.min(), date_index.max()
+        print(f"Window-clipped data date range (effective): {_min_dt} -> {_max_dt}")
 
     # Coverage check: ensure we had enough post-window data to compute 7d target near the end
     # Since target was computed before clipping, full_data contains only rows with valid future_close
@@ -3775,7 +3668,7 @@ def run_pipeline(args, cfg, root_dir) -> int:
     # For competition training, use labeled rows within [start, min(effective_end, now-7d)] to avoid leakage.
     # Use timezone-aware UTC now; then strip tz to naive UTC for numpy-friendly arithmetic
     now_minus_7d = _to_naive_utc_ts(pd.Timestamp.now(tz="UTC")) - pd.Timedelta(hours=168)
-    eligible_cutoff: pd.Timestamp = end_effective
+    eligible_cutoff: pd.Timestamp = min(end_effective, now_minus_7d)
     # Apply eligible cutoff to avoid leakage (<= eligible_cutoff)
     eligible_mask = (date_index >= start_naive) & (date_index <= eligible_cutoff)
     df_range: pd.DataFrame = full_data.loc[eligible_mask]
@@ -4132,7 +4025,7 @@ def run_pipeline(args, cfg, root_dir) -> int:
         else:
             train_end_idx2 = max(1, int(n2 * 0.7))
             val_end_idx2 = max(train_end_idx2 + 1, int(n2 * 0.9))
-            if n2 - val_end_idx2 < 2:
+            if n2 - val_end_idx2 < 1:
                 val_end_idx2 = max(train_end_idx2 + 1, n2 - 1)
             train_df2 = df_any.iloc[:train_end_idx2]
             val_df2 = df_any.iloc[train_end_idx2:val_end_idx2]
@@ -4143,7 +4036,10 @@ def run_pipeline(args, cfg, root_dir) -> int:
         y_val = val_df2["target"] if not val_df2.empty else pd.Series(dtype=float)
         X_test = test_df2.drop(columns=["target", "future_close"], errors="ignore") if not test_df2.empty else pd.DataFrame()
         y_test = test_df2["target"] if not test_df2.empty else pd.Series(dtype=float)
-
+        _print_cols(X_train, "X_train[fallback]")
+        _print_cols(X_val, "X_val[fallback]")
+        _print_cols(X_test, "X_test[fallback]")
+        
         # Apply deduplication to fallback splits as well
         print("🔍 Removing duplicate features in fallback splits using X_train[fallback] as reference...")
         X_train, X_val, X_test = _drop_duplicate_features_by_content(X_train, X_val, X_test)
@@ -4205,15 +4101,6 @@ def run_pipeline(args, cfg, root_dir) -> int:
     live_predictors: Dict[str, Any] = {}
     try:
         from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
         xgb_model = XGBRegressor(
             n_estimators=1000,
             learning_rate=0.03,
@@ -4228,47 +4115,13 @@ def run_pipeline(args, cfg, root_dir) -> int:
         )
         # Enforce XGBoost-only policy
         assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
+        xgb_model.fit(X_tr[feature_cols].to_numpy(dtype=float), y_tr.to_numpy(dtype=float))
         live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
+        if not X_val.empty:
+            model_preds_val["xgb"] = pd.Series(cast(np.ndarray, xgb_model.predict(X_val[feature_cols].to_numpy(dtype=float))), index=y_val.index)
+        model_preds_test["xgb"] = pd.Series(cast(np.ndarray, xgb_model.predict(X_te.to_numpy(dtype=float))), index=y_te.index)
     except Exception as _xgbe:
         xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
     # No other learners are used; forecasts must come from XGB only.
     if not model_preds_test:
         print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
@@ -4284,2064 +4137,891 @@ def run_pipeline(args, cfg, root_dir) -> int:
     # Build training matrix
     X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
     y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
+    if X_tr.empty:
+        raise RuntimeError("Training feature matrix is empty after numeric selection.")
+    if X_test[feature_cols].empty:
+        raise RuntimeError("Test feature matrix is empty after numeric selection.")
 
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
+    print("Base learner: XGBRegressor(hist)")
+    # Debug: basic prediction stats (avoid warnings on empty)
+    if len(y_pred_series) > 0:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            m = float(np.nanmean(y_pred_series))
+            sd = float(np.nanstd(y_pred_series))
+            mn = float(np.nanmin(y_pred_series))
+            mx = float(np.nanmax(y_pred_series))
+        print(f"Pred stats -> count:{len(y_pred_series)} mean:{m:.6g} std:{sd:.6g} min:{mn:.6g} max:{mx:.6g}")
+    else:
+        print("Pred stats -> count:0")
+    # Only compute metrics if we have at least 2 test samples
+    if len(y_test) >= 2:
+        # Compute log10_loss from test MAE, like pipeline.py
+        val_mae = mean_absolute_error(y_test, y_pred_series)
+        l10 = float(np.log10(max(val_mae, 1e-12)))
+        mae = val_mae
+        mse = mean_squared_error(y_test, y_pred_series)
+        metrics_out: Dict[str, Any] = {"log10_loss": l10, "source": "test", "mae": mae, "mse": mse, "n": int(len(y_test))}
+        art_dir = os.path.join(root_dir, "data", "artifacts")
+        os.makedirs(art_dir, exist_ok=True)
+        # Ensure strict JSON (no NaN/Inf) and write atomically
+        safe = {k: (None if (isinstance(v, float) and not np.isfinite(v)) else v) for k, v in metrics_out.items()}
+        _atomic_json_write(os.path.join(art_dir, "metrics.json"), safe)
+        print(f"Wrote metrics.json with log10_loss={metrics_out['log10_loss']}")
+    else:
+        # Fallback: if test too small, compute validation metrics when possible
+        if len(y_val) >= 2 and xgb_model is not None:
+            try:
+                # Predict on validation split using the trained XGB model
+                y_val_pred_series = pd.Series(cast(np.ndarray, xgb_model.predict(X_val[feature_cols].to_numpy(dtype=float))), index=y_val.index)
+                # Optional quick stats
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    m = float(np.nanmean(y_val_pred_series))
+                    sd = float(np.nanstd(y_val_pred_series))
+                print(f"Val pred stats -> count:{len(y_val_pred_series)} mean:{m:.6g} std:{sd:.6g}")
 
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
+                # Compute log10_loss from validation MAE, like pipeline.py
+                val_mae = mean_absolute_error(y_val, y_val_pred_series)
+                l10 = float(np.log10(max(val_mae, 1e-12)))
+                mae = val_mae
+                mse = mean_squared_error(y_val, y_val_pred_series)
+                metrics_out: Dict[str, Any] = {"log10_loss": l10, "source": "validation", "mae": mae, "mse": mse, "n": int(len(y_val))}
+                art_dir = os.path.join(root_dir, "data", "artifacts")
+                os.makedirs(art_dir, exist_ok=True)
+                safe = {k: (None if (isinstance(v, float) and not np.isfinite(v)) else v) for k, v in metrics_out.items()}
+                _atomic_json_write(os.path.join(art_dir, "metrics.json"), safe)
+                print(f"Wrote metrics.json (validation fallback) with log10_loss={metrics_out['log10_loss']}")
+            except (OSError, IOError, ValueError, RuntimeError, ImportError) as e:
+                print(f"Warning: failed to compute/write validation MAE metrics: {e}")
+        else:
+            # If we cannot compute a metric, write a warning placeholder for traceability
+            print("Skipped metrics: both test and validation too small (<2 samples)")
+            try:
+                art_dir = os.path.join(root_dir, "data", "artifacts")
+                os.makedirs(art_dir, exist_ok=True)
+                placeholder = {"log10_loss": None, "source": "none", "warning": "insufficient ground truth (<2 samples)", "n": 0}
+                _atomic_json_write(os.path.join(art_dir, "metrics.json"), placeholder)
+            except (OSError, IOError, ValueError, RuntimeError):
+                pass
 
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
+    # Live-as-of prediction for current submission window
+    # Build features up to 'as_of' and compute base predictions
     try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
+        # Filter full data up to as_of for base close series
+        asof_mask = (date_index >= start_naive) & (date_index <= min(as_of_naive, end_effective))
+        full_asof = full_data.loc[asof_mask]
+        flat_any = full_asof.copy()
+        if "close" in flat_any.columns:
+            close_series_any = flat_any["close"]
+        else:
+            price_candidates = [c for c in flat_any.columns if "close" in c or c.endswith("_close")]
+            close_series_any = flat_any[price_candidates[0]] if price_candidates else pd.Series(index=flat_any.index, dtype=float)
+        alpha_asof = build_alpha_features(close_series_any, extra=(extra_map if extra_map else None))
+
+        # Add simple volume-based features (rolling mean/std and z-score, 24h and 168h)
         try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
+            if "volume" in flat_any.columns:
+                vol_series = pd.Series(pd.to_numeric(flat_any["volume"], errors="coerce"), index=pd.to_datetime(flat_any.index.get_level_values("date")))
+                vol_h = vol_series.resample("h").last()
+                for w in (24, 168):
+                    ma = vol_h.rolling(window=w, min_periods=max(2, w//4)).mean()
+                    sd = vol_h.rolling(window=w, min_periods=max(2, w//4)).std(ddof=0)
+                    alpha_asof[f"vol_ma_{w}"] = ma
+                    alpha_asof[f"vol_sd_{w}"] = sd
+                    alpha_asof[f"vol_z_{w}"] = (vol_h - ma) / (sd.replace(0.0, np.nan))
+                    alpha_asof[f"vol_ma_ratio_{w}"] = vol_h / ma.replace(0.0, np.nan)
+        except Exception:
+            pass
+
+        # Compose live feature row aligned to training feature set
+        live_row = alpha_asof.tail(1).copy()
+        live_row = live_row.reindex(columns=feature_cols, fill_value=0.0)
+
+        # XGB-only live prediction
+        live_member_preds: Dict[str, float] = {}
+        if "xgb" in live_predictors:
+            try:
+                pred = float(np.asarray(live_predictors["xgb"].predict(live_row.to_numpy(dtype=float))).reshape(-1)[-1])
+            except Exception:
+                pred = 0.0
+            live_member_preds["xgb"] = pred
+            live_value = pred
+        else:
+            live_value = 0.0
+        # Persist a small artifact for forecast construction in the submit step
         try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
+            preds_arr = np.array(list(live_member_preds.values()), dtype=float)
+            stddev = float(np.nanstd(preds_arr)) if preds_arr.size > 0 else None
+            art_dir = os.path.join(root_dir, "data", "artifacts")
+            os.makedirs(art_dir, exist_ok=True)
+            lf_payload = {
+                "as_of": str(as_of_naive),
+                "topic_id": int(DEFAULT_TOPIC_ID),
+                "member_preds": live_member_preds,
+                "weights": {k: 1.0 for k in live_member_preds.keys()},
+                "stddev": stddev,
+            }
+            _atomic_json_write(os.path.join(art_dir, "live_forecast.json"), lf_payload)
+        except Exception:
+            pass
+    except (ValueError, TypeError, KeyError, RuntimeError) as e:
+        print(f"Warning: live-as-of feature build failed: {e}")
+        # Fallback: use last y_pred_series if available
+        live_value = float(y_pred_series.iloc[-1]) if len(y_pred_series) else 1e-4
 
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
+    # Signal damping and safety checks
+    if np.isfinite(live_value) and abs(live_value) < 1e-5:
+        live_value = float(np.sign(live_value) or 1.0) * 1e-5
+        print(f"Signal damping applied; clamped live_value to {live_value}")
+    if not (np.isfinite(live_value)) or abs(live_value) < 1e-8:
+        print("Warning: invalid or near-zero live_value; applying fallback.")
+        try:
+            if len(y_train) > 0:
+                recent = y_train.tail(min(100, len(y_train)))
+                m = float(np.nanmean(recent))
+                if np.isfinite(m) and abs(m) >= 1e-6:
+                    live_value = m
+                else:
+                    s = float(np.sign(float(recent.iloc[-1]))) if len(recent) > 0 else 1.0
+                    live_value = s * 1e-4
+            else:
+                live_value = 1e-4
+        except (ValueError, TypeError, IndexError):
+            live_value = 1e-4
+        print(f"Using fallback live_value={live_value}")
 
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
+    # Validate predictions before submission
     try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
+        validate_predictions(y_pred_series)
+    except ValueError as e:
+        logging.warning(f"Prediction validation warning: {e} - continuing with submission attempt")
+        # Don't block submission on validation, but log the issue
 
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
+    # 7) Persist XGB model bundle (model + features) for deterministic, fast inference
+    # root_dir defined earlier
+    models_dir = os.path.join(root_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    bundle_path = os.path.join(models_dir, "xgb_model.pkl")
     try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
+        with open(bundle_path, "wb") as bf:
+            # Persist only the XGB model and its features
+            bundle_meta: Dict[str, Any] = {"features": feature_cols, "model_class": "XGBRegressor"}
+            xgb_only = cast(Any, live_predictors.get("xgb"))
+            pickle.dump({"model": xgb_only, "meta": bundle_meta}, bf)
+        print(f"Saved XGB model bundle to {bundle_path}")
+        # Verify bundle integrity by loading and reporting features count
         try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
+            with open(bundle_path, "rb") as bf2:
+                bundle_loaded: Dict[str, Any] = pickle.load(bf2)
+            meta_loaded: Dict[str, Any] = cast(Dict[str, Any], bundle_loaded.get("meta") or {})
+            features_loaded: List[Any] = cast(List[Any], meta_loaded.get("features") or [])
+            n_features = len(features_loaded)
+            print(f"bundle_ok model=XGBRegressor features={n_features}")
+        except (OSError, IOError, pickle.UnpicklingError, AttributeError, KeyError) as e2:
+            print(f"Warning: bundle self-check failed: {e2}")
+    except (OSError, IOError) as e:
+        print(f"Warning: failed to save model bundle: {e}")
 
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
+    # 8) Save minimal JSON output ONLY to artifacts path in the new format
+    # Required format: { "topic_id": 67, "value": <float> }
+    # This replaces the former per-topic-key format like {"<topic_id>": [value]}.
+    def save_prediction(prediction: Dict[str, Any], paths: List[str]) -> None:
+        for p in paths:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            _atomic_json_write(p, prediction)
+            print(f"Wrote prediction artifact -> {p}")
 
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
+    artifacts_path = os.path.join(root_dir, "data", "artifacts", "predictions.json")
+    topic_id_cfg: Optional[int] = None
     try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
+        submission_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("submission", {}) or {})
+        topic_id_cfg = int(submission_cfg.get("topic_id", 67))
+    except (ValueError, TypeError, KeyError):
+        topic_id_cfg = 67
+    save_prediction({"topic_id": topic_id_cfg or 67, "value": live_value}, [artifacts_path])
+    print(f"📊 Final prediction (as_of={as_of}) value: {live_value:.10f}")
+    # Ensure submission log schema exists and is locked for future writes
+    log_csv = os.path.join(root_dir, "submission_log.csv")
+    ensure_submission_log_schema(log_csv)
+    # Also normalize existing rows to ensure exact 12-column order, lowercase booleans, and 'null' tokens
+    normalize_submission_log_file(log_csv)
+    # Deduplicate historical rows keeping at most one per (timestamp_utc, topic_id), preferring success rows
+    dedupe_submission_log_file(log_csv)
+
+    # 9) Optional: trigger submission now using SDK directly
+    if args.submit:
+        # Clamp and validate live_value
+        if not (np.isfinite(live_value)):
+            print("ERROR: live_value is not finite; aborting submission.", file=sys.stderr)
+            return 1
+        if abs(live_value) > 2.0:
+            print("Warning: live prediction magnitude large; clamping to +/-2.", file=sys.stderr)
+            live_value = float(max(-2.0, min(2.0, live_value)))
+
+        # Read precomputed log10_loss if available
+        pre_log10_loss: Optional[float] = None
         try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
+            mpath = os.path.join(root_dir, "data", "artifacts", "metrics.json")
+            if os.path.exists(mpath):
+                with open(mpath, "r", encoding="utf-8") as mf:
+                    _m = json.load(mf) or {}
+                if isinstance(_m, dict) and "log10_loss" in _m:
+                    v = _m.get("log10_loss")
+                    pre_log10_loss = float(v) if v is not None else None
+        except (OSError, IOError, ValueError, json.JSONDecodeError):
+            pre_log10_loss = None
+
+        if not args.force_submit and not (topic_validation_ok and topic_validation_funded and topic_validation_epoch):
+            reason = topic_validation_reason or "topic_validation_failed"
+            skip_msg = (
+                "Submission skipped: topic is not rewardable or active due to: "
+                f"{reason}; artifacts retained for monitoring and loop will retry."
+            )
+            print(skip_msg)
+            logging.warning(skip_msg)
+            try:
+                ws_now_tv = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
+                wallet_log = _resolve_wallet_for_logging(root_dir)
+                _log_submission(
+                    root_dir,
+                    ws_now_tv,
+                    int(topic_id_cfg or 67),
+                    live_value,
+                    wallet_log,
+                    None,
+                    None,
+                    False,
+                    0,
+                    "skipped_topic_not_ready",
+                    pre_log10_loss,
+                )
+            except Exception:
+                pass
+            return 0
+
+        # Cooldown guard: avoid EMA collisions by limiting one success per 600s window
+        def _seconds_since_last_success(csv_path: str) -> Optional[int]:
+            try:
+                if not os.path.exists(csv_path):
+                    return None
+                import csv as _csv
+                last_ts: Optional[pd.Timestamp] = None
+                with open(csv_path, "r", encoding="utf-8") as fh:
+                    r = _csv.DictReader(fh)
+                    for row in r:
+                        succ = (row.get("success", "").strip().lower() in ("true", "1"))
+                        ts = (row.get("timestamp_utc") or "").strip()
+                        if succ and ts:
+                            try:
+                                t = pd.Timestamp(ts).tz_localize("UTC") if pd.Timestamp(ts).tzinfo is None else pd.Timestamp(ts).tz_convert("UTC")
+                                if (last_ts is None) or (t > last_ts):
+                                    last_ts = t
+                            except Exception:
+                                continue
+                if last_ts is None:
+                    return None
+                now_u = pd.Timestamp.now(tz="UTC")
+                return int((now_u - last_ts).total_seconds())
+            except Exception:
+                return None
+
+        sec_ago = _seconds_since_last_success(log_csv)
+        if (sec_ago is not None) and (sec_ago < 600):
+            print(f"submit: cooldown active; last success {sec_ago}s ago < 600s; skipping to avoid EMA collision")
+            try:
+                ws_now_cd = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
+                w = _resolve_wallet_for_logging(root_dir)
+                _log_submission(root_dir, ws_now_cd, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "cooldown_600s", pre_log10_loss)
+            except Exception:
+                pass
+            return 0
+
+        # High-loss filter: require pre_log10_loss to be within top 25% (lowest losses)
+        def _recent_loss_q(csv_path: str, q: float = 0.25, k: int = 40) -> Optional[float]:
+            try:
+                if not os.path.exists(csv_path):
+                    return None
+                import csv as _csv
+                vals: List[float] = []
+                with open(csv_path, "r", encoding="utf-8") as fh:
+                    r = _csv.DictReader(fh)
+                    for row in r:
+                        s = (row.get("log10_loss") or "").strip()
+                        if s == "" or s.lower() == "null":
+                            continue
+                        try:
+                            v = float(s)
+                        except Exception:
+                            continue
+                        if np.isfinite(v):
+                            vals.append(v)
+                if not vals:
+                    return None
+                arr = np.array(vals[-k:], dtype=float)
+                if arr.size < 5:
+                    return None
+                return float(np.quantile(arr, q))
+            except Exception:
+                return None
+
+        q25 = _recent_loss_q(log_csv, q=0.25, k=40)
+        if (pre_log10_loss is not None) and (q25 is not None) and not args.force_submit:
+            # Lower loss is better; require being <= q25
+            if not (pre_log10_loss <= q25):
+                print(f"submit: filtered out high-loss prediction (loss={pre_log10_loss:.6g} > q25={q25:.6g})")
+                logging.warning(f"🚫 FILTERED: pre_log10_loss={pre_log10_loss:.6f} > q25={q25:.6f}")
+                try:
+                    ws_now_fl = _window_start_utc(cadence_s=_load_cadence_from_config(root_dir))
+                    w = _resolve_wallet_for_logging(root_dir)
+                    _log_submission(root_dir, ws_now_fl, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "filtered_high_loss", pre_log10_loss)
+                    logging.info(f"📝 Logged submission attempt: status=filtered_high_loss, value={live_value:.10f}, loss={pre_log10_loss:.6f}")
+                except Exception:
+                    pass
+                return 0
+
+        # Competition window guard (UTC)
+        def _comp_window_from_config(root: str) -> Tuple[pd.Timestamp, pd.Timestamp]:
+            try:
+                if yaml is not None:
+                    cfg_path2 = os.path.join(root, "config", "pipeline.yaml")
+                    if os.path.exists(cfg_path2):
+                        with open(cfg_path2, "r", encoding="utf-8") as fh2:
+                            cfg2 = yaml.safe_load(fh2) or {}
+                        if isinstance(cfg2, dict):
+                            sch = cfg2.get("schedule", {}) or {}
+                            s = sch.get("start")
+                            e = sch.get("end")
+                            if isinstance(s, str) and isinstance(e, str):
+                                sdt = pd.Timestamp(s).tz_localize("UTC") if pd.Timestamp(s).tzinfo is None else pd.Timestamp(s).tz_convert("UTC")
+                                edt = pd.Timestamp(e).tz_localize("UTC") if pd.Timestamp(e).tzinfo is None else pd.Timestamp(e).tz_convert("UTC")
+                                return sdt, edt
+            except (OSError, IOError, ValueError, TypeError):
+                pass
+            return pd.Timestamp("2025-09-16T13:00:00Z"), pd.Timestamp("2025-12-15T13:00:00Z")
+
+        cadence_s = _load_cadence_from_config(root_dir)
+        ws_now = _window_start_utc(cadence_s=cadence_s)
+        comp_start, comp_end = _comp_window_from_config(root_dir)
+        now_utc = pd.Timestamp.now(tz="UTC")
+        if (not args.force_submit) and (not (comp_start <= now_utc < comp_end)):
+            print("submit: outside competition window; skipping submission")
+            try:
+                w = _resolve_wallet_for_logging(root_dir)
+                _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "outside_window")
+            except Exception:
+                pass
+            return 0
+        # Duplicate guards
+        # If --force-submit is NOT provided, enforce per-window duplicate guard.
+        if (not args.force_submit) and _has_submitted_this_hour(log_csv, ws_now):
+            print("submit: skipped; successful submission already recorded for this hour (CSV)")
+            try:
+                w = _resolve_wallet_for_logging(root_dir)
+                _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "skipped_window")
+            except Exception:
+                pass
+            return 0
+
+        # Additional blockchain-level duplicate check to prevent EMA errors
+        # This applies even with --force-submit to avoid blockchain rejections
+        intended_env = os.getenv("ALLORA_WALLET_ADDR", "").strip() or None
+        try:
+            topic_info = _run_allorad_json(["q", "emissions", "topic", str(int(topic_id_cfg or 67))]) or {}
+            last_epoch = topic_info.get("topic", {}).get("epoch_last_ended")
+            if last_epoch:
+                # Check if we already have a successful submission for this epoch
+                if _has_submitted_for_nonce(log_csv, int(last_epoch)):
+                    print(f"submit: skipped; already submitted for current epoch {last_epoch} (blockchain protection)")
+                    try:
+                        w = intended_env or _resolve_wallet_for_logging(root_dir)
+                        _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, last_epoch, None, False, 0, "epoch_already_submitted")
+                    except Exception:
+                        pass
+                    return 0
         except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
+            logging.warning(f"Could not check blockchain epoch status: {e}")
+
+        # Lifecycle: gate by Active and Churnable states per Allora Topic Life Cycle
+        lifecycle = _compute_lifecycle_state(int(topic_id_cfg or 67))
+        global _LAST_TOPIC_ACTIVE_STATE
+        current_active = bool(lifecycle.get("is_active", False))
+        is_rewardable = bool(lifecycle.get("is_rewardable", False))
+        inactive_reasons = lifecycle.get("inactive_reasons") or []
+        churn_reasons = lifecycle.get("churn_reasons") or []
+        activity_snapshot = lifecycle.get("activity_snapshot") or {}
+        submission_window_state = lifecycle.get("submission_window") or {}
+        window_is_open = submission_window_state.get("is_open")
+        window_confident = bool(submission_window_state.get("confidence"))
+
+        reps_raw = activity_snapshot.get("reputers_count")
         try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
+            reputers_count = int(float(reps_raw)) if reps_raw is not None else None
+        except (TypeError, ValueError):
+            reputers_count = None
+        delegated_stake_raw = activity_snapshot.get("delegated_stake")
+        try:
+            delegated_stake_val = float(delegated_stake_raw) if delegated_stake_raw is not None else None
+        except (TypeError, ValueError):
+            delegated_stake_val = None
+        min_delegate_raw = activity_snapshot.get("min_delegated_stake")
+        try:
+            min_delegate_val = float(min_delegate_raw) if min_delegate_raw is not None else None
+        except (TypeError, ValueError):
+            min_delegate_val = None
+        unfulfilled_raw = lifecycle.get("unfulfilled")
+        try:
+            unfulfilled_int = int(float(unfulfilled_raw)) if unfulfilled_raw is not None else None
+        except (TypeError, ValueError):
+            unfulfilled_int = None
 
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
+        lifecycle_report = (
+            "Lifecycle diagnostics:\n"
+            f"  is_active={current_active}\n"
+            f"  is_rewardable={is_rewardable}\n"
+            f"  submission_window_open={window_is_open}\n"
+            f"  submission_window_confidence={window_confident}\n"
+            f"  inactive_reasons={inactive_reasons}\n"
+            f"  churn_reasons={churn_reasons}\n"
+            f"  reputers_count={reputers_count}\n"
+            f"  delegated_stake={delegated_stake_val}\n"
+            f"  min_delegated_stake={min_delegate_val}\n"
+            f"  unfulfilled={unfulfilled_int}\n"
+            f"  activity_snapshot={activity_snapshot}\n"
+            f"  submission_window_state={submission_window_state}"
         )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
+        print(lifecycle_report)
+        logging.info(lifecycle_report)
+
+        previous_active = _LAST_TOPIC_ACTIVE_STATE
+        if current_active and previous_active is not True:
+            msg_active = "Topic now active — submitting"
+            print(msg_active)
+            logging.info(msg_active)
+        _LAST_TOPIC_ACTIVE_STATE = current_active
+        # Also enforce topic-creation parameter compatibility and funding before submission
+        topic_validation = _validate_topic_creation_and_funding(int(topic_id_cfg or 67), EXPECTED_TOPIC_67)
+        if not bool(topic_validation.get("funded", False)):
+            print("submit: topic not funded; call fund-topic first; skipping submission")
+            try:
+                w = intended_env or _resolve_wallet_for_logging(root_dir)
+                _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "topic_not_funded", pre_log10_loss)
+            except Exception:
+                pass
+            return 0
+        mism = topic_validation.get("mismatches") or []
+        if mism:
+            # Non-fatal: require at least loss_method/p_norm/allow_negative to be aligned; if not, skip
+            def _has_key(prefix: str) -> bool:
+                return any((isinstance(x, str) and x.startswith(prefix)) for x in mism)
+            if _has_key("loss_method:") or _has_key("p_norm:") or _has_key("allow_negative:"):
+                print(f"submit: topic params mismatch detected (critical): {mism}; skipping submission")
+                try:
+                    w = intended_env or _resolve_wallet_for_logging(root_dir)
+                    _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, "topic_params_mismatch", pre_log10_loss)
+                except Exception:
+                    pass
+                return 0
+        # Persist lifecycle snapshot for auditability
         try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
+            audit_dir = os.path.join(root_dir, "data", "artifacts", "logs")
+            os.makedirs(audit_dir, exist_ok=True)
+            ts_str = pd.Timestamp.now(tz="UTC").strftime("%Y%m%dT%H%M%SZ")
+            with open(os.path.join(audit_dir, f"lifecycle-{ts_str}.json"), "w", encoding="utf-8") as lf:
+                json.dump(lifecycle, lf, indent=2)
+        except Exception:
+            pass
+        # Check Active (funding+stake+reputers) and rewardability/nonce hygiene
+        reps_for_skip = reputers_count
+        unfulfilled_for_skip = unfulfilled_int
+        stake_for_skip = delegated_stake_val
+        min_stake_for_skip = min_delegate_val
         
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
-
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
+        # NOTE: Intelligent waiting disabled to prevent hanging in --once mode
+        # Use --loop mode for automatic retry during submission windows
         
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
+        # CRITICAL: Enforce exact submission rules per competition requirements
+        # submission_window_open=True only when blocks_remaining_in_epoch < 600 AND unfulfilled_nonces == 1
+        # This ensures we submit during the correct window with proper nonce state
         
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
+        blocks_remaining_val = submission_window_state.get("blocks_remaining_in_epoch")
         
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
+        should_skip = (
+            not current_active
+            or (window_confident and window_is_open is False)
+            or reps_for_skip is None
+            or reps_for_skip < 1
+            or (unfulfilled_for_skip is not None and unfulfilled_for_skip != 1)  # Changed: require exactly 1 unfulfilled nonce
+            or stake_for_skip is None
+            or (
+                min_stake_for_skip is not None
+                and stake_for_skip is not None
+                and stake_for_skip < min_stake_for_skip
+            )
         )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
+        if not args.force_submit and should_skip:
+            snapshot = activity_snapshot
+            eff = snapshot.get("effective_revenue")
+            stk = snapshot.get("delegated_stake")
+            reps = snapshot.get("reputers_count")
+            min_req = snapshot.get("min_delegated_stake")
+            reason_list = [str(r) for r in inactive_reasons if r]
+            if (reps_for_skip is None or reps_for_skip < 1) and "reputers missing" not in reason_list:
+                reason_list.append("reputers missing")
+            if unfulfilled_for_skip is not None and unfulfilled_for_skip != 1:
+                reason_list.append(f"unfulfilled_nonces:{unfulfilled_for_skip} (require exactly 1)")
+            if (stake_for_skip is None) and "stake unavailable" not in reason_list:
+                reason_list.append("stake unavailable")
+            if (
+                stake_for_skip is not None
+                and min_stake_for_skip is not None
+                and stake_for_skip < min_stake_for_skip
+                and "stake below minimum requirement" not in reason_list
+            ):
+                reason_list.append("stake below minimum requirement")
+            if window_confident and window_is_open is False:
+                remaining = submission_window_state.get("blocks_remaining_in_epoch")
+                if isinstance(remaining, int):
+                    reason_list.append(f"submission_window_closed(remaining={remaining})")
+                else:
+                    reason_list.append("submission_window_closed")
+            if (not window_confident) and window_is_open is False and "submission_window_closed" not in reason_list:
+                reason_list.append("submission_window_closed")
+            reason_str = ", ".join(reason_list) if reason_list else "unknown"
+            skip_msg = (
+                "Submission skipped: topic not ready for submission due to: "
+                f"{reason_str}"
+            )
+            print(skip_msg)
+            logging.warning(f"⏸️  SKIPPED: {skip_msg}")
             
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
+            # Provide actionable guidance based on skip reason
+            if "submission_window_closed" in reason_str:
+                remaining_blocks = submission_window_state.get('blocks_remaining_in_epoch')
+                if isinstance(remaining_blocks, int):
+                    est_minutes = (remaining_blocks - 600) * 5 / 60  # Estimate time to window opening
+                    if est_minutes > 0:
+                        print(f"💡 TIP: Submission window opens in ~{est_minutes:.1f} minutes. Use --loop mode to auto-retry.")
+            elif "unfulfilled_nonces" in reason_str:
+                print("💡 TIP: Unfulfilled nonces detected. They typically clear within 1-2 epochs. Use --loop mode to auto-retry.")
             
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
+            wait_msg = (
+                "Waiting for topic to activate: "
+                f"effective_revenue={eff} delegated_stake={stk} reputers_count={reps} "
+                f"min_required_stake={min_req} unfulfilled={unfulfilled_for_skip} "
+                f"window_open={window_is_open} window_confidence={window_confident} "
+                f"blocks_remaining={submission_window_state.get('blocks_remaining_in_epoch')}; Will retry next loop."
+            )
+            print(wait_msg)
+            logging.info(wait_msg)
+            try:
+                detailed_status = "skipped_topic_not_ready"
+                try:
+                    wallet_for_log = intended_env or _resolve_wallet_for_logging(root_dir)
+                except Exception:
+                    wallet_for_log = intended_env
+                _log_submission(
+                    root_dir,
+                    ws_now,
+                    int(topic_id_cfg or 67),
+                    live_value,
+                    wallet_for_log,
+                    None,
+                    None,
+                    False,
+                    0,
+                    detailed_status,
+                    pre_log10_loss,
+                )
+                logging.info(f"📝 Logged submission attempt: status={detailed_status}, value={live_value:.10f}, loss={pre_log10_loss:.6f if pre_log10_loss is not None else 'N/A'}")
+            except Exception:
+                pass
+            return 0
+        # Check Churnable (epoch elapsed and weight rank acceptable)
+        if not args.force_submit and not lifecycle.get("is_churnable", False):
+            reasons = lifecycle.get("churn_reasons") or []
+            print(f"submit: topic Active but not Churnable; reasons={reasons}; skipping submission")
+            try:
+                w = intended_env or _resolve_wallet_for_logging(root_dir)
+                status = "active_not_churnable:" + ",".join(reasons) if isinstance(reasons, list) else "active_not_churnable"
+                _log_submission(root_dir, ws_now, int(topic_id_cfg or 67), live_value, w, None, None, False, 0, status, pre_log10_loss)
+            except Exception:
+                pass
+            return 0
 
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
+        # Submit via client using XGB-only policy to ensure non-null forecast
+        _env_wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
+        if _env_wallet and not _env_wallet.endswith("6vma"):
+            print(f"Warning: ALLORA_WALLET_ADDR does not end with '6vma' (got ...{_env_wallet[-4:]}); ensure correct worker wallet is configured.", file=sys.stderr)
+        helper_result = _submit_via_external_helper(
+            int(topic_id_cfg or 67),
+            float(live_value),
+            root_dir,
+            pre_log10_loss,
+            int(args.submit_timeout),
         )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
+        if helper_result is not None:
+            helper_rc, helper_success = helper_result
+            if helper_success:
+                try:
+                    _update_window_lock(root_dir, cadence_s, intended_env)
+                except Exception:
+                    pass
+                try:
+                    _post_submit_backfill(root_dir, tail=20, attempts=3, delay_s=2.0)
+                except Exception:
+                    pass
+                return helper_rc
+            else:
+                print("submit(helper): external helper failed, falling back to direct client submission", file=sys.stderr)
+
+        # Prefer client-based submit to guarantee forecast, fallback to SDK worker if client path fails
+        rc_client = asyncio.run(_submit_with_client_xgb(int(topic_id_cfg or 67), float(live_value), root_dir, pre_log10_loss, args.force_submit))
+        rc = rc_client
+        if rc_client != 0:
+            # Always attempt SDK fallback when client path fails; unfulfilled nonces query can be stale
+            print("Client-based xgb-only submit failed; attempting SDK worker fallback (forecast may be null)", file=sys.stderr)
+            rc = asyncio.run(_submit_with_sdk(int(topic_id_cfg or 67), float(live_value), int(args.submit_timeout), int(args.submit_retries), root_dir, pre_log10_loss))
+        if rc == 0:
+            try:
+                _update_window_lock(root_dir, cadence_s, intended_env)
+            except Exception:
+                pass
+            # Best-effort score/reward backfill for recent rows
+            try:
+                _post_submit_backfill(root_dir, tail=20, attempts=3, delay_s=2.0)
+            except Exception:
+                pass
+        # After submission, normalize/dedupe once more in case new rows were added
         try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
+            ensure_submission_log_schema(log_csv)
+            normalize_submission_log_file(log_csv)
+            dedupe_submission_log_file(log_csv)
+        except (OSError, IOError, ValueError, RuntimeError):
+            pass
+        return rc
+
+    return 0
+
+def main() -> int:
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    cfg = _load_pipeline_config(root_dir)
+    parser = argparse.ArgumentParser(description="Train model and emit predictions.json for Topic 67 (7-day BTC/USD log-return)")
+    parser.add_argument("--from-month", default="2022-01")
+    parser.add_argument("--schedule-mode", default=None, help="Schedule mode (single, loop, etc.)")
+    parser.add_argument("--cadence", default=None, help="Cadence for scheduling (e.g., 1h)")
+    parser.add_argument("--start-utc", default=None, help="Start datetime in UTC (ISO format)")
+    parser.add_argument("--end-utc", default=None, help="End datetime in UTC (ISO format)")
+    parser.add_argument("--as-of", default=None, help="As-of datetime in UTC (ISO format)")
+    parser.add_argument("--as-of-now", action="store_true", help="Use current UTC time as as_of")
+    parser.add_argument("--submit", action="store_true", help="Submit the prediction after training")
+    parser.add_argument("--submit-timeout", type=int, default=30, help="Timeout for submission in seconds")
+    parser.add_argument("--submit-retries", type=int, default=3, help="Number of retries for submission")
+    parser.add_argument("--force-submit", action="store_true", help="Force submission even if guards are active")
+    parser.add_argument("--loop", action="store_true", help="Continuously run training/submission cycles based on cadence")
+    parser.add_argument("--once", action="store_true", help="Run exactly one iteration even if config requests loop")
+    parser.add_argument("--timeout", type=int, default=0, help="Loop runtime limit in seconds (0 runs indefinitely)")
+    parser.add_argument("--refresh-scores", action="store_true", help="Refresh score/reward data in submission_log.csv from blockchain (standalone mode)")
+    parser.add_argument("--refresh-tail", type=int, default=20, help="Number of recent rows to refresh (default: 20)")
+    parser.add_argument("--print-wallet", action="store_true", help="Print wallet address from SDK and exit (standalone mode)")
+    parser.add_argument("--inspect-log", action="store_true", help="Inspect submission_log.csv schema and recent entries (standalone mode)")
+    parser.add_argument("--inspect-tail", type=int, default=3, help="Number of recent rows to show with --inspect-log (default: 3)")
+    args = parser.parse_args()
+    
+    # Handle standalone print-wallet mode
+    if args.print_wallet:
+        # Check that .allora_key exists (needed for AlloraWorker authentication)
+        key_path = os.path.join(root_dir, ".allora_key")
+        if not os.path.exists(key_path):
+            print("ERROR: Missing .allora_key file (needed for wallet authentication)", file=sys.stderr)
+            return 1
+        try:
+            from allora_sdk.worker import AlloraWorker
+            def dummy_run(_: int) -> float:
+                return 0.0
+            # AlloraWorker uses mnemonic from .allora_key for authentication, not API key
+            w = AlloraWorker(run=dummy_run, topic_id=67)
+            addr = None
+            for attr in ("wallet_address", "address", "wallet"):
+                try:
+                    val = getattr(w, attr, None)
+                    if isinstance(val, dict):
+                        val = val.get("address")
+                    if val:
+                        addr = val
+                        break
+                except AttributeError:
+                    continue
+            if addr:
+                print(f"Resolved SDK wallet address: {addr}")
+                if os.getenv("ALLORA_WALLET_ADDR") and os.getenv("ALLORA_WALLET_ADDR") != addr:
+                    print("Warning: ALLORA_WALLET_ADDR differs from SDK-resolved wallet address", file=sys.stderr)
+            else:
+                print("ERROR: Could not resolve wallet address from SDK worker", file=sys.stderr)
+                return 2
+        except ImportError as e:
+            print(f"ERROR: allora-sdk is required (pip install allora-sdk): {e}", file=sys.stderr)
+            return 1
         except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
+            print(f"ERROR: Could not construct AlloraWorker: {e}", file=sys.stderr)
+            return 2
+        return 0
+    
+    # Handle standalone inspect-log mode
+    if args.inspect_log:
+        from allora_forge_builder_kit.submission_log import CANONICAL_SUBMISSION_HEADER
+        csv_path = os.path.join(root_dir, "submission_log.csv")
+        print(f"CSV exists: {os.path.exists(csv_path)} -> {csv_path}")
+        if not os.path.exists(csv_path):
+            print("No CSV found")
+            return 0
         try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
-
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
+            import csv
+            with open(csv_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = [dict(r) for r in reader]
+            if not rows:
+                print("CSV is empty")
+                return 0
+            cols = list(rows[0].keys()) if rows else []
+            print(f"Columns (count={len(cols)}):")
+            print(cols)
+            ok = cols == CANONICAL_SUBMISSION_HEADER
+            if ok:
+                print("Schema: PASS (exact 12-column canonical header)")
+            else:
+                print("Schema: FAIL (header mismatch)")
+                expected = set(CANONICAL_SUBMISSION_HEADER)
+                actual = set(cols)
+                missing = list(expected - actual)
+                extra = list(actual - expected)
+                if missing:
+                    print(f" - Missing: {missing}")
+                if extra:
+                    print(f" - Extra: {extra}")
+            n = max(1, int(args.inspect_tail))
+            print(f"\nLast {n} rows:")
+            for row in rows[-n:]:
+                print(", ".join(str(row.get(k, "")) for k in CANONICAL_SUBMISSION_HEADER))
         except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
+            print(f"ERROR: Failed to inspect CSV: {e}", file=sys.stderr)
+            return 2
+        return 0
+    
+    # Handle standalone refresh mode
+    if args.refresh_scores:
+        print(f"[refresh-scores] Refreshing last {args.refresh_tail} entries in submission_log.csv...")
+        _post_submit_backfill(root_dir, tail=args.refresh_tail, attempts=3, delay_s=2.0)
+        return 0
+    data_cfg: Dict[str, Any] = cfg.get("data", {})
+    args.from_month = str(data_cfg.get("from_month", args.from_month))
+    sched_cfg: Dict[str, Any] = cfg.get("schedule", {})
+    mode_cfg = str(args.schedule_mode or sched_cfg.get("mode", "single"))
+    if getattr(args, "once", False):
+        effective_mode = "once"
+    elif args.loop or mode_cfg.lower() == "loop":
+        effective_mode = "loop"
+    else:
+        effective_mode = mode_cfg
+    if effective_mode.lower() == "loop":
+        cadence = "1h"
+    else:
+        cadence = str(args.cadence or sched_cfg.get("cadence", "1h"))
+    setattr(args, "_effective_mode", effective_mode)
+    setattr(args, "_effective_cadence", cadence)
+    cadence_s = _parse_cadence(cadence)
+    
+    def _run_once() -> int:
+        return run_pipeline(args, cfg, root_dir)
+    
+    # Print startup mode information
+    now_utc = pd.Timestamp.now(tz="UTC")
+    print("="*80)
+    print("ALLORA PIPELINE - Topic 67 (7-Day BTC/USD Log-Return Prediction)")
+    print("="*80)
+    print(f"Start Time:    {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    print(f"Mode:          {effective_mode.upper()}")
+    print(f"Cadence:       {cadence} ({cadence_s} seconds)")
+    print(f"Submit:        {'YES' if args.submit else 'NO'}")
+    print(f"Force Submit:  {'YES' if args.force_submit else 'NO'}")
+    
+    if effective_mode.lower() != "loop":
+        # SINGLE-SHOT MODE: Run once and exit immediately (no looping, no sleep)
+        print("Execution:     Single iteration (--once mode)")
+        print("="*80)
+        print()
+        return _run_once()
+    
+    # LOOP MODE: Continuous execution with cadence alignment
+    print("Execution:     Continuous loop (--loop mode)")
+    next_window = _window_start_utc(now=now_utc, cadence_s=cadence_s) + pd.Timedelta(seconds=cadence_s)
+    print(f"Next Cycle:    {next_window.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    if args.timeout > 0:
+        print(f"Timeout:       {args.timeout} seconds")
+    else:
+        print(f"Timeout:       None (runs indefinitely)")
+    print("="*80)
+    print()
+    
+    iteration = 0
+    loop_timeout = max(0, int(getattr(args, "timeout", 0) or 0))
+    start_wall = time.time()
+    
+    # Initial alignment: sleep until next cadence boundary before first iteration
+    _sleep_until_next_window(cadence_s)
+    last_rc = 0
+    while True:
+        if loop_timeout and (time.time() - start_wall) >= loop_timeout:
+            logging.info("[loop] timeout reached before next iteration; exiting loop")
+            print(f"Loop timeout reached. Exiting after {iteration} iterations.")
+            return last_rc
+        iteration += 1
+        iter_start = pd.Timestamp.now(tz="UTC")
+        logging.info(f"[loop] iteration={iteration} start at {iter_start.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        print(f"\n{'='*80}")
+        print(f"LOOP ITERATION {iteration} - {iter_start.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print(f"{'='*80}\n")
         
-        # Generate predictions with error handling
+        # Wrap pipeline execution in try-except to prevent loop crashes
         try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
-
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
+            rc = _run_once()
+            last_rc = rc
+            iter_end = pd.Timestamp.now(tz="UTC")
+            duration = (iter_end - iter_start).total_seconds()
+            logging.info(f"[loop] iteration={iteration} completed with rc={rc} in {duration:.1f}s")
+            print(f"\n✅ Iteration {iteration} completed (rc={rc}, duration={duration:.1f}s)")
+        except KeyboardInterrupt:
+            logging.info("[loop] received KeyboardInterrupt during execution; exiting loop")
+            print("\n\n🛑 Received KeyboardInterrupt. Exiting loop gracefully.")
+            return last_rc
         except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
+            # Log error but continue loop - ensures resilience against API failures, validation errors, etc.
+            error_msg = f"[loop] iteration={iteration} failed with exception: {type(e).__name__}: {e}"
+            logging.error(error_msg)
+            print(f"\n❌ ERROR in iteration {iteration}: {type(e).__name__}: {e}", file=sys.stderr)
+            rc = 1
+            last_rc = rc
+            logging.info(f"[loop] iteration={iteration} error handled, continuing to next cycle")
+            print(f"⚠️  Error handled. Will retry in next cycle.")
         
-        # Generate predictions with error handling
+        now_utc = pd.Timestamp.now(tz="UTC")
+        window_start = _window_start_utc(now=now_utc, cadence_s=cadence_s)
+        next_window = window_start + pd.Timedelta(seconds=cadence_s)
+        sleep_seconds = max(0.0, (next_window - now_utc).total_seconds())
+        logging.info(f"[loop] sleeping {sleep_seconds:.1f}s until {next_window.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        print(f"\n💤 Sleeping {sleep_seconds/60:.1f} minutes until next cycle at {next_window.strftime('%H:%M:%S')} UTC...")
         try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
-
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
-
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
-
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
-
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
-
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
-
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
-
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
-
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
-
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
-
-    # XGBoost (required for forecasts)
-    model_preds_val: Dict[str, pd.Series] = {}
-    model_preds_test: Dict[str, pd.Series] = {}
-    live_predictors: Dict[str, Any] = {}
-    try:
-        from xgboost import XGBRegressor  # type: ignore
-        
-        # Validate data before training
-        if X_tr.empty or y_tr.empty:
-            raise ValueError("Training data is empty")
-        if len(feature_cols) == 0:
-            raise ValueError("No features available for training")
-        
-        logging.info(f"Training XGBoost model with {len(X_tr)} samples and {len(feature_cols)} features")
-        
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.03,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=42,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        # Enforce XGBoost-only policy
-        assert xgb_model.__class__.__name__ == "XGBRegressor", "Only XGBoost models are allowed."
-        
-        # Convert to numpy with error handling
-        try:
-            X_train_np = X_tr[feature_cols].to_numpy(dtype=float)
-            y_train_np = y_tr.to_numpy(dtype=float)
-            
-            # Check for NaN values
-            if np.any(np.isnan(X_train_np)) or np.any(np.isnan(y_train_np)):
-                logging.warning("NaN values detected in training data, filling with zeros")
-                X_train_np = np.nan_to_num(X_train_np, nan=0.0)
-                y_train_np = np.nan_to_num(y_train_np, nan=0.0)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to convert training data to numpy: {e}")
-            
-        xgb_model.fit(X_train_np, y_train_np)
-        live_predictors["xgb"] = xgb_model
-        
-        # Generate predictions with error handling
-        try:
-            if not X_val.empty:
-                X_val_np = X_val[feature_cols].to_numpy(dtype=float)
-                X_val_np = np.nan_to_num(X_val_np, nan=0.0)
-                val_preds = xgb_model.predict(X_val_np)
-                model_preds_val["xgb"] = pd.Series(cast(np.ndarray, val_preds), index=y_val.index)
-                logging.info(f"Generated validation predictions: {len(val_preds)} values")
-                
-            X_test_np = X_te.to_numpy(dtype=float)
-            X_test_np = np.nan_to_num(X_test_np, nan=0.0)
-            test_preds = xgb_model.predict(X_test_np)
-            model_preds_test["xgb"] = pd.Series(cast(np.ndarray, test_preds), index=y_te.index)
-            logging.info(f"Generated test predictions: {len(test_preds)} values")
-            
-        except Exception as pred_e:
-            logging.error(f"Prediction generation failed: {pred_e}")
-            raise ValueError(f"Failed to generate predictions: {pred_e}")
-            
-    except Exception as _xgbe:
-        xgb_model = None
-        logging.error(f"XGBoost model training failed: {_xgbe}")
-        print(f"❌ XGBoost training failed: {_xgbe}", file=sys.stderr)
-    # No other learners are used; forecasts must come from XGB only.
-    if not model_preds_test:
-        print("ERROR: XGBoost failed to train or predict; forecasts will not be submitted.", file=sys.stderr)
-
-    # Enforce single-model: XGB only
-    if set(live_predictors.keys()) - {"xgb"}:
-        raise RuntimeError("Detected non-XGB predictors; only XGBoost is allowed.")
-    # With XGB-only, predictions come directly from the XGB model
-    y_pred_series = model_preds_test.get("xgb", pd.Series(0.0, index=y_te.index))
-
-    # (removed unused local helper _metrics to reduce linter warnings)
-
-    # Build training matrix
-    X_tr = pd.concat([X_train[feature_cols], X_val[feature_cols]]) if not X_val.empty else X_train[feature_cols]
-    y_tr = pd.concat([y_train, y_val]) if not X_val.empty else y_train
-    X_te = X_test[feature_cols]
-    y_te = y_test
-
-    # Expanding-window CV splits
-    def expanding_splits(n: int, k: int = 5):
-        step = max(2, n // (k + 1))
-        for i in range(1, k + 1):
-            tr_end = i * step
-            va_end = min(n, tr_end + step)
-            if va_end - tr_end < 2:
-                continue
-            yield list(range(0, tr_end)), list(range(tr_end, va_end))
-
-    # Volatility stratification: weight folds by recent volatility
-    def fold_score(y_true: pd.Series, y_pred: pd.Series) -> float:
-        # prioritize correlation and lower absolute errors; simple blend
-        a = y_true.to_numpy(dtype=float)
-        b = y_pred.to_numpy(dtype=float)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            corr = np.corrcoef(a, b)[0, 1]
-        rmse = float(np.sqrt(np.nanmean((a - b) ** 2)))
-        if not math.isfinite(corr):
-            corr = 0.0
-        return float(corr) - 0.1 * rmse
-
-    # Hyperparameter config (still read, but we ignore LGBM-related settings)
-   
+            time.sleep(sleep_seconds)
+        except KeyboardInterrupt:
+            logging.info("[loop] received KeyboardInterrupt; exiting loop")
+            print("\n\n🛑 Received KeyboardInterrupt. Exiting loop gracefully.")
+            return rc
+        if loop_timeout and (time.time() - start_wall) >= loop_timeout:
+            logging.info("[loop] timeout reached after iteration; exiting loop")
+            return last_rc
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
