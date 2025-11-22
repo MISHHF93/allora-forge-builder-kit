@@ -1,5 +1,19 @@
 {
-  "timestamp_utc": "2025-11-22T18:58:56.646316+00:00",
+  "timestamp": "2025-11-22T20:17:41.979380+00:00",
   "topic_id": 67,
-  "prediction_log_return_7d": 0.013221357017755508
+  "prediction": -0.012504137121140957,
+  "worker": "allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma",
+  "block_height": 6640075,
+  "proof": {
+    "inference": {
+      "topic_id": 67,
+      "block_height": 6640075,
+      "inferer": "allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma",
+      "value": "-0.012504137121140957",
+      "extra_data": "",
+      "proof": ""
+    }
+  },
+  "signature": "yAM07JlY40k7R7yjjk8vfCc5B7DqN4mSgcsD+j4/AHsbL3lxH9EvSULIgXbu7TgJj4Ju0Fg+q13MIFvb70yOXQ==",
+  "status": "success"
 }

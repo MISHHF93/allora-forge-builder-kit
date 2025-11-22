@@ -223,6 +223,12 @@ def get_unfulfilled_nonce(topic_id: int) -> int:
 def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> bool:
     timestamp = datetime.now(timezone.utc).isoformat()
     wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
+    
+    # Validate wallet before proceeding
+    if not wallet:
+        logger.error("ALLORA_WALLET_ADDR not set")
+        return False
+    
     block_height = get_unfulfilled_nonce(topic_id)
     if block_height == 0:
         logger.warning("No unfulfilled nonce available, skipping submission")
@@ -238,24 +244,33 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
     if not mnemonic:
         logger.error("MNEMONIC not set")
         return False
-    wallet_obj = LocalWallet.from_mnemonic(mnemonic)
+    
+    try:
+        wallet_obj = LocalWallet.from_mnemonic(mnemonic)
+    except Exception as e:
+        logger.error(f"Failed to create wallet from mnemonic: {e}")
+        return False
 
     # Create protobuf bundle
-    inference = InputInference(
-        topic_id=topic_id,
-        block_height=block_height,
-        inferer=wallet,
-        value=str(value),
-        extra_data=b"",
-        proof=""
-    )
-    bundle = InputInferenceForecastBundle(inference=inference)
+    try:
+        inference = InputInference(
+            topic_id=topic_id,
+            block_height=block_height,
+            inferer=wallet,
+            value=str(value),
+            extra_data=b"",
+            proof=""
+        )
+        bundle = InputInferenceForecastBundle(inference=inference)
 
-    # Serialize bundle to bytes
-    bundle_bytes = bundle.SerializeToString()
-    digest = hashlib.sha256(bundle_bytes).digest()
-    sig = wallet_obj._private_key.sign_digest(digest)
-    bundle_signature = base64.b64encode(sig).decode()
+        # Serialize bundle to bytes
+        bundle_bytes = bundle.SerializeToString()
+        digest = hashlib.sha256(bundle_bytes).digest()
+        sig = wallet_obj._private_key.sign_digest(digest)
+        bundle_signature = base64.b64encode(sig).decode()
+    except Exception as e:
+        logger.error(f"Failed to create bundle/signature: {e}")
+        return False
 
     # Worker data
     worker_data = {
@@ -276,28 +291,32 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
         "pubkey": "036ebdd2e91e40fe2e78200c788bf442cf2504a94a0b3eb328dcbda826d526d372"
     }
 
-    if not wallet:
-        logger.error("ALLORA_WALLET_ADDR not set")
-        return False
-
-    if block_height == 0:
-        logger.error("Cannot submit without block height")
-        return False
-
     cli = shutil.which("allorad") or shutil.which("allora")
     if not cli:
         logger.error("Allora CLI not found")
         return False
 
-    cmd = [cli, "tx", "emissions", "insert-worker-payload", wallet, json.dumps(worker_data),
-           "--yes", "--keyring-backend", "test", "--node", "https://allora-rpc.testnet.allora.network/",
-           "--chain-id", "allora-testnet-1", "--fees", "2500000uallo", "--broadcast-mode", "sync", "--gas", "250000", "--sequence", str(sequence), "--output", "json"]
+    # Use --from flag with wallet address instead of positional argument
+    cmd = [cli, "tx", "emissions", "insert-worker-payload",
+           json.dumps(worker_data),
+           "--from", wallet,
+           "--yes",
+           "--keyring-backend", "test",
+           "--node", "https://allora-rpc.testnet.allora.network/",
+           "--chain-id", "allora-testnet-1",
+           "--fees", "2500000uallo",
+           "--broadcast-mode", "sync",
+           "--gas", "250000",
+           "--sequence", str(sequence),
+           "--output", "json"]
     if dry_run:
         cmd.append("--dry-run")
         logger.info("Dry-run mode: simulating submission")
 
-    logger.info(f"Submitting: {' '.join(cmd)}")
+    logger.info(f"Submitting prediction {value:.8f} for topic {topic_id} at block {block_height}")
+    
     success = False
+    status = "pending"
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if proc.returncode == 0:
@@ -310,19 +329,24 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
                     status = "success"
                     success = True
                 else:
-                    logger.error(f"Submission failed: {resp.get('raw_log', 'Unknown error')}")
-                    status = f"failed: {resp.get('raw_log', 'Unknown error')}"
+                    error_msg = resp.get('raw_log', 'Unknown error')
+                    logger.error(f"Submission failed: {error_msg}")
+                    status = f"failed: {error_msg}"
             except json.JSONDecodeError:
-                logger.error(f"Failed to parse response: {proc.stdout}")
+                logger.error(f"Failed to parse JSON response: {proc.stdout}")
                 status = f"error: invalid response"
         else:
-            logger.error(f"CLI failed: {proc.stderr}")
-            status = f"cli_error: {proc.stderr.strip()}"
+            cli_error = proc.stderr.strip()
+            logger.error(f"CLI failed with code {proc.returncode}: {cli_error}")
+            status = f"cli_error: {cli_error}"
+    except subprocess.TimeoutExpired:
+        logger.error("CLI submission timed out (120s)")
+        status = "error: submission timeout"
     except Exception as e:
         logger.error(f"Submission error: {e}")
         status = f"error: {str(e)}"
 
-    # Log to CSV after submission
+    # Log to CSV ALWAYS (whether success or not)
     csv_path = "submission_log.csv"
     record = {
         "timestamp": timestamp,
@@ -334,14 +358,31 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
         "signature": bundle_signature,
         "status": status
     }
-    import csv
-    with open(csv_path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["timestamp","topic_id","prediction","worker","block_height","proof","signature","status"])
-        w.writerow(record)
+    
+    try:
+        import csv
+        with open(csv_path, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["timestamp","topic_id","prediction","worker","block_height","proof","signature","status"])
+            w.writerow(record)
+        logger.debug(f"Logged submission to CSV with status: {status}")
+    except Exception as e:
+        logger.error(f"Failed to log CSV: {e}")
 
-    # JSON
-    with open("latest_submission.json", "w") as jf:
-        json.dump({"timestamp": timestamp, "topic_id": topic_id, "prediction": value, "worker": wallet, "block_height": block_height, "proof": worker_data["inference_forecasts_bundle"], "signature": bundle_signature, "status": status}, jf, indent=2)
+    # Update latest_submission.json
+    try:
+        with open("latest_submission.json", "w") as jf:
+            json.dump({
+                "timestamp": timestamp,
+                "topic_id": topic_id,
+                "prediction": value,
+                "worker": wallet,
+                "block_height": block_height,
+                "proof": worker_data["inference_forecasts_bundle"],
+                "signature": bundle_signature,
+                "status": status
+            }, jf, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to write latest_submission.json: {e}")
 
     return success
 def main():
