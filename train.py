@@ -34,7 +34,8 @@ import pandas as pd
 try:
     import xgboost as xgb
     _XGB_AVAILABLE = True
-except Exception:  # pragma: no cover - fallback
+except Exception as e:
+    logger.error(f"❌ XGBoost import failed: {e}. Install with: pip install xgboost")
     _XGB_AVAILABLE = False
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error
@@ -383,6 +384,12 @@ def main():
     logger.info("=" * 72)
     logger.info("BTC 7D LOG-RETURN FORECAST - SINGLE RUN")
     logger.info("Config: days_back=%d, submit=%s, topic_id=%d", cfg.days_back, cfg.submit, cfg.topic_id)
+    
+    # Verify critical dependencies
+    if not _XGB_AVAILABLE:
+        logger.error("❌ CRITICAL: XGBoost is not installed. Install with: pip install xgboost")
+        logger.error("   Falling back to Ridge regression (lower accuracy).")
+    
     rc = run(cfg)
     logger.info("Exit code: %d", rc)
     return rc

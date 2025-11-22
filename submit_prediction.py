@@ -352,6 +352,21 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Simulate submission without sending.")
     parser.add_argument("--continuous", action="store_true", help="Run in continuous mode, submitting every hour.")
     args = parser.parse_args()
+    
+    # Validate critical files exist before entering continuous mode
+    if not os.path.exists(args.model):
+        logger.error(f"❌ CRITICAL: {args.model} not found. Run 'python train.py' first.")
+        sys.exit(1)
+    if not os.path.exists(args.features):
+        logger.error(f"❌ CRITICAL: {args.features} not found. Run 'python train.py' first.")
+        sys.exit(1)
+    
+    # Validate environment
+    required_env = ["ALLORA_WALLET_ADDR", "MNEMONIC", "TOPIC_ID"]
+    missing = [k for k in required_env if not os.getenv(k)]
+    if missing:
+        logger.error(f"❌ Missing environment variables: {', '.join(missing)}")
+        sys.exit(1)
 
     if args.continuous:
         import time
