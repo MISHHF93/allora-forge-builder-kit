@@ -568,6 +568,32 @@ def log_submission_to_csv(timestamp: str, topic_id: int, prediction: float, work
         logger.debug(f"Traceback: {traceback.format_exc()}")
 
 ###############################################################################
+# Update Latest Submission JSON
+###############################################################################
+def update_latest_submission_json(timestamp: str, topic_id: int, prediction: float, worker: str,
+                                   block_height: int, proof: dict, signature: str, status: str,
+                                   tx_hash: str = "", rpc_endpoint: str = "N/A"):
+    """Update latest_submission.json with current cycle data."""
+    try:
+        with open("latest_submission.json", "w") as jf:
+            json.dump({
+                "timestamp": timestamp,
+                "topic_id": topic_id,
+                "prediction": prediction,
+                "worker": worker,
+                "block_height": block_height,
+                "proof": proof,
+                "signature": signature,
+                "status": status,
+                "tx_hash": tx_hash or None,
+                "rpc_endpoint": rpc_endpoint,
+            }, jf, indent=2)
+        logger.debug(f"Updated latest_submission.json with status: {status}")
+    except Exception as e:
+        logger.error(f"❌ Failed to update latest_submission.json: {e}")
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+
+###############################################################################
 # Submission with Enhanced RPC Failover, Retry Logic, and CSV Logging
 ###############################################################################
 def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> bool:
@@ -589,6 +615,19 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
     if block_height == 0:
         logger.warning("⚠️  No unfulfilled nonce available, skipping submission")
         log_submission_to_csv(
+            timestamp=timestamp,
+            topic_id=topic_id,
+            prediction=value,
+            worker=wallet,
+            block_height=0,
+            proof={},
+            signature="",
+            status="skipped_no_nonce",
+            tx_hash="",
+            rpc_endpoint="N/A"
+        )
+        # Update JSON even when skipping
+        update_latest_submission_json(
             timestamp=timestamp,
             topic_id=topic_id,
             prediction=value,
@@ -812,24 +851,18 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
     )
 
     # Update latest_submission.json with comprehensive status
-    try:
-        with open("latest_submission.json", "w") as jf:
-            json.dump({
-                "timestamp": timestamp,
-                "topic_id": topic_id,
-                "prediction": value,
-                "worker": wallet,
-                "block_height": block_height,
-                "proof": worker_data["inference_forecasts_bundle"],
-                "signature": bundle_signature,
-                "status": status,
-                "tx_hash": tx_hash,
-                "rpc_endpoint": used_rpc["name"] if used_rpc else "unknown",
-                "submission_attempts": _submission_attempt_count,
-                "leaderboard_impact": success
-            }, jf, indent=2)
-    except Exception as e:
-        logger.error(f"❌ Failed to write latest_submission.json: {e}")
+    update_latest_submission_json(
+        timestamp=timestamp,
+        topic_id=topic_id,
+        prediction=value,
+        worker=wallet,
+        block_height=block_height,
+        proof=worker_data["inference_forecasts_bundle"],
+        signature=bundle_signature,
+        status=status,
+        tx_hash=tx_hash or "",
+        rpc_endpoint=used_rpc["name"] if used_rpc else "unknown"
+    )
 
     return success
 
