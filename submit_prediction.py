@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """
-BTC/USD 7-Day Log-Return Prediction Submission Utility
+BTC/USD 7-Day Log-Return Prediction Submission Daemon
 ------------------------------------------------------
 Loads trained model and features, fetches latest data, predicts,
 prepares Allora worker payload, and submits via allorad CLI.
 
+DAEMON MODE: Runs as a reliable long-lived process until December 15, 2025
+- Catches ALL exceptions and logs full tracebacks
+- Hourly heartbeat/liveness check
+- Never silently fails
+- Suitable for systemd/supervisord auto-restart
+- Validates model on every cycle
+
 Usage:
     python submit_prediction.py [--model MODEL_PATH] [--features FEATURES_PATH] [--topic-id TOPIC_ID] [--dry-run] [--once]
+    python submit_prediction.py --daemon  (run as permanent daemon)
 """
 
 import os
@@ -15,12 +23,15 @@ import sys
 import json
 import shutil
 import logging
+import logging.handlers
 import argparse
 import subprocess
 import hashlib
 import base64
 import time
 import math
+import signal
+import traceback
 from typing import List
 from datetime import datetime, timezone
 
@@ -40,65 +51,67 @@ class Nonce:
         self.block_height = block_height
 
 ###############################################################################
-# Logging Setup - Enhanced for Long-Lived Daemon
+# Logging Setup - Enhanced for Daemon
 ###############################################################################
-def setup_logging(log_file: str = "logs/submission.log") -> logging.Logger:
-    """Setup enhanced logging with both file and console output."""
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    
+def setup_logging(log_file: str = "logs/submission.log"):
+    """Configure logging with both console and file output."""
     logger = logging.getLogger("btc_submit")
-    logger.setLevel(logging.DEBUG)  # Capture all levels
+    logger.setLevel(logging.DEBUG)
     
-    # File handler - writes everything including tracebacks
-    fh = logging.FileHandler(log_file)
-    fh.setLevel(logging.DEBUG)
-    file_formatter = logging.Formatter(
+    # Create logs directory if needed
+    log_dir = os.path.dirname(log_file)
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    # Console handler (INFO level)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_fmt = logging.Formatter(
         '%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%SZ'
     )
-    fh.setFormatter(file_formatter)
+    console_handler.setFormatter(console_fmt)
     
-    # Console handler - shows important messages
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    console_formatter = logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s',
+    # File handler with rotation (DEBUG level - capture everything)
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=50*1024*1024,  # 50 MB
+        backupCount=5,           # Keep 5 rotated files
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_fmt = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%SZ'
     )
-    ch.setFormatter(console_formatter)
+    file_handler.setFormatter(file_fmt)
     
-    # Remove old handlers to avoid duplicates
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-    
-    logger.addHandler(fh)
-    logger.addHandler(ch)
+    # Add handlers
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
     
     return logger
 
 logger = setup_logging()
 
+# Global state for daemon
+_shutdown_requested = False
+
+def signal_handler(signum, frame):
+    """Handle termination signals gracefully."""
+    global _shutdown_requested
+    signal_name = signal.Signals(signum).name
+    logger.warning(f"Received signal {signal_name} ({signum}), initiating graceful shutdown...")
+    _shutdown_requested = True
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGHUP, signal_handler)
+
 ###############################################################################
 # Data Fetching (Latest)
 ###############################################################################
-def safe_call(func, *args, **kwargs):
-    """Safely execute a function, logging full traceback on exception."""
-    try:
-        return func(*args, **kwargs)
-    except Exception as e:
-        logger.error(f"Exception in {func.__name__}: {type(e).__name__}: {e}")
-        logger.error("Full traceback:")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise
-
-def log_heartbeat(cycle_num: int = None):
-    """Log a heartbeat message for daemon liveness monitoring."""
-    if cycle_num is not None:
-        logger.info(f"🔄 [HEARTBEAT] Daemon alive - cycle #{cycle_num}")
-    else:
-        logger.info(f"🔄 [HEARTBEAT] Daemon alive at {datetime.now(timezone.utc).isoformat()}")
-
 def fetch_latest_btcusd_hourly(hours: int = 168, api_timeout: int = 30) -> pd.DataFrame:
     """Fetch recent BTC/USD hourly data for prediction."""
     logger.info(f"Fetching latest {hours}h BTC/USD data from Tiingo...")
@@ -483,7 +496,9 @@ def main():
     parser.add_argument("--features", type=str, default="features.json", help="Path to feature columns.")
     parser.add_argument("--topic-id", type=int, default=int(os.getenv("TOPIC_ID", "67")), help="Allora topic ID.")
     parser.add_argument("--dry-run", action="store_true", help="Simulate submission without sending.")
+    parser.add_argument("--once", action="store_true", help="Run once and exit (replaces --continuous when not set).")
     parser.add_argument("--continuous", action="store_true", help="Run in continuous mode, submitting every hour.")
+    parser.add_argument("--daemon", action="store_true", help="Run as permanent daemon (until Dec 15, 2025).")
     args = parser.parse_args()
     
     # Validate critical files exist before entering continuous mode
@@ -501,55 +516,89 @@ def main():
         logger.error(f"❌ Missing environment variables: {', '.join(missing)}")
         sys.exit(1)
 
-    if args.continuous:
-        import time
-        interval = int(os.getenv("SUBMISSION_INTERVAL", "3600"))
-        heartbeat_interval = 3600  # Log heartbeat every hour
-        last_heartbeat = time.time()
-        cycle_num = 0
-        
-        logger.info("="*80)
-        logger.info("DAEMON MODE STARTED - Will run until Dec 15, 2025")
-        logger.info(f"Submission interval: {interval}s ({interval//60}min)")
-        logger.info(f"Heartbeat interval: {heartbeat_interval}s ({heartbeat_interval//60}min)")
-        logger.info("="*80)
-        
-        while True:
-            cycle_num += 1
-            cycle_start = time.time()
-            
-            try:
-                # Log heartbeat if time has passed
-                current_time = time.time()
-                if current_time - last_heartbeat >= heartbeat_interval:
-                    log_heartbeat(cycle_num)
-                    last_heartbeat = current_time
-                
-                logger.info(f"\n--- Cycle #{cycle_num} started at {datetime.now(timezone.utc).isoformat()} ---")
-                success = main_once(args)
-                
-                if success:
-                    logger.info("✅ Submission completed successfully")
-                else:
-                    logger.info("⚠️  Submission skipped or failed (will retry in next cycle)")
-                    
-            except Exception as e:
-                logger.error(f"❌ CRITICAL ERROR in continuous loop cycle #{cycle_num}: {type(e).__name__}: {e}")
-                logger.error("Full traceback:")
-                import traceback
-                logger.error(traceback.format_exc())
-                logger.error(f"Daemon will continue running and retry in {interval}s...")
-            
-            # Calculate sleep time
-            cycle_elapsed = time.time() - cycle_start
-            sleep_time = max(0, interval - cycle_elapsed)
-            logger.info(f"Cycle #{cycle_num} completed in {cycle_elapsed:.1f}s. Sleeping {sleep_time:.1f}s until next cycle...")
-            time.sleep(sleep_time)
+    if args.daemon or args.continuous:
+        run_daemon(args)
     else:
-        sys.exit(main_once(args))
+        # Single run mode
+        exit_code = main_once(args)
+        sys.exit(0 if exit_code else 1)
+
+def run_daemon(args):
+    """
+    Run as a long-lived daemon until December 15, 2025.
+    Handles all exceptions, never silently fails, includes hourly heartbeat.
+    """
+    global _shutdown_requested
+    
+    interval = int(os.getenv("SUBMISSION_INTERVAL", "3600"))  # 1 hour default
+    competition_end = datetime(2025, 12, 15, 0, 0, 0, tzinfo=timezone.utc)
+    
+    logger.info("=" * 80)
+    logger.info("🚀 DAEMON MODE STARTED")
+    logger.info(f"   Model: {args.model}")
+    logger.info(f"   Features: {args.features}")
+    logger.info(f"   Topic ID: {args.topic_id}")
+    logger.info(f"   Submission Interval: {interval}s ({interval/3600:.1f}h)")
+    logger.info(f"   Competition End: {competition_end.isoformat()}")
+    logger.info(f"   Current Time: {datetime.now(timezone.utc).isoformat()}")
+    logger.info("=" * 80)
+    
+    cycle_count = 0
+    last_heartbeat = None
+    
+    while not _shutdown_requested:
+        cycle_count += 1
+        cycle_start = datetime.now(timezone.utc)
+        
+        # Check if competition has ended
+        if cycle_start >= competition_end:
+            logger.info(f"⏰ Competition end date ({competition_end.isoformat()}) reached. Shutting down.")
+            break
+        
+        # Hourly heartbeat (separate from submission attempts)
+        now_hour = cycle_start.replace(minute=0, second=0, microsecond=0)
+        if last_heartbeat != now_hour:
+            logger.info(f"💓 HEARTBEAT - Daemon alive at {cycle_start.isoformat()}")
+            last_heartbeat = now_hour
+        
+        try:
+            logger.info(f"\n{'='*80}")
+            logger.info(f"SUBMISSION CYCLE #{cycle_count} - {cycle_start.isoformat()}")
+            logger.info(f"{'='*80}")
+            
+            success = main_once(args)
+            
+            if success:
+                logger.info("✅ Submission cycle completed successfully")
+            else:
+                logger.warning("⚠️  Submission cycle completed without successful submission (may be skipped/no nonce)")
+        
+        except Exception as e:
+            # CRITICAL: Never silently fail
+            logger.error(f"❌ UNHANDLED EXCEPTION IN SUBMISSION CYCLE #{cycle_count}")
+            logger.error(f"   Exception: {type(e).__name__}: {str(e)}")
+            logger.error("   Full traceback:")
+            for line in traceback.format_exc().split('\n'):
+                if line.strip():
+                    logger.error(f"   {line}")
+            # Continue to next cycle instead of crashing
+        
+        try:
+            if not _shutdown_requested:
+                logger.info(f"Sleeping for {interval}s until next submission cycle...")
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            logger.warning("Interrupted during sleep, proceeding to next cycle")
+            pass
+    
+    logger.info("=" * 80)
+    logger.info("🛑 DAEMON SHUTDOWN COMPLETE")
+    logger.info(f"   Total Cycles: {cycle_count}")
+    logger.info(f"   Final Time: {datetime.now(timezone.utc).isoformat()}")
+    logger.info("=" * 80)
 
 def main_once(args):
-    """Execute one submission cycle with comprehensive error handling."""
+    """Execute a single submission cycle with comprehensive error handling."""
     try:
         # Load and validate features first
         if not os.path.exists(args.features):
@@ -557,104 +606,107 @@ def main_once(args):
             logger.error("   Run 'python train.py' to generate features.json")
             return False
         
-        try:
-            with open(args.features, "r") as f:
-                feature_cols = json.load(f)
-            logger.info(f"✅ Loaded {len(feature_cols)} feature columns")
-        except Exception as e:
-            logger.error(f"Failed to load features.json: {e}")
-            logger.error("Full traceback:")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
+        with open(args.features, "r") as f:
+            feature_cols = json.load(f)
+        logger.info(f"✅ Loaded {len(feature_cols)} feature columns")
         
-        # Validate model before using it
+        # Validate model before using it (CRITICAL FOR DAEMON)
         if not validate_model(args.model, len(feature_cols)):
-            logger.error(f"❌ CRITICAL: Model validation failed. Cannot proceed.")
+            logger.error(f"❌ CRITICAL: Model validation failed. Cannot proceed with submission.")
             logger.error("   Run 'python train.py' to train a new model.")
+            logger.error("   Daemon will retry in next cycle.")
             return False
         
         # Load model (we know it's valid now)
-        try:
-            import pickle
-            with open(args.model, "rb") as f:
-                model = pickle.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load model pickle: {e}")
-            logger.error("Full traceback:")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
+        import pickle
+        with open(args.model, "rb") as f:
+            model = pickle.load(f)
+        logger.debug("Model loaded and validated")
 
-        # Fetch latest data with exception handling
+        # Fetch latest data with error handling
         try:
             raw = fetch_latest_btcusd_hourly()
-            if raw.empty:
-                logger.error("Fetched empty dataframe from Tiingo")
-                return False
+            logger.debug(f"Fetched {len(raw)} raw price records")
         except Exception as e:
-            logger.error(f"Failed to fetch latest data: {e}")
-            logger.error("Full traceback:")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Failed to fetch BTC/USD data: {e}")
+            logger.error("   Retrying in next cycle")
+            for line in traceback.format_exc().split('\n'):
+                if line.strip():
+                    logger.debug(line)
             return False
         
-        # Feature engineering with exception handling
+        # Feature engineering with error handling
         try:
             feats = generate_features(raw)
             if len(feats) == 0:
-                logger.error("No feature data available after feature engineering")
+                logger.error("❌ No feature data available after feature engineering")
+                logger.error("   Raw data insufficient or feature generation failed")
+                logger.error("   Retrying in next cycle")
                 return False
+            logger.debug(f"Generated features for {len(feats)} records")
         except Exception as e:
-            logger.error(f"Failed during feature engineering: {e}")
-            logger.error("Full traceback:")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Feature engineering failed: {e}")
+            logger.error("   Retrying in next cycle")
+            for line in traceback.format_exc().split('\n'):
+                if line.strip():
+                    logger.debug(line)
             return False
         
         # Prepare input for prediction
         try:
             latest = feats.iloc[-1]
             x_live = latest[feature_cols].values.reshape(1, -1)
+            logger.debug(f"Prepared prediction input (shape: {x_live.shape})")
         except KeyError as e:
             logger.error(f"❌ Missing feature column: {e}")
-            logger.error("   Feature mismatch with current data.")
+            logger.error("   Feature mismatch between features.json and current data.")
             logger.error("   Run 'python train.py' to regenerate features.json")
+            logger.error("   Retrying in next cycle")
             return False
         except Exception as e:
-            logger.error(f"Failed to prepare input for prediction: {e}")
-            logger.error("Full traceback:")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Error preparing prediction input: {e}")
+            logger.error("   Retrying in next cycle")
+            for line in traceback.format_exc().split('\n'):
+                if line.strip():
+                    logger.debug(line)
             return False
 
-        # Predict with exception handling
+        # Predict with error handling
         try:
             pred = predict_forward_log_return(model, x_live)
+            logger.debug(f"Prediction computed: {pred:.8f}")
         except Exception as e:
-            logger.error(f"Failed to generate prediction: {e}")
-            logger.error("Full traceback:")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Prediction failed: {e}")
+            logger.error("   Model may be corrupted or incompatible")
+            logger.error("   Retrying in next cycle")
+            for line in traceback.format_exc().split('\n'):
+                if line.strip():
+                    logger.debug(line)
             return False
 
-        # Submit with exception handling
+        # Submit with error handling
         try:
             success = submit_prediction(pred, args.topic_id, dry_run=args.dry_run)
-            logger.info(f"Submission status: {'success' if success else 'skipped or failed'}")
+            if success:
+                logger.info(f"✅ Submission status: SUCCESS")
+            else:
+                logger.info(f"⚠️  Submission status: skipped or failed (may be no unfulfilled nonce)")
             return success
         except Exception as e:
-            logger.error(f"Failed during submission: {e}")
-            logger.error("Full traceback:")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Submission failed with exception: {e}")
+            logger.error("   Retrying in next cycle")
+            for line in traceback.format_exc().split('\n'):
+                if line.strip():
+                    logger.debug(line)
             return False
-            
+    
     except Exception as e:
-        logger.error(f"Fatal error in main_once: {type(e).__name__}: {e}")
-        logger.error("Full traceback:")
-        import traceback
-        logger.error(traceback.format_exc())
+        # Final catch-all to ensure no silent failures
+        logger.error(f"❌ UNHANDLED EXCEPTION in main_once: {type(e).__name__}: {str(e)}")
+        logger.error("   This should not happen - indicates a bug in cycle logic")
+        for line in traceback.format_exc().split('\n'):
+            if line.strip():
+                logger.error(f"   {line}")
         return False
 
 if __name__ == "__main__":

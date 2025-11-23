@@ -1,42 +1,63 @@
 [Unit]
 Description=Allora BTC/USD Prediction Submission Daemon
-Documentation=file:///workspaces/allora-forge-builder-kit/README.md
+Documentation=https://github.com/MISHHF93/allora-forge-builder-kit
 After=network-online.target
 Wants=network-online.target
+Requires=network-online.target
 
 [Service]
-# Service execution
 Type=simple
-User=root
+User=codespa
+Group=codespa
 WorkingDirectory=/workspaces/allora-forge-builder-kit
-ExecStart=/workspaces/allora-forge-builder-kit/.venv/bin/python submit_prediction.py --continuous
+Environment="PATH=/workspaces/allora-forge-builder-kit/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
 
-# Auto-restart on failure
+# Main execution
+ExecStart=/workspaces/allora-forge-builder-kit/.venv/bin/python -u submit_prediction.py --daemon
+
+# Restart policy for reliability
 Restart=always
-RestartSec=10
-StartLimitInterval=60s
+RestartSec=30
+StartLimitInterval=300
 StartLimitBurst=5
+
+# Graceful shutdown: allow 30 seconds to shut down cleanly
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Resource limits (adjust as needed)
+MemoryLimit=2G
+CPUQuota=50%
 
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=allora-submit
+SyslogIdentifier=allora-submission
 
-# Security & resource limits
-NoNewPrivileges=true
-PrivateTmp=true
+# Security
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadOnlyPaths=/etc
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/workspaces/allora-forge-builder-kit/logs /workspaces/allora-forge-builder-kit/submission_log.csv /workspaces/allora-forge-builder-kit/latest_submission.json
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallFilter=~@clock @debug @module @mount @obsolete @privileged @raw-io @reboot @swap
+LockPersonality=yes
 
-# Environment variables - set these before starting
-EnvironmentFile=/workspaces/allora-forge-builder-kit/.env
+# Ensure clean environment
+ClearEnvironment=no
 
-# Timeout before force kill
-TimeoutStopSec=30
-
-# Nice level for resource priority
-Nice=0
+# Optional: Automatically restart on system boot
+WantedBy=multi-user.target
 
 [Install]
 WantedBy=multi-user.target
