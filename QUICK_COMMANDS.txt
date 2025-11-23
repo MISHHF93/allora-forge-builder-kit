@@ -1,0 +1,241 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                      RPC REFACTOR - QUICK COMMANDS                         ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DAEMON CONTROL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Check Status:
+  ps aux | grep "submit_prediction.py --daemon" | grep -v grep
+
+Start Daemon:
+  cd /workspaces/allora-forge-builder-kit && \
+  nohup python submit_prediction.py --daemon > /tmp/daemon_refactored.log 2>&1 & \
+  echo $! > daemon.pid && ps aux | grep "submit_prediction.py --daemon" | grep -v grep
+
+Stop Daemon:
+  PID=$(cat daemon.pid) && kill $PID && echo "Daemon stopped (PID $PID)"
+
+Test Single Cycle (Dry-Run):
+  python submit_prediction.py --once --dry-run 2>&1 | tail -20
+
+Test Single Cycle (Real):
+  python submit_prediction.py --once 2>&1 | tail -20
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MONITORING & LOGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+View Live Logs:
+  tail -f /tmp/daemon_refactored.log
+
+View Errors Only:
+  tail -f /tmp/daemon_refactored.log | grep -i "error\|failed"
+
+View Last 50 Lines:
+  tail -50 /tmp/daemon_refactored.log
+
+View Last Heartbeat:
+  grep "HEARTBEAT" /tmp/daemon_refactored.log | tail -1
+
+Count Log Lines:
+  wc -l /tmp/daemon_refactored.log
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CSV SUBMISSION LOG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+View All Entries:
+  cat submission_log.csv
+
+View Last 5 Entries:
+  tail -5 submission_log.csv
+
+Count Total Entries:
+  wc -l submission_log.csv
+
+View Header:
+  head -1 submission_log.csv
+
+View Latest Entry:
+  tail -1 submission_log.csv
+
+Find Successful Submissions:
+  grep "success_confirmed" submission_log.csv
+
+Find Failed Submissions:
+  grep "failed_submission" submission_log.csv
+
+Find Heartbeats:
+  grep "heartbeat_alive\|heartbeat_error" submission_log.csv
+
+View Success Rate:
+  echo "Successes:"; grep -c "success_confirmed" submission_log.csv; \
+  echo "Failures:"; grep -c "failed_submission" submission_log.csv
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RPC ENDPOINT DIAGNOSTICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+View RPC Health Report:
+  grep -A 5 "RPC Health Report" /tmp/daemon_refactored.log | tail -10
+
+Count Ankr Usage:
+  grep "Ankr" submission_log.csv | wc -l
+
+Count AllThatNode Usage:
+  grep "AllThatNode" submission_log.csv | wc -l
+
+Count ChandraStation Usage:
+  grep "ChandraStation" submission_log.csv | wc -l
+
+Count Allora Official Usage:
+  grep "Allora Official" submission_log.csv | wc -l
+
+View Endpoint Failures:
+  grep "RPC ENDPOINT FAILED" /tmp/daemon_refactored.log
+
+View Endpoint Resets:
+  grep "RPC Endpoint recovered" /tmp/daemon_refactored.log
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ERROR CODE LOOKUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Find All Errors by Code:
+  grep "Error Code:" /tmp/daemon_refactored.log | sort | uniq -c
+
+Find Invalid JSON Errors:
+  grep "INVALID_JSON" /tmp/daemon_refactored.log
+
+Find Sequence Mismatch:
+  grep "SEQUENCE_MISMATCH" /tmp/daemon_refactored.log
+
+Find Timeout Errors:
+  grep "TIMEOUT" /tmp/daemon_refactored.log
+
+Find CLI Errors:
+  grep "CLI_ERROR" /tmp/daemon_refactored.log
+
+Find Query Failed:
+  grep "QUERY_FAILED" /tmp/daemon_refactored.log
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SUBMISSION DETAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+View All Transaction Hashes:
+  grep "success_confirmed" submission_log.csv | cut -d',' -f9
+
+View Latest Transaction:
+  grep "success_confirmed" submission_log.csv | tail -1 | cut -d',' -f9
+
+View Prediction Values:
+  cut -d',' -f3 submission_log.csv | grep -v "prediction"
+
+View Submission Attempts:
+  cut -d',' -f11 submission_log.csv | grep -v "attempts"
+
+View On-Chain Verification Status:
+  cut -d',' -f12 submission_log.csv | sort | uniq -c
+
+View All Error Details:
+  cut -d',' -f13 submission_log.csv | grep -v "error_details" | head -5
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DOCUMENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Quick Start:
+  cat START_HERE.md
+
+Executive Summary:
+  cat DELIVERY_SUMMARY.md
+
+Technical Deep-Dive:
+  cat RPC_REFACTOR_COMPREHENSIVE.md
+
+Error Analysis:
+  cat RPC_WARNINGS_AND_ERRORS.md
+
+Verification Results:
+  cat RPC_REFACTOR_VERIFICATION_CHECKLIST.md
+
+Quick Reference:
+  cat RPC_FAILOVER_QUICK_REFERENCE.md
+
+Complete Index:
+  cat RPC_REFACTOR_INDEX.md
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MAINTENANCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Backup Current Code:
+  cp submit_prediction.py submit_prediction.py.$(date +%s).backup
+
+Restore Previous Version:
+  cp submit_prediction.py.backup submit_prediction.py
+
+Check Code Differences:
+  diff submit_prediction.py submit_prediction.py.backup | head -20
+
+Verify Code Integrity:
+  wc -l submit_prediction.py submit_prediction.py.backup
+
+Clear RPC Failure History (ADVANCED):
+  python -c "import json; print(json.dumps({}, indent=2))" > /tmp/rpc_failures.json
+
+Monitor Resource Usage:
+  watch -n 1 'ps aux | grep "submit_prediction.py --daemon" | grep -v grep'
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TROUBLESHOOTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Check if Daemon is Stuck:
+  ps aux | grep "submit_prediction.py --daemon" && \
+  tail -5 /tmp/daemon_refactored.log
+
+Force Restart Daemon:
+  pkill -f "submit_prediction.py --daemon" || true && sleep 2 && \
+  cd /workspaces/allora-forge-builder-kit && \
+  nohup python submit_prediction.py --daemon > /tmp/daemon_refactored.log 2>&1 & \
+  echo $! > daemon.pid && sleep 2 && \
+  ps aux | grep "submit_prediction.py --daemon" | grep -v grep
+
+Check Model File:
+  ls -lh model.pkl feature_columns.json
+
+Verify Data Source (Tiingo):
+  grep -i "tiingo\|fetch" /tmp/daemon_refactored.log | tail -5
+
+Check RPC Connectivity:
+  grep -i "rpc\|endpoint" /tmp/daemon_refactored.log | grep -E "FAILED|SUCCESS|attempt" | tail -10
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DASHBOARD (All-in-One Status)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Full Status Report:
+  echo "=== DAEMON STATUS ===" && \
+  ps aux | grep "submit_prediction.py --daemon" | grep -v grep && \
+  echo && echo "=== LATEST ENTRIES ===" && \
+  tail -3 submission_log.csv | cut -c1-80 && \
+  echo && echo "=== RECENT ERRORS ===" && \
+  grep "ERROR\|FAILED" /tmp/daemon_refactored.log | tail -5 && \
+  echo && echo "=== STATS ===" && \
+  echo "Total: $(wc -l < submission_log.csv) entries" && \
+  echo "Success: $(grep -c success_confirmed submission_log.csv || echo 0) entries" && \
+  echo "Failed: $(grep -c failed_submission submission_log.csv || echo 0) entries" && \
+  echo "Heartbeats: $(grep -c HEARTBEAT submission_log.csv || echo 0) entries"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For more information, see:
+  - START_HERE.md (5 min overview)
+  - RPC_REFACTOR_INDEX.md (complete index)
+  - RPC_FAILOVER_QUICK_REFERENCE.md (detailed commands)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
