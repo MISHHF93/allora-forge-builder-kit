@@ -1,19 +1,19 @@
 {
-  "timestamp": "2025-11-23T02:43:48.914968+00:00",
+  "timestamp": "2025-11-23T04:10:16.981583+00:00",
   "topic_id": 67,
   "prediction": -0.038135699927806854,
   "worker": "allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma",
-  "block_height": 6644395,
+  "block_height": 6645115,
   "proof": {
     "inference": {
       "topic_id": 67,
-      "block_height": 6644395,
+      "block_height": 6645115,
       "inferer": "allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma",
       "value": "-0.038135699927806854",
       "extra_data": "",
       "proof": ""
     }
   },
-  "signature": "N8rzYnQyz/0IC5tXh017hVkzZemoSqud/8r22mZ7a7gNUJSPXiTRGtCy+SaVzqzOGifsK0EVSj5D4oIHGOKQ4w==",
+  "signature": "Z8dNgbC/kQl7DJTlWMNPF+w7W6MOCkX6n3jrxwBbAvAvwZ51H4RcpD/Q52O1eNxeh/zcvQ9BTWPjqhGT9NsxtQ==",
   "status": "success"
 }

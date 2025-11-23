@@ -32,11 +32,22 @@ import time
 import math
 import signal
 import traceback
-from typing import List
+from typing import List, Optional
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 load_dotenv()
+
+# RPC Endpoint Failover List
+RPC_ENDPOINTS = [
+    "https://allora-rpc.testnet.allora.network/",
+    "https://allora-testnet-rpc.allthatnode.com:1317/",
+    "https://allora.api.chandrastation.com/",
+]
+
+# Global state for RPC endpoint rotation
+_rpc_endpoint_index = 0
+_failed_rpc_endpoints = set()
 
 import requests
 import numpy as np
@@ -49,6 +60,39 @@ from allora_sdk.protos.emissions.v9 import InputWorkerDataBundle, InputInference
 class Nonce:
     def __init__(self, block_height: int):
         self.block_height = block_height
+
+###############################################################################
+# RPC Endpoint Management with Failover
+###############################################################################
+def get_rpc_endpoint() -> str:
+    """Get the next working RPC endpoint with automatic failover."""
+    global _rpc_endpoint_index, _failed_rpc_endpoints
+    
+    # Reset if all endpoints marked as failed
+    if len(_failed_rpc_endpoints) >= len(RPC_ENDPOINTS):
+        logger.info("🔄 Resetting failed RPC endpoints list for retry")
+        _failed_rpc_endpoints.clear()
+        _rpc_endpoint_index = 0
+    
+    # Try to find next working endpoint
+    for _ in range(len(RPC_ENDPOINTS)):
+        endpoint = RPC_ENDPOINTS[_rpc_endpoint_index % len(RPC_ENDPOINTS)]
+        _rpc_endpoint_index += 1
+        
+        if endpoint not in _failed_rpc_endpoints:
+            return endpoint
+    
+    # Fallback to first endpoint if all tried
+    logger.warning("⚠️  All RPC endpoints exhausted, using first endpoint")
+    _rpc_endpoint_index = 0
+    _failed_rpc_endpoints.clear()
+    return RPC_ENDPOINTS[0]
+
+def mark_rpc_failed(endpoint: str):
+    """Mark an RPC endpoint as failed for future queries."""
+    global _failed_rpc_endpoints
+    _failed_rpc_endpoints.add(endpoint)
+    logger.warning(f"⚠️  Marked RPC endpoint as failed: {endpoint}")
 
 ###############################################################################
 # Logging Setup - Enhanced for Daemon
@@ -257,102 +301,197 @@ def validate_model(model_path: str, feature_count: int) -> bool:
 # Get Account Sequence
 ###############################################################################
 def get_account_sequence(wallet: str) -> int:
+    """Query account sequence from Allora network with RPC failover."""
     cli = shutil.which("allorad") or shutil.which("allora")
     if not cli:
-        logger.error("Allora CLI not found")
+        logger.error("❌ Allora CLI not found in PATH")
         return 0
-    cmd = [cli, "query", "auth", "account", wallet, "--output", "json"]
+    
+    rpc_endpoint = get_rpc_endpoint()
+    logger.debug(f"Querying account sequence via RPC: {rpc_endpoint}")
+    
+    cmd = [cli, "query", "auth", "account", wallet, 
+           "--node", rpc_endpoint,
+           "--output", "json"]
+    
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if proc.returncode == 0:
             data = json.loads(proc.stdout)
-            return int(data["account"]["value"]["sequence"])
+            sequence = int(data["account"]["value"]["sequence"])
+            logger.debug(f"✅ Got account sequence: {sequence}")
+            return sequence
         else:
-            logger.error(f"Query failed: {proc.stderr}")
+            error_msg = proc.stderr.strip()
+            logger.warning(f"⚠️  Query failed for account {wallet}: {error_msg}")
+            mark_rpc_failed(rpc_endpoint)
             return 0
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Failed to parse account sequence response: {e}")
+        mark_rpc_failed(rpc_endpoint)
+        return 0
+    except subprocess.TimeoutExpired:
+        logger.error(f"❌ Query timed out (30s) for account sequence on {rpc_endpoint}")
+        mark_rpc_failed(rpc_endpoint)
+        return 0
     except Exception as e:
-        logger.error(f"Query error: {e}")
+        logger.error(f"❌ Error querying account sequence: {e}")
+        mark_rpc_failed(rpc_endpoint)
         return 0
 
 ###############################################################################
 # Get Unfulfilled Nonce
 ###############################################################################
 def get_unfulfilled_nonce(topic_id: int) -> int:
+    """Query unfulfilled nonces from Allora network with RPC failover."""
     cli = shutil.which("allorad") or shutil.which("allora")
     if not cli:
-        logger.error("Allora CLI not found")
+        logger.error("❌ Allora CLI not found in PATH")
         return 0
+    
+    rpc_endpoint = get_rpc_endpoint()
+    logger.debug(f"Querying unfulfilled nonces for topic {topic_id} via RPC: {rpc_endpoint}")
+    
     cmd = [cli, "query", "emissions", "unfulfilled-worker-nonces", str(topic_id),
+           "--node", rpc_endpoint,
            "--output", "json"]
+    
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if proc.returncode == 0:
             data = json.loads(proc.stdout)
             nonces_data = data.get("nonces", {}).get("nonces", [])
             nonces = [int(item["block_height"]) for item in nonces_data]
-            if nonces:
-                # Filter out nonces already submitted by this worker
-                wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
-                filtered_nonces = []
-                for nonce in nonces:
+            
+            if not nonces:
+                logger.info(f"ℹ️  No unfulfilled nonces found for topic {topic_id}")
+                return 0
+            
+            logger.debug(f"✅ Found {len(nonces)} unfulfilled nonces for topic {topic_id}: {nonces}")
+            
+            # Filter out nonces already submitted by this worker
+            wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
+            if not wallet:
+                logger.error("❌ ALLORA_WALLET_ADDR not set")
+                return 0
+            
+            filtered_nonces = []
+            for nonce in nonces:
+                try:
                     # Check if already submitted
-                    cmd_check = [cli, "query", "emissions", "worker-latest-inference", str(topic_id), wallet, "--output", "json"]
+                    cmd_check = [cli, "query", "emissions", "worker-latest-inference", 
+                                str(topic_id), wallet,
+                                "--node", rpc_endpoint,
+                                "--output", "json"]
                     proc_check = subprocess.run(cmd_check, capture_output=True, text=True, timeout=30)
+                    
                     if proc_check.returncode == 0:
                         data_check = json.loads(proc_check.stdout)
                         latest_bh = int(data_check.get("latest_inference", {}).get("block_height", 0))
                         if latest_bh != nonce:
                             filtered_nonces.append(nonce)
+                            logger.debug(f"  ✓ Nonce {nonce} available (latest submitted: {latest_bh})")
+                        else:
+                            logger.debug(f"  ✗ Nonce {nonce} already submitted")
                     else:
-                        # If check fails, assume not submitted
+                        # If check fails, assume not submitted and include it
                         filtered_nonces.append(nonce)
-                if filtered_nonces:
-                    return min(filtered_nonces)
-                else:
-                    logger.warning("All unfulfilled nonces already submitted by this worker")
-                    return 0
+                        logger.debug(f"  ? Nonce {nonce} check inconclusive, will attempt submission")
+                except Exception as e:
+                    logger.warning(f"⚠️  Error checking nonce {nonce}: {e}")
+                    filtered_nonces.append(nonce)
+            
+            if filtered_nonces:
+                selected_nonce = min(filtered_nonces)
+                logger.info(f"🎯 Selected nonce for submission: block_height={selected_nonce}")
+                return selected_nonce
             else:
-                logger.warning("No unfulfilled nonces found")
+                logger.warning(f"⚠️  All unfulfilled nonces already submitted by worker {wallet}")
                 return 0
         else:
-            logger.error(f"Query failed: {proc.stderr}")
+            error_msg = proc.stderr.strip()
+            logger.warning(f"⚠️  Query failed for unfulfilled nonces: {error_msg}")
+            mark_rpc_failed(rpc_endpoint)
             return 0
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Failed to parse unfulfilled nonces response: {e}")
+        mark_rpc_failed(rpc_endpoint)
+        return 0
+    except subprocess.TimeoutExpired:
+        logger.error(f"❌ Query timed out (30s) for unfulfilled nonces on {rpc_endpoint}")
+        mark_rpc_failed(rpc_endpoint)
+        return 0
     except Exception as e:
-        logger.error(f"Query error: {e}")
+        logger.error(f"❌ Error querying unfulfilled nonces: {e}")
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+        mark_rpc_failed(rpc_endpoint)
         return 0
 
 ###############################################################################
-# Submission
+# Validate Transaction On-Chain
+###############################################################################
+def validate_transaction_on_chain(tx_hash: str, rpc_endpoint: str) -> bool:
+    """Verify that a transaction actually landed on-chain."""
+    try:
+        logger.debug(f"Validating transaction {tx_hash} on-chain...")
+        cmd = ["curl", "-s", f"{rpc_endpoint}cosmos/tx/v1beta1/txs/{tx_hash}"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if proc.returncode == 0:
+            resp = json.loads(proc.stdout)
+            if resp.get("code") == 0 or "tx" in resp:
+                logger.info(f"✅ Transaction {tx_hash} confirmed on-chain")
+                return True
+            else:
+                logger.warning(f"⚠️  Transaction {tx_hash} not confirmed or invalid: {resp.get('message', 'unknown')}")
+                return False
+        else:
+            logger.debug(f"Could not validate transaction {tx_hash}: {proc.stderr}")
+            return False
+    except Exception as e:
+        logger.debug(f"Error validating transaction: {e}")
+        return False
+
+###############################################################################
+# Submission with RPC Failover
 ###############################################################################
 def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> bool:
+    """Submit prediction with RPC failover and transaction validation."""
     timestamp = datetime.now(timezone.utc).isoformat()
     wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
     
     # Validate wallet before proceeding
     if not wallet:
-        logger.error("ALLORA_WALLET_ADDR not set")
+        logger.error("❌ ALLORA_WALLET_ADDR not set")
         return False
+    
+    logger.info(f"🚀 LEADERBOARD SUBMISSION: Preparing prediction for topic {topic_id}")
     
     block_height = get_unfulfilled_nonce(topic_id)
     if block_height == 0:
-        logger.warning("No unfulfilled nonce available, skipping submission")
+        logger.warning("⚠️  No unfulfilled nonce available, skipping submission")
         return False
+    
+    logger.info(f"📊 Prediction value: {value:.10f}")
+    logger.info(f"📍 Block height: {block_height}")
 
     sequence = get_account_sequence(wallet)
     if sequence == 0:
-        logger.error("Cannot get account sequence")
+        logger.error("❌ Cannot get account sequence (RPC query failed)")
         return False
+    
+    logger.debug(f"Account sequence: {sequence}")
 
     # Create wallet for signing
     mnemonic = os.getenv("MNEMONIC", "").strip()
     if not mnemonic:
-        logger.error("MNEMONIC not set")
+        logger.error("❌ MNEMONIC not set")
         return False
     
     try:
         wallet_obj = LocalWallet.from_mnemonic(mnemonic)
     except Exception as e:
-        logger.error(f"Failed to create wallet from mnemonic: {e}")
+        logger.error(f"❌ Failed to create wallet from mnemonic: {e}")
         return False
 
     # Create protobuf bundle
@@ -372,8 +511,10 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
         digest = hashlib.sha256(bundle_bytes).digest()
         sig = wallet_obj._private_key.sign_digest(digest)
         bundle_signature = base64.b64encode(sig).decode()
+        logger.debug(f"Bundle signature created: {bundle_signature[:20]}...")
     except Exception as e:
-        logger.error(f"Failed to create bundle/signature: {e}")
+        logger.error(f"❌ Failed to create bundle/signature: {e}")
+        logger.debug(f"Traceback: {traceback.format_exc()}")
         return False
 
     # Worker data
@@ -397,9 +538,13 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
 
     cli = shutil.which("allorad") or shutil.which("allora")
     if not cli:
-        logger.error("Allora CLI not found")
+        logger.error("❌ Allora CLI not found in PATH")
         return False
 
+    # Get RPC endpoint for submission
+    rpc_endpoint = get_rpc_endpoint()
+    logger.debug(f"Using RPC endpoint: {rpc_endpoint}")
+    
     # allorad expects: insert-worker-payload [sender] [worker_data] [flags]
     cmd = [cli, "tx", "emissions", "insert-worker-payload",
            wallet,                          # positional arg 1: sender
@@ -407,7 +552,7 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
            "--from", wallet,                # flag: signing wallet
            "--yes",
            "--keyring-backend", "test",
-           "--node", "https://allora-rpc.testnet.allora.network/",
+           "--node", rpc_endpoint,
            "--chain-id", "allora-testnet-1",
            "--fees", "2500000uallo",
            "--broadcast-mode", "sync",
@@ -418,10 +563,12 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
         cmd.append("--dry-run")
         logger.info("Dry-run mode: simulating submission")
 
-    logger.info(f"Submitting prediction {value:.8f} for topic {topic_id} at block {block_height}")
+    logger.info(f"📤 Submitting prediction {value:.10f} for topic {topic_id} at block {block_height}")
     
     success = False
     status = "pending"
+    tx_hash = None
+    
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if proc.returncode == 0:
@@ -429,27 +576,48 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
             try:
                 resp = json.loads(proc.stdout)
                 if resp.get("code") == 0:
-                    logger.info("✅ Submission success")
-                    logger.info(f"Transaction hash: {resp.get('txhash', 'N/A')}")
-                    status = "success"
-                    success = True
+                    tx_hash = resp.get('txhash', 'N/A')
+                    logger.info(f"✅ LEADERBOARD SUBMISSION ACCEPTED")
+                    logger.info(f"   Transaction hash: {tx_hash}")
+                    logger.info(f"   Block height: {block_height}")
+                    logger.info(f"   Prediction: {value:.10f}")
+                    logger.info(f"   Topic ID: {topic_id}")
+                    logger.info(f"   Timestamp: {timestamp}")
+                    
+                    # Attempt to validate on-chain
+                    if validate_transaction_on_chain(tx_hash, rpc_endpoint):
+                        logger.info(f"🎉 CONFIRMED: Submission landed on-chain!")
+                        status = "success_confirmed"
+                        success = True
+                    else:
+                        logger.warning(f"⚠️  Submitted but on-chain validation pending")
+                        status = "success_pending_confirmation"
+                        success = True
                 else:
                     error_msg = resp.get('raw_log', 'Unknown error')
-                    logger.error(f"Submission failed: {error_msg}")
+                    logger.error(f"❌ Submission rejected by network: {error_msg}")
+                    logger.error(f"   This may be a leaderboard-impacting failure")
                     status = f"failed: {error_msg}"
+                    mark_rpc_failed(rpc_endpoint)
             except json.JSONDecodeError:
-                logger.error(f"Failed to parse JSON response: {proc.stdout}")
+                logger.error(f"❌ Failed to parse submission response: {proc.stdout}")
                 status = f"error: invalid response"
         else:
             cli_error = proc.stderr.strip()
-            logger.error(f"CLI failed with code {proc.returncode}: {cli_error}")
+            logger.error(f"❌ CLI submission failed with code {proc.returncode}")
+            logger.error(f"   Error: {cli_error}")
+            logger.error(f"   This may indicate RPC connectivity issues")
             status = f"cli_error: {cli_error}"
+            mark_rpc_failed(rpc_endpoint)
     except subprocess.TimeoutExpired:
-        logger.error("CLI submission timed out (120s)")
+        logger.error("❌ Submission timed out (120s) - RPC may be slow or unresponsive")
         status = "error: submission timeout"
+        mark_rpc_failed(rpc_endpoint)
     except Exception as e:
-        logger.error(f"Submission error: {e}")
+        logger.error(f"❌ Unexpected submission error: {e}")
+        logger.debug(f"Traceback: {traceback.format_exc()}")
         status = f"error: {str(e)}"
+        mark_rpc_failed(rpc_endpoint)
 
     # Log to CSV ALWAYS (whether success or not)
     csv_path = "submission_log.csv"
@@ -461,19 +629,21 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
         "block_height": str(block_height),
         "proof": json.dumps(worker_data["inference_forecasts_bundle"]),
         "signature": bundle_signature,
-        "status": status
+        "status": status,
+        "tx_hash": tx_hash or ""
     }
     
     try:
         import csv
         with open(csv_path, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["timestamp","topic_id","prediction","worker","block_height","proof","signature","status"])
+            fieldnames = ["timestamp","topic_id","prediction","worker","block_height","proof","signature","status","tx_hash"]
+            w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writerow(record)
-        logger.debug(f"Logged submission to CSV with status: {status}")
+        logger.info(f"📝 Logged submission to CSV with status: {status}")
     except Exception as e:
-        logger.error(f"Failed to log CSV: {e}")
+        logger.error(f"❌ Failed to log CSV: {e}")
 
-    # Update latest_submission.json
+    # Update latest_submission.json with comprehensive status
     try:
         with open("latest_submission.json", "w") as jf:
             json.dump({
@@ -484,12 +654,15 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
                 "block_height": block_height,
                 "proof": worker_data["inference_forecasts_bundle"],
                 "signature": bundle_signature,
-                "status": status
+                "status": status,
+                "tx_hash": tx_hash,
+                "leaderboard_impact": success
             }, jf, indent=2)
     except Exception as e:
-        logger.error(f"Failed to write latest_submission.json: {e}")
+        logger.error(f"❌ Failed to write latest_submission.json: {e}")
 
     return success
+
 def main():
     parser = argparse.ArgumentParser(description="Submit BTC/USD 7-day log-return prediction.")
     parser.add_argument("--model", type=str, default="model.pkl", help="Path to trained model.")
