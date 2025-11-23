@@ -1,0 +1,42 @@
+[Unit]
+Description=Allora BTC/USD Prediction Submission Daemon
+Documentation=file:///workspaces/allora-forge-builder-kit/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Service execution
+Type=simple
+User=root
+WorkingDirectory=/workspaces/allora-forge-builder-kit
+ExecStart=/workspaces/allora-forge-builder-kit/.venv/bin/python submit_prediction.py --continuous
+
+# Auto-restart on failure
+Restart=always
+RestartSec=10
+StartLimitInterval=60s
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=allora-submit
+
+# Security & resource limits
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/workspaces/allora-forge-builder-kit/logs /workspaces/allora-forge-builder-kit/submission_log.csv /workspaces/allora-forge-builder-kit/latest_submission.json
+
+# Environment variables - set these before starting
+EnvironmentFile=/workspaces/allora-forge-builder-kit/.env
+
+# Timeout before force kill
+TimeoutStopSec=30
+
+# Nice level for resource priority
+Nice=0
+
+[Install]
+WantedBy=multi-user.target

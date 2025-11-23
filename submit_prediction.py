@@ -40,18 +40,65 @@ class Nonce:
         self.block_height = block_height
 
 ###############################################################################
-# Logging Setup
+# Logging Setup - Enhanced for Long-Lived Daemon
 ###############################################################################
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%SZ'
-)
-logger = logging.getLogger("btc_submit")
+def setup_logging(log_file: str = "logs/submission.log") -> logging.Logger:
+    """Setup enhanced logging with both file and console output."""
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    
+    logger = logging.getLogger("btc_submit")
+    logger.setLevel(logging.DEBUG)  # Capture all levels
+    
+    # File handler - writes everything including tracebacks
+    fh = logging.FileHandler(log_file)
+    fh.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%SZ'
+    )
+    fh.setFormatter(file_formatter)
+    
+    # Console handler - shows important messages
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    console_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%SZ'
+    )
+    ch.setFormatter(console_formatter)
+    
+    # Remove old handlers to avoid duplicates
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    
+    return logger
+
+logger = setup_logging()
 
 ###############################################################################
 # Data Fetching (Latest)
 ###############################################################################
+def safe_call(func, *args, **kwargs):
+    """Safely execute a function, logging full traceback on exception."""
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        logger.error(f"Exception in {func.__name__}: {type(e).__name__}: {e}")
+        logger.error("Full traceback:")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
+
+def log_heartbeat(cycle_num: int = None):
+    """Log a heartbeat message for daemon liveness monitoring."""
+    if cycle_num is not None:
+        logger.info(f"🔄 [HEARTBEAT] Daemon alive - cycle #{cycle_num}")
+    else:
+        logger.info(f"🔄 [HEARTBEAT] Daemon alive at {datetime.now(timezone.utc).isoformat()}")
+
 def fetch_latest_btcusd_hourly(hours: int = 168, api_timeout: int = 30) -> pd.DataFrame:
     """Fetch recent BTC/USD hourly data for prediction."""
     logger.info(f"Fetching latest {hours}h BTC/USD data from Tiingo...")
@@ -457,71 +504,158 @@ def main():
     if args.continuous:
         import time
         interval = int(os.getenv("SUBMISSION_INTERVAL", "3600"))
+        heartbeat_interval = 3600  # Log heartbeat every hour
+        last_heartbeat = time.time()
+        cycle_num = 0
+        
+        logger.info("="*80)
+        logger.info("DAEMON MODE STARTED - Will run until Dec 15, 2025")
+        logger.info(f"Submission interval: {interval}s ({interval//60}min)")
+        logger.info(f"Heartbeat interval: {heartbeat_interval}s ({heartbeat_interval//60}min)")
+        logger.info("="*80)
+        
         while True:
+            cycle_num += 1
+            cycle_start = time.time()
+            
             try:
+                # Log heartbeat if time has passed
+                current_time = time.time()
+                if current_time - last_heartbeat >= heartbeat_interval:
+                    log_heartbeat(cycle_num)
+                    last_heartbeat = current_time
+                
+                logger.info(f"\n--- Cycle #{cycle_num} started at {datetime.now(timezone.utc).isoformat()} ---")
                 success = main_once(args)
+                
                 if success:
                     logger.info("✅ Submission completed successfully")
-                # Don't warn on skip/failure - already logged in detail by submit_prediction()
+                else:
+                    logger.info("⚠️  Submission skipped or failed (will retry in next cycle)")
+                    
             except Exception as e:
-                logger.error(f"Continuous loop error: {e}")
-            logger.info(f"Sleeping for {interval}s until next submission")
-            time.sleep(interval)
+                logger.error(f"❌ CRITICAL ERROR in continuous loop cycle #{cycle_num}: {type(e).__name__}: {e}")
+                logger.error("Full traceback:")
+                import traceback
+                logger.error(traceback.format_exc())
+                logger.error(f"Daemon will continue running and retry in {interval}s...")
+            
+            # Calculate sleep time
+            cycle_elapsed = time.time() - cycle_start
+            sleep_time = max(0, interval - cycle_elapsed)
+            logger.info(f"Cycle #{cycle_num} completed in {cycle_elapsed:.1f}s. Sleeping {sleep_time:.1f}s until next cycle...")
+            time.sleep(sleep_time)
     else:
         sys.exit(main_once(args))
 
 def main_once(args):
+    """Execute one submission cycle with comprehensive error handling."""
     try:
         # Load and validate features first
         if not os.path.exists(args.features):
             logger.error(f"❌ Features file not found: {args.features}")
             logger.error("   Run 'python train.py' to generate features.json")
-            return 1
+            return False
         
-        with open(args.features, "r") as f:
-            feature_cols = json.load(f)
-        logger.info(f"✅ Loaded {len(feature_cols)} feature columns")
+        try:
+            with open(args.features, "r") as f:
+                feature_cols = json.load(f)
+            logger.info(f"✅ Loaded {len(feature_cols)} feature columns")
+        except Exception as e:
+            logger.error(f"Failed to load features.json: {e}")
+            logger.error("Full traceback:")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
         
         # Validate model before using it
         if not validate_model(args.model, len(feature_cols)):
             logger.error(f"❌ CRITICAL: Model validation failed. Cannot proceed.")
             logger.error("   Run 'python train.py' to train a new model.")
-            return 1
+            return False
         
         # Load model (we know it's valid now)
-        import pickle
-        with open(args.model, "rb") as f:
-            model = pickle.load(f)
+        try:
+            import pickle
+            with open(args.model, "rb") as f:
+                model = pickle.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load model pickle: {e}")
+            logger.error("Full traceback:")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
 
-        # Fetch latest data
-        raw = fetch_latest_btcusd_hourly()
-        feats = generate_features(raw)
-        if len(feats) == 0:
-            logger.error("No feature data available after feature engineering")
-            return 1
+        # Fetch latest data with exception handling
+        try:
+            raw = fetch_latest_btcusd_hourly()
+            if raw.empty:
+                logger.error("Fetched empty dataframe from Tiingo")
+                return False
+        except Exception as e:
+            logger.error(f"Failed to fetch latest data: {e}")
+            logger.error("Full traceback:")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+        
+        # Feature engineering with exception handling
+        try:
+            feats = generate_features(raw)
+            if len(feats) == 0:
+                logger.error("No feature data available after feature engineering")
+                return False
+        except Exception as e:
+            logger.error(f"Failed during feature engineering: {e}")
+            logger.error("Full traceback:")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
         
         # Prepare input for prediction
-        latest = feats.iloc[-1]
         try:
+            latest = feats.iloc[-1]
             x_live = latest[feature_cols].values.reshape(1, -1)
         except KeyError as e:
             logger.error(f"❌ Missing feature column: {e}")
             logger.error("   Feature mismatch with current data.")
             logger.error("   Run 'python train.py' to regenerate features.json")
-            return 1
+            return False
+        except Exception as e:
+            logger.error(f"Failed to prepare input for prediction: {e}")
+            logger.error("Full traceback:")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
 
-        # Predict
-        pred = predict_forward_log_return(model, x_live)
+        # Predict with exception handling
+        try:
+            pred = predict_forward_log_return(model, x_live)
+        except Exception as e:
+            logger.error(f"Failed to generate prediction: {e}")
+            logger.error("Full traceback:")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
 
-        # Submit
-        success = submit_prediction(pred, args.topic_id, dry_run=args.dry_run)
-        logger.info(f"Submission status: {'success' if success else 'skipped or failed'}")
-        return success  # Return actual success status (True/False) not exit code
+        # Submit with exception handling
+        try:
+            success = submit_prediction(pred, args.topic_id, dry_run=args.dry_run)
+            logger.info(f"Submission status: {'success' if success else 'skipped or failed'}")
+            return success
+        except Exception as e:
+            logger.error(f"Failed during submission: {e}")
+            logger.error("Full traceback:")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+            
     except Exception as e:
-        logger.error(f"Fatal error in main_once: {e}")
+        logger.error(f"Fatal error in main_once: {type(e).__name__}: {e}")
+        logger.error("Full traceback:")
         import traceback
         logger.error(traceback.format_exc())
-        return False  # Return False on error instead of 1
+        return False
 
 if __name__ == "__main__":
     main()
