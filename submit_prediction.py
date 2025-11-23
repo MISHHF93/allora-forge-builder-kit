@@ -38,16 +38,19 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()
 
-# RPC Endpoint Failover List
+# RPC Endpoint Failover List with priorities
 RPC_ENDPOINTS = [
-    "https://allora-rpc.testnet.allora.network/",
-    "https://allora-testnet-rpc.allthatnode.com:1317/",
-    "https://allora.api.chandrastation.com/",
+    {"url": "https://allora-rpc.testnet.allora.network/", "name": "Primary", "priority": 1},
+    {"url": "https://allora-testnet-rpc.allthatnode.com:1317/", "name": "AllThatNode", "priority": 2},
+    {"url": "https://allora.api.chandrastation.com/", "name": "ChandraStation", "priority": 3},
 ]
 
-# Global state for RPC endpoint rotation
+# Global state for RPC endpoint rotation with enhanced tracking
 _rpc_endpoint_index = 0
-_failed_rpc_endpoints = set()
+_failed_rpc_endpoints = {}  # endpoint_url -> failure_count
+_rpc_endpoint_last_used = None
+_submission_attempt_count = 0
+_max_submission_retries = 3
 
 import requests
 import numpy as np
@@ -62,37 +65,77 @@ class Nonce:
         self.block_height = block_height
 
 ###############################################################################
-# RPC Endpoint Management with Failover
+# Response Validation - Detect Invalid JSON/HTML responses
 ###############################################################################
-def get_rpc_endpoint() -> str:
+def validate_json_response(response_text: str, context: str = "") -> tuple[bool, dict]:
+    """Validate that response is valid JSON, not HTML error page."""
+    response_text = response_text.strip()
+    
+    # Check for HTML responses (error pages)
+    if response_text.startswith("<"):
+        logger.error(f"❌ Received HTML response instead of JSON {context}")
+        logger.debug(f"   Response starts with: {response_text[:100]}")
+        return False, {}
+    
+    # Check for empty response
+    if not response_text:
+        logger.error(f"❌ Empty response received {context}")
+        return False, {}
+    
+    # Try to parse JSON
+    try:
+        data = json.loads(response_text)
+        return True, data
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Invalid JSON response {context}: {e}")
+        logger.debug(f"   Response: {response_text[:200]}")
+        return False, {}
+
+###############################################################################
+# RPC Endpoint Management with Enhanced Failover
+###############################################################################
+def get_rpc_endpoint() -> dict:
     """Get the next working RPC endpoint with automatic failover."""
     global _rpc_endpoint_index, _failed_rpc_endpoints
     
-    # Reset if all endpoints marked as failed
-    if len(_failed_rpc_endpoints) >= len(RPC_ENDPOINTS):
-        logger.info("🔄 Resetting failed RPC endpoints list for retry")
+    # Count of working endpoints
+    working_endpoints = [e for e in RPC_ENDPOINTS if _failed_rpc_endpoints.get(e["url"], 0) < 3]
+    
+    # If all endpoints exhausted, reset
+    if not working_endpoints:
+        logger.info("🔄 Resetting failed RPC endpoints - all exceeded retry limit")
         _failed_rpc_endpoints.clear()
+        working_endpoints = RPC_ENDPOINTS
         _rpc_endpoint_index = 0
     
-    # Try to find next working endpoint
-    for _ in range(len(RPC_ENDPOINTS)):
-        endpoint = RPC_ENDPOINTS[_rpc_endpoint_index % len(RPC_ENDPOINTS)]
-        _rpc_endpoint_index += 1
-        
-        if endpoint not in _failed_rpc_endpoints:
-            return endpoint
+    # Get next endpoint
+    endpoint = working_endpoints[_rpc_endpoint_index % len(working_endpoints)]
+    _rpc_endpoint_index += 1
     
-    # Fallback to first endpoint if all tried
-    logger.warning("⚠️  All RPC endpoints exhausted, using first endpoint")
-    _rpc_endpoint_index = 0
-    _failed_rpc_endpoints.clear()
-    return RPC_ENDPOINTS[0]
+    logger.debug(f"Selected RPC endpoint: {endpoint['name']} ({endpoint['url']})")
+    return endpoint
 
-def mark_rpc_failed(endpoint: str):
-    """Mark an RPC endpoint as failed for future queries."""
+def mark_rpc_failed(endpoint_url: str, error: str = ""):
+    """Mark an RPC endpoint as failed and track failure count."""
     global _failed_rpc_endpoints
-    _failed_rpc_endpoints.add(endpoint)
-    logger.warning(f"⚠️  Marked RPC endpoint as failed: {endpoint}")
+    current_failures = _failed_rpc_endpoints.get(endpoint_url, 0)
+    _failed_rpc_endpoints[endpoint_url] = current_failures + 1
+    
+    endpoint_name = next((e["name"] for e in RPC_ENDPOINTS if e["url"] == endpoint_url), "Unknown")
+    logger.warning(
+        f"⚠️  RPC endpoint marked failed: {endpoint_name}\n"
+        f"   Failures: {_failed_rpc_endpoints[endpoint_url]}/3\n"
+        f"   Error: {error}"
+    )
+
+def reset_rpc_endpoint(endpoint_url: str):
+    """Reset RPC endpoint failure count after successful use."""
+    global _failed_rpc_endpoints
+    if endpoint_url in _failed_rpc_endpoints:
+        _failed_rpc_endpoints[endpoint_url] = 0
+        endpoint_name = next((e["name"] for e in RPC_ENDPOINTS if e["url"] == endpoint_url), "Unknown")
+        logger.debug(f"✅ Reset failure count for {endpoint_name}")
+
 
 ###############################################################################
 # Logging Setup - Enhanced for Daemon
@@ -298,73 +341,86 @@ def validate_model(model_path: str, feature_count: int) -> bool:
     return True
 
 ###############################################################################
-# Get Account Sequence
+# Get Account Sequence with Enhanced RPC Handling
 ###############################################################################
 def get_account_sequence(wallet: str) -> int:
-    """Query account sequence from Allora network with RPC failover."""
+    """Query account sequence from Allora network with RPC failover and validation."""
     cli = shutil.which("allorad") or shutil.which("allora")
     if not cli:
         logger.error("❌ Allora CLI not found in PATH")
         return 0
     
     rpc_endpoint = get_rpc_endpoint()
-    logger.debug(f"Querying account sequence via RPC: {rpc_endpoint}")
+    logger.debug(f"Querying account sequence via RPC: {rpc_endpoint['name']} ({rpc_endpoint['url']})")
     
     cmd = [cli, "query", "auth", "account", wallet, 
-           "--node", rpc_endpoint,
+           "--node", rpc_endpoint["url"],
            "--output", "json"]
     
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
         if proc.returncode == 0:
-            data = json.loads(proc.stdout)
+            # Validate response is JSON, not HTML error
+            is_valid, data = validate_json_response(proc.stdout, f"for account {wallet}")
+            if not is_valid:
+                mark_rpc_failed(rpc_endpoint["url"], "Invalid JSON response (likely HTML error)")
+                return 0
+            
             sequence = int(data["account"]["value"]["sequence"])
-            logger.debug(f"✅ Got account sequence: {sequence}")
+            logger.debug(f"✅ Got account sequence: {sequence} from {rpc_endpoint['name']}")
+            reset_rpc_endpoint(rpc_endpoint["url"])
             return sequence
         else:
             error_msg = proc.stderr.strip()
-            logger.warning(f"⚠️  Query failed for account {wallet}: {error_msg}")
-            mark_rpc_failed(rpc_endpoint)
+            logger.warning(f"⚠️  Query failed for account {wallet} on {rpc_endpoint['name']}: {error_msg}")
+            mark_rpc_failed(rpc_endpoint["url"], error_msg)
             return 0
     except json.JSONDecodeError as e:
         logger.error(f"❌ Failed to parse account sequence response: {e}")
-        mark_rpc_failed(rpc_endpoint)
+        mark_rpc_failed(rpc_endpoint["url"], f"JSON decode error: {e}")
         return 0
     except subprocess.TimeoutExpired:
-        logger.error(f"❌ Query timed out (30s) for account sequence on {rpc_endpoint}")
-        mark_rpc_failed(rpc_endpoint)
+        logger.error(f"❌ Query timed out (30s) for account sequence on {rpc_endpoint['name']}")
+        mark_rpc_failed(rpc_endpoint["url"], "Timeout (30s)")
         return 0
     except Exception as e:
         logger.error(f"❌ Error querying account sequence: {e}")
-        mark_rpc_failed(rpc_endpoint)
+        mark_rpc_failed(rpc_endpoint["url"], str(e))
         return 0
 
 ###############################################################################
-# Get Unfulfilled Nonce
+# Get Unfulfilled Nonce with Enhanced RPC Handling
 ###############################################################################
 def get_unfulfilled_nonce(topic_id: int) -> int:
-    """Query unfulfilled nonces from Allora network with RPC failover."""
+    """Query unfulfilled nonces from Allora network with RPC failover and validation."""
     cli = shutil.which("allorad") or shutil.which("allora")
     if not cli:
         logger.error("❌ Allora CLI not found in PATH")
         return 0
     
     rpc_endpoint = get_rpc_endpoint()
-    logger.debug(f"Querying unfulfilled nonces for topic {topic_id} via RPC: {rpc_endpoint}")
+    logger.debug(f"Querying unfulfilled nonces for topic {topic_id} via RPC: {rpc_endpoint['name']}")
     
     cmd = [cli, "query", "emissions", "unfulfilled-worker-nonces", str(topic_id),
-           "--node", rpc_endpoint,
+           "--node", rpc_endpoint["url"],
            "--output", "json"]
     
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if proc.returncode == 0:
-            data = json.loads(proc.stdout)
+            # Validate response is JSON, not HTML error
+            is_valid, data = validate_json_response(proc.stdout, f"for unfulfilled nonces (topic {topic_id})")
+            if not is_valid:
+                mark_rpc_failed(rpc_endpoint["url"], "Invalid JSON response")
+                return 0
+            
             nonces_data = data.get("nonces", {}).get("nonces", [])
             nonces = [int(item["block_height"]) for item in nonces_data]
             
             if not nonces:
                 logger.info(f"ℹ️  No unfulfilled nonces found for topic {topic_id}")
+                reset_rpc_endpoint(rpc_endpoint["url"])
                 return 0
             
             logger.debug(f"✅ Found {len(nonces)} unfulfilled nonces for topic {topic_id}: {nonces}")
@@ -381,22 +437,27 @@ def get_unfulfilled_nonce(topic_id: int) -> int:
                     # Check if already submitted
                     cmd_check = [cli, "query", "emissions", "worker-latest-inference", 
                                 str(topic_id), wallet,
-                                "--node", rpc_endpoint,
+                                "--node", rpc_endpoint["url"],
                                 "--output", "json"]
                     proc_check = subprocess.run(cmd_check, capture_output=True, text=True, timeout=30)
                     
                     if proc_check.returncode == 0:
-                        data_check = json.loads(proc_check.stdout)
-                        latest_bh = int(data_check.get("latest_inference", {}).get("block_height", 0))
-                        if latest_bh != nonce:
-                            filtered_nonces.append(nonce)
-                            logger.debug(f"  ✓ Nonce {nonce} available (latest submitted: {latest_bh})")
+                        is_valid_check, data_check = validate_json_response(proc_check.stdout)
+                        if is_valid_check:
+                            latest_bh = int(data_check.get("latest_inference", {}).get("block_height", 0))
+                            if latest_bh != nonce:
+                                filtered_nonces.append(nonce)
+                                logger.debug(f"  ✓ Nonce {nonce} available (latest submitted: {latest_bh})")
+                            else:
+                                logger.debug(f"  ✗ Nonce {nonce} already submitted")
                         else:
-                            logger.debug(f"  ✗ Nonce {nonce} already submitted")
+                            # Invalid response, assume not submitted
+                            filtered_nonces.append(nonce)
+                            logger.debug(f"  ? Nonce {nonce} check inconclusive (invalid response), will attempt")
                     else:
                         # If check fails, assume not submitted and include it
                         filtered_nonces.append(nonce)
-                        logger.debug(f"  ? Nonce {nonce} check inconclusive, will attempt submission")
+                        logger.debug(f"  ? Nonce {nonce} check inconclusive (query failed), will attempt submission")
                 except Exception as e:
                     logger.warning(f"⚠️  Error checking nonce {nonce}: {e}")
                     filtered_nonces.append(nonce)
@@ -404,46 +465,56 @@ def get_unfulfilled_nonce(topic_id: int) -> int:
             if filtered_nonces:
                 selected_nonce = min(filtered_nonces)
                 logger.info(f"🎯 Selected nonce for submission: block_height={selected_nonce}")
+                reset_rpc_endpoint(rpc_endpoint["url"])
                 return selected_nonce
             else:
                 logger.warning(f"⚠️  All unfulfilled nonces already submitted by worker {wallet}")
+                reset_rpc_endpoint(rpc_endpoint["url"])
                 return 0
         else:
             error_msg = proc.stderr.strip()
             logger.warning(f"⚠️  Query failed for unfulfilled nonces: {error_msg}")
-            mark_rpc_failed(rpc_endpoint)
+            mark_rpc_failed(rpc_endpoint["url"], error_msg)
             return 0
     except json.JSONDecodeError as e:
         logger.error(f"❌ Failed to parse unfulfilled nonces response: {e}")
-        mark_rpc_failed(rpc_endpoint)
+        mark_rpc_failed(rpc_endpoint["url"], f"JSON decode error: {e}")
         return 0
     except subprocess.TimeoutExpired:
-        logger.error(f"❌ Query timed out (30s) for unfulfilled nonces on {rpc_endpoint}")
-        mark_rpc_failed(rpc_endpoint)
+        logger.error(f"❌ Query timed out (30s) for unfulfilled nonces on {rpc_endpoint['name']}")
+        mark_rpc_failed(rpc_endpoint["url"], "Timeout (30s)")
         return 0
     except Exception as e:
         logger.error(f"❌ Error querying unfulfilled nonces: {e}")
         logger.debug(f"Traceback: {traceback.format_exc()}")
-        mark_rpc_failed(rpc_endpoint)
+        mark_rpc_failed(rpc_endpoint["url"], str(e))
         return 0
 
 ###############################################################################
-# Validate Transaction On-Chain
+# Validate Transaction On-Chain with Enhanced Response Handling
 ###############################################################################
-def validate_transaction_on_chain(tx_hash: str, rpc_endpoint: str) -> bool:
-    """Verify that a transaction actually landed on-chain."""
+def validate_transaction_on_chain(tx_hash: str, rpc_endpoint: dict) -> bool:
+    """Verify that a transaction actually landed on-chain with response validation."""
     try:
-        logger.debug(f"Validating transaction {tx_hash} on-chain...")
-        cmd = ["curl", "-s", f"{rpc_endpoint}cosmos/tx/v1beta1/txs/{tx_hash}"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        logger.debug(f"Validating transaction {tx_hash} on-chain via {rpc_endpoint['name']}...")
+        
+        cmd = ["curl", "-s", "-m", "30", f"{rpc_endpoint['url']}cosmos/tx/v1beta1/txs/{tx_hash}"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
         
         if proc.returncode == 0:
-            resp = json.loads(proc.stdout)
+            # Validate response is JSON, not HTML error
+            is_valid, resp = validate_json_response(proc.stdout, f"for transaction {tx_hash}")
+            if not is_valid:
+                logger.warning(f"⚠️  Invalid response when validating transaction {tx_hash}")
+                return False
+            
+            # Check if transaction succeeded
             if resp.get("code") == 0 or "tx" in resp:
-                logger.info(f"✅ Transaction {tx_hash} confirmed on-chain")
+                logger.info(f"✅ Transaction {tx_hash} confirmed on-chain via {rpc_endpoint['name']}")
+                reset_rpc_endpoint(rpc_endpoint["url"])
                 return True
             else:
-                logger.warning(f"⚠️  Transaction {tx_hash} not confirmed or invalid: {resp.get('message', 'unknown')}")
+                logger.warning(f"⚠️  Transaction {tx_hash} not confirmed: {resp.get('message', 'unknown error')}")
                 return False
         else:
             logger.debug(f"Could not validate transaction {tx_hash}: {proc.stderr}")
@@ -453,10 +524,57 @@ def validate_transaction_on_chain(tx_hash: str, rpc_endpoint: str) -> bool:
         return False
 
 ###############################################################################
-# Submission with RPC Failover
+# CSV Submission Logging with RPC and Status Tracking
+###############################################################################
+def log_submission_to_csv(timestamp: str, topic_id: int, prediction: float, worker: str, 
+                          block_height: int, proof: dict, signature: str, status: str, 
+                          tx_hash: str, rpc_endpoint: str = "unknown"):
+    """Log submission to CSV with RPC endpoint used and full status."""
+    csv_path = "submission_log.csv"
+    
+    record = {
+        "timestamp": timestamp,
+        "topic_id": str(topic_id),
+        "prediction": str(prediction),
+        "worker": worker,
+        "block_height": str(block_height),
+        "proof": json.dumps(proof) if proof else "",
+        "signature": signature,
+        "status": status,
+        "tx_hash": tx_hash or "",
+        "rpc_endpoint": rpc_endpoint,
+    }
+    
+    try:
+        import csv
+        
+        # Check if file exists to determine if we need headers
+        file_exists = os.path.exists(csv_path)
+        
+        with open(csv_path, "a", newline="") as f:
+            fieldnames = ["timestamp", "topic_id", "prediction", "worker", "block_height", 
+                         "proof", "signature", "status", "tx_hash", "rpc_endpoint"]
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            
+            # Write header if file is new
+            if not file_exists:
+                w.writeheader()
+            
+            w.writerow(record)
+        
+        logger.info(f"📝 Logged submission to CSV (RPC: {rpc_endpoint}, Status: {status})")
+    except Exception as e:
+        logger.error(f"❌ Failed to log to CSV: {e}")
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+
+###############################################################################
+# Submission with Enhanced RPC Failover, Retry Logic, and CSV Logging
 ###############################################################################
 def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> bool:
-    """Submit prediction with RPC failover and transaction validation."""
+    """Submit prediction with RPC failover, retry logic, and comprehensive logging."""
+    global _submission_attempt_count
+    _submission_attempt_count = 0
+    
     timestamp = datetime.now(timezone.utc).isoformat()
     wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
     
@@ -470,6 +588,18 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
     block_height = get_unfulfilled_nonce(topic_id)
     if block_height == 0:
         logger.warning("⚠️  No unfulfilled nonce available, skipping submission")
+        log_submission_to_csv(
+            timestamp=timestamp,
+            topic_id=topic_id,
+            prediction=value,
+            worker=wallet,
+            block_height=0,
+            proof={},
+            signature="",
+            status="skipped_no_nonce",
+            tx_hash="",
+            rpc_endpoint="N/A"
+        )
         return False
     
     logger.info(f"📊 Prediction value: {value:.10f}")
@@ -477,7 +607,19 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
 
     sequence = get_account_sequence(wallet)
     if sequence == 0:
-        logger.error("❌ Cannot get account sequence (RPC query failed)")
+        logger.error("❌ Cannot get account sequence (all RPC endpoints failed)")
+        log_submission_to_csv(
+            timestamp=timestamp,
+            topic_id=topic_id,
+            prediction=value,
+            worker=wallet,
+            block_height=block_height,
+            proof={},
+            signature="",
+            status="failed_no_sequence",
+            tx_hash="",
+            rpc_endpoint="all_failed"
+        )
         return False
     
     logger.debug(f"Account sequence: {sequence}")
@@ -541,107 +683,133 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
         logger.error("❌ Allora CLI not found in PATH")
         return False
 
-    # Get RPC endpoint for submission
-    rpc_endpoint = get_rpc_endpoint()
-    logger.debug(f"Using RPC endpoint: {rpc_endpoint}")
-    
-    # allorad expects: insert-worker-payload [sender] [worker_data] [flags]
-    cmd = [cli, "tx", "emissions", "insert-worker-payload",
-           wallet,                          # positional arg 1: sender
-           json.dumps(worker_data),         # positional arg 2: worker_data
-           "--from", wallet,                # flag: signing wallet
-           "--yes",
-           "--keyring-backend", "test",
-           "--node", rpc_endpoint,
-           "--chain-id", "allora-testnet-1",
-           "--fees", "2500000uallo",
-           "--broadcast-mode", "sync",
-           "--gas", "250000",
-           "--sequence", str(sequence),
-           "--output", "json"]
-    if dry_run:
-        cmd.append("--dry-run")
-        logger.info("Dry-run mode: simulating submission")
-
-    logger.info(f"📤 Submitting prediction {value:.10f} for topic {topic_id} at block {block_height}")
-    
+    # Retry loop with multiple RPC endpoints
     success = False
     status = "pending"
     tx_hash = None
+    used_rpc = None
     
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if proc.returncode == 0:
-            # Parse the JSON response
-            try:
-                resp = json.loads(proc.stdout)
+    for attempt in range(_max_submission_retries):
+        _submission_attempt_count = attempt + 1
+        
+        # Get RPC endpoint for submission (rotates on each attempt)
+        rpc_endpoint = get_rpc_endpoint()
+        used_rpc = rpc_endpoint
+        logger.info(f"📤 Submission attempt {_submission_attempt_count}/{_max_submission_retries} via {rpc_endpoint['name']}")
+        
+        # allorad expects: insert-worker-payload [sender] [worker_data] [flags]
+        cmd = [cli, "tx", "emissions", "insert-worker-payload",
+               wallet,                          # positional arg 1: sender
+               json.dumps(worker_data),         # positional arg 2: worker_data
+               "--from", wallet,                # flag: signing wallet
+               "--yes",
+               "--keyring-backend", "test",
+               "--node", rpc_endpoint["url"],
+               "--chain-id", "allora-testnet-1",
+               "--fees", "2500000uallo",
+               "--broadcast-mode", "sync",
+               "--gas", "250000",
+               "--sequence", str(sequence),
+               "--output", "json"]
+        if dry_run:
+            cmd.append("--dry-run")
+            logger.info("Dry-run mode: simulating submission")
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            
+            if proc.returncode == 0:
+                # Validate response is JSON
+                is_valid, resp = validate_json_response(proc.stdout, f"from submission attempt {_submission_attempt_count}")
+                if not is_valid:
+                    logger.error(f"❌ Invalid JSON response from {rpc_endpoint['name']}")
+                    mark_rpc_failed(rpc_endpoint["url"], "Invalid JSON in submission response")
+                    if attempt < _max_submission_retries - 1:
+                        continue
+                    status = "failed_invalid_response"
+                    break
+                
                 if resp.get("code") == 0:
                     tx_hash = resp.get('txhash', 'N/A')
-                    logger.info(f"✅ LEADERBOARD SUBMISSION ACCEPTED")
+                    logger.info(f"✅ LEADERBOARD SUBMISSION ACCEPTED on {rpc_endpoint['name']}")
                     logger.info(f"   Transaction hash: {tx_hash}")
                     logger.info(f"   Block height: {block_height}")
                     logger.info(f"   Prediction: {value:.10f}")
                     logger.info(f"   Topic ID: {topic_id}")
+                    logger.info(f"   RPC Endpoint: {rpc_endpoint['name']}")
                     logger.info(f"   Timestamp: {timestamp}")
+                    
+                    # Reset RPC endpoint on successful submission
+                    reset_rpc_endpoint(rpc_endpoint["url"])
                     
                     # Attempt to validate on-chain
                     if validate_transaction_on_chain(tx_hash, rpc_endpoint):
-                        logger.info(f"🎉 CONFIRMED: Submission landed on-chain!")
+                        logger.info(f"🎉 CONFIRMED: Submission landed on-chain via {rpc_endpoint['name']}!")
                         status = "success_confirmed"
                         success = True
                     else:
                         logger.warning(f"⚠️  Submitted but on-chain validation pending")
                         status = "success_pending_confirmation"
                         success = True
+                    break
                 else:
-                    error_msg = resp.get('raw_log', 'Unknown error')
-                    logger.error(f"❌ Submission rejected by network: {error_msg}")
+                    error_msg = resp.get('raw_log', resp.get('message', 'Unknown error'))
+                    logger.error(f"❌ Submission rejected on {rpc_endpoint['name']}: {error_msg}")
                     logger.error(f"   This may be a leaderboard-impacting failure")
+                    mark_rpc_failed(rpc_endpoint["url"], error_msg)
                     status = f"failed: {error_msg}"
-                    mark_rpc_failed(rpc_endpoint)
-            except json.JSONDecodeError:
-                logger.error(f"❌ Failed to parse submission response: {proc.stdout}")
-                status = f"error: invalid response"
-        else:
-            cli_error = proc.stderr.strip()
-            logger.error(f"❌ CLI submission failed with code {proc.returncode}")
-            logger.error(f"   Error: {cli_error}")
-            logger.error(f"   This may indicate RPC connectivity issues")
-            status = f"cli_error: {cli_error}"
-            mark_rpc_failed(rpc_endpoint)
-    except subprocess.TimeoutExpired:
-        logger.error("❌ Submission timed out (120s) - RPC may be slow or unresponsive")
-        status = "error: submission timeout"
-        mark_rpc_failed(rpc_endpoint)
-    except Exception as e:
-        logger.error(f"❌ Unexpected submission error: {e}")
-        logger.debug(f"Traceback: {traceback.format_exc()}")
-        status = f"error: {str(e)}"
-        mark_rpc_failed(rpc_endpoint)
+                    if attempt < _max_submission_retries - 1:
+                        continue
+                    break
+            else:
+                cli_error = proc.stderr.strip()
+                logger.error(f"❌ CLI submission failed on {rpc_endpoint['name']} with code {proc.returncode}")
+                logger.error(f"   Error: {cli_error}")
+                
+                # Check for specific RPC errors
+                if "invalid character" in cli_error.lower() or "looking for beginning" in cli_error.lower():
+                    logger.error(f"   ⚠️  Received invalid response (likely HTML error page)")
+                    mark_rpc_failed(rpc_endpoint["url"], "Invalid response (HTML or malformed JSON)")
+                else:
+                    logger.error(f"   May indicate RPC connectivity issues")
+                    mark_rpc_failed(rpc_endpoint["url"], cli_error)
+                
+                status = f"cli_error: {cli_error[:100]}"
+                if attempt < _max_submission_retries - 1:
+                    logger.info(f"🔄 Retrying with next RPC endpoint...")
+                    continue
+                break
+        except subprocess.TimeoutExpired:
+            logger.error(f"❌ Submission timed out (120s) on {rpc_endpoint['name']}")
+            mark_rpc_failed(rpc_endpoint["url"], "Timeout (120s)")
+            status = "error: submission_timeout"
+            if attempt < _max_submission_retries - 1:
+                logger.info(f"🔄 Retrying with next RPC endpoint...")
+                continue
+            break
+        except Exception as e:
+            logger.error(f"❌ Unexpected submission error: {e}")
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+            mark_rpc_failed(rpc_endpoint["url"], str(e))
+            status = f"error: {str(e)}"
+            if attempt < _max_submission_retries - 1:
+                logger.info(f"🔄 Retrying with next RPC endpoint...")
+                continue
+            break
 
     # Log to CSV ALWAYS (whether success or not)
-    csv_path = "submission_log.csv"
-    record = {
-        "timestamp": timestamp,
-        "topic_id": str(topic_id),
-        "prediction": str(value),
-        "worker": wallet,
-        "block_height": str(block_height),
-        "proof": json.dumps(worker_data["inference_forecasts_bundle"]),
-        "signature": bundle_signature,
-        "status": status,
-        "tx_hash": tx_hash or ""
-    }
-    
-    try:
-        import csv
-        with open(csv_path, "a", newline="") as f:
-            fieldnames = ["timestamp","topic_id","prediction","worker","block_height","proof","signature","status","tx_hash"]
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writerow(record)
-        logger.info(f"📝 Logged submission to CSV with status: {status}")
-    except Exception as e:
-        logger.error(f"❌ Failed to log CSV: {e}")
+    log_submission_to_csv(
+        timestamp=timestamp,
+        topic_id=topic_id,
+        prediction=value,
+        worker=wallet,
+        block_height=block_height,
+        proof=worker_data.get("inference_forecasts_bundle", {}),
+        signature=bundle_signature,
+        status=status,
+        tx_hash=tx_hash or "",
+        rpc_endpoint=used_rpc["name"] if used_rpc else "unknown"
+    )
 
     # Update latest_submission.json with comprehensive status
     try:
@@ -656,6 +824,8 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
                 "signature": bundle_signature,
                 "status": status,
                 "tx_hash": tx_hash,
+                "rpc_endpoint": used_rpc["name"] if used_rpc else "unknown",
+                "submission_attempts": _submission_attempt_count,
                 "leaderboard_impact": success
             }, jf, indent=2)
     except Exception as e:
