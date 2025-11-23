@@ -192,6 +192,23 @@ def train_model(df: pd.DataFrame) -> tuple[object, List[str]]:
     rmse = float(np.sqrt(np.mean((y - preds_in_sample) ** 2)))
     logger.info(f"In-sample RMSE: {rmse:.6f}")
     
+    # TEST THE MODEL BEFORE SAVING: Verify it can predict on dummy input
+    logger.info("Testing model with dummy input before saving...")
+    try:
+        dummy_shape = (1, X.shape[1])
+        dummy_input = np.zeros(dummy_shape)
+        dummy_pred = model.predict(dummy_input)
+        logger.info(f"✓ Test prediction successful: {dummy_pred[0]:.8f}")
+        # Verify n_features_in_ is set
+        if hasattr(model, 'n_features_in_'):
+            logger.info(f"✓ Model has n_features_in_={model.n_features_in_}")
+        else:
+            logger.error(f"❌ Model missing n_features_in_ attribute (unfitted)")
+            raise RuntimeError("Model not properly fitted before saving")
+    except Exception as e:
+        logger.error(f"❌ Test prediction failed: {e}. Model is not fitted properly.")
+        raise
+    
     # Explicitly save model using both pickle and joblib for reliability
     try:
         with open("model.pkl", "wb") as f:
@@ -199,12 +216,25 @@ def train_model(df: pd.DataFrame) -> tuple[object, List[str]]:
         logger.info("✅ Model saved via pickle.dump() to model.pkl")
     except Exception as e:
         logger.error(f"❌ pickle.dump() failed: {e}")
+        raise
     
     try:
         joblib.dump(model, "model.pkl")
         logger.info("✅ Model saved via joblib.dump() to model.pkl")
     except Exception as e:
         logger.error(f"❌ joblib.dump() failed: {e}")
+        raise
+    
+    # FINAL VERIFICATION: Load and test the saved model file
+    logger.info("Final verification: loading and testing saved model.pkl...")
+    try:
+        with open("model.pkl", "rb") as f:
+            loaded_model = pickle.load(f)
+        verify_pred = loaded_model.predict(dummy_input)
+        logger.info(f"✓ Loaded model prediction successful: {verify_pred[0]:.8f}")
+    except Exception as e:
+        logger.error(f"❌ Failed to load/test model.pkl: {e}")
+        raise
     
     return model, feature_cols
 
