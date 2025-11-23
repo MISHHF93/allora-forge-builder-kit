@@ -249,25 +249,41 @@ def submit_prediction(value: float, cfg: Config) -> bool:
     Expects environment variables for wallet context if required.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
-    record = {"timestamp_utc": timestamp, "topic_id": cfg.topic_id, "prediction_log_return_7d": value}
-    # Append to local CSV log
-    csv_path = "submission_log.csv"
-    header_needed = not os.path.exists(csv_path)
-    import csv
-    with open(csv_path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(record.keys()))
-        if header_needed:
-            w.writeheader()
-        w.writerow(record)
-    # JSON snapshot
-    with open("latest_submission.json", "w") as jf:
-        json.dump(record, jf, indent=2)
+    wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
+    
+    # Initialize record with all required fields
+    # Will be populated as we go through submission process
+    csv_record = {
+        "timestamp": timestamp,
+        "topic_id": cfg.topic_id,
+        "prediction": value,
+        "worker": wallet if wallet else "unknown",
+        "block_height": 0,
+        "proof": "",
+        "signature": "",
+        "status": "pending"
+    }
+    
+    # JSON snapshot (minimal version for immediate records)
+    json_record = {
+        "timestamp_utc": timestamp,
+        "topic_id": cfg.topic_id,
+        "prediction_log_return_7d": value
+    }
     if not cfg.submit:
         logger.info("Submission disabled (cfg.submit=False). Skipping.")
+        # Log CSV record even if not submitting
+        _log_submission_to_csv(csv_record)
+        with open("latest_submission.json", "w") as jf:
+            json.dump(json_record, jf, indent=2)
         return False
-    # Get block height
+    
+    # Get block height and submission details
     block_height = 0
     pubkey = ""
+    bundle_signature = ""
+    status = "unknown"
+    
     try:
         from allora_sdk import AlloraRPCClient
         client = AlloraRPCClient.from_env()
@@ -285,50 +301,8 @@ def submit_prediction(value: float, cfg: Config) -> bool:
             pubkey = ""  # still empty
         except Exception as e2:
             logger.warning(f"Failed to get block height via REST ({e2})")
-    # Try SDK submission first
-    if block_height > 0:
-        try:
-            from allora_sdk.protos.emissions.v9 import InsertWorkerPayloadRequest, InputWorkerDataBundle, InputInferenceForecastBundle, InputInference
-            from allora_sdk.protos.emissions.v9._v3__ import Nonce
-            client = AlloraRPCClient.from_env()
-            wallet = client.address
-            nonce = Nonce(block_height=block_height)
-            inference = InputInference(
-                topic_id=cfg.topic_id,
-                block_height=block_height,
-                inferer=wallet,
-                value=str(value),
-                extra_data=b"",
-                proof=""
-            )
-            bundle = InputInferenceForecastBundle(inference=inference)
-            worker_data_bundle = InputWorkerDataBundle(
-                worker=wallet,
-                nonce=nonce,
-                topic_id=cfg.topic_id,
-                inference_forecasts_bundle=bundle,
-                inferences_forecasts_bundle_signature=b"",
-                pubkey=pubkey
-            )
-            request = InsertWorkerPayloadRequest(
-                sender=wallet,
-                worker_data_bundle=worker_data_bundle
-            )
-            tx_response = client.tx_manager.send_tx(request)
-            logger.info("✅ Submission via SDK success")
-            return True
-        except Exception as e:
-            logger.warning(f"SDK submission failed ({e}); falling back to CLI.")
-    # Fallback to CLI
-    cli = shutil.which("allorad") or shutil.which("allora")
-    if not cli:
-        logger.warning("Allora CLI not found in PATH; skipping on-chain submission.")
-        return False
-    wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
-    if not wallet:
-        logger.warning("ALLORA_WALLET_ADDR not set; skipping on-chain submission.")
-        return False
-    # Correct worker_data as JSON of InputWorkerDataBundle
+    
+    # Prepare worker data for submission
     worker_data = {
         "worker": wallet,
         "nonce": {"block_height": block_height},
@@ -343,23 +317,78 @@ def submit_prediction(value: float, cfg: Config) -> bool:
                 "proof": ""
             }
         },
-        "inferences_forecasts_bundle_signature": "",
+        "inferences_forecasts_bundle_signature": bundle_signature,
         "pubkey": pubkey
     }
-    cmd = [cli, "tx", "emissions", "insert-worker-payload", wallet, json.dumps(worker_data), "--yes", "--keyring-backend", "test", "--node", "https://allora-rpc.testnet.allora.network/", "--chain-id", "allora-testnet-1"]
-    logger.info("Submitting via CLI: %s", " ".join(cmd))
+    
+    # Update CSV record with submission details
+    csv_record["block_height"] = block_height
+    csv_record["proof"] = json.dumps(worker_data["inference_forecasts_bundle"])
+    csv_record["signature"] = bundle_signature
+    
+    # Try CLI submission
+    cli = shutil.which("allorad") or shutil.which("allora")
+    if not cli:
+        logger.warning("Allora CLI not found in PATH; skipping on-chain submission.")
+        csv_record["status"] = "error: CLI not found"
+        _log_submission_to_csv(csv_record)
+        return False
+    
+    if not wallet:
+        logger.warning("ALLORA_WALLET_ADDR not set; skipping on-chain submission.")
+        csv_record["status"] = "error: wallet not set"
+        _log_submission_to_csv(csv_record)
+        return False
+    
+    cmd = [cli, "tx", "emissions", "insert-worker-payload", wallet, json.dumps(worker_data), 
+           "--yes", "--keyring-backend", "test", 
+           "--node", "https://allora-rpc.testnet.allora.network/", 
+           "--chain-id", "allora-testnet-1"]
+    
+    logger.info("Submitting via CLI")
     try:
         import subprocess
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if proc.returncode == 0:
             logger.info("✅ Submission CLI success")
+            csv_record["status"] = "success"
+            _log_submission_to_csv(csv_record)
             return True
         else:
-            logger.error(f"Submission CLI failed (rc={proc.returncode}): {proc.stdout} {proc.stderr}")
+            error_msg = proc.stderr.strip() if proc.stderr else proc.stdout.strip()
+            logger.error(f"Submission CLI failed (rc={proc.returncode}): {error_msg}")
+            csv_record["status"] = f"cli_error: {error_msg}"
+            _log_submission_to_csv(csv_record)
             return False
+    except subprocess.TimeoutExpired:
+        logger.error("CLI submission timed out (120s)")
+        csv_record["status"] = "error: submission timeout"
+        _log_submission_to_csv(csv_record)
+        return False
     except Exception as e:
         logger.error(f"CLI submission error: {e}")
+        csv_record["status"] = f"error: {str(e)}"
+        _log_submission_to_csv(csv_record)
         return False
+
+###############################################################################
+# CSV Logging Helper
+###############################################################################
+def _log_submission_to_csv(record: dict) -> None:
+    """Log a submission record to CSV with all 8 fields."""
+    csv_path = "submission_log.csv"
+    header_needed = not os.path.exists(csv_path)
+    import csv
+    try:
+        with open(csv_path, "a", newline="") as f:
+            fieldnames = ["timestamp", "topic_id", "prediction", "worker", "block_height", "proof", "signature", "status"]
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            if header_needed:
+                w.writeheader()
+            w.writerow(record)
+        logger.debug(f"Logged submission to CSV with status: {record.get('status', 'unknown')}")
+    except Exception as e:
+        logger.error(f"Failed to log CSV: {e}")
 
 ###############################################################################
 # Model Verification
