@@ -460,8 +460,9 @@ def main():
         while True:
             try:
                 success = main_once(args)
-                if not success:
-                    logger.warning("Submission failed, retrying in next interval")
+                if success:
+                    logger.info("✅ Submission completed successfully")
+                # Don't warn on skip/failure - already logged in detail by submit_prediction()
             except Exception as e:
                 logger.error(f"Continuous loop error: {e}")
             logger.info(f"Sleeping for {interval}s until next submission")
@@ -515,12 +516,12 @@ def main_once(args):
         # Submit
         success = submit_prediction(pred, args.topic_id, dry_run=args.dry_run)
         logger.info(f"Submission status: {'success' if success else 'skipped or failed'}")
-        return 0  # Always return 0 for dry-run or skipped
+        return success  # Return actual success status (True/False) not exit code
     except Exception as e:
         logger.error(f"Fatal error in main_once: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return 1
+        return False  # Return False on error instead of 1
 
 if __name__ == "__main__":
     main()
