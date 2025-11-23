@@ -187,27 +187,29 @@ def train_model(df: pd.DataFrame) -> tuple[object, List[str]]:
         logger.warning("XGBoost unavailable; using Ridge regression fallback.")
         model = Ridge(alpha=1.0)
         model.fit(X, y)
+    
+    # Verify model is fitted
+    try:
+        if not hasattr(model, 'n_features_in_'):
+            raise RuntimeError("Model not fitted: missing n_features_in_ attribute")
+        logger.info(f"✅ Model fitted with n_features_in_={model.n_features_in_}")
+    except Exception as e:
+        logger.error(f"❌ Model verification failed: {e}")
+        raise
+    
+    # Test prediction with dummy input before saving
+    try:
+        dummy_test = np.zeros((1, len(feature_cols)))
+        dummy_pred = model.predict(dummy_test)
+        logger.info(f"✅ Test prediction on dummy input successful: {float(dummy_pred[0]):.8f}")
+    except Exception as e:
+        logger.error(f"❌ Test prediction failed: {e}")
+        raise RuntimeError(f"Model cannot predict on dummy input: {e}")
+    
     preds_in_sample = model.predict(X)
     # Manual RMSE to avoid version incompatibilities
     rmse = float(np.sqrt(np.mean((y - preds_in_sample) ** 2)))
     logger.info(f"In-sample RMSE: {rmse:.6f}")
-    
-    # TEST THE MODEL BEFORE SAVING: Verify it can predict on dummy input
-    logger.info("Testing model with dummy input before saving...")
-    try:
-        dummy_shape = (1, X.shape[1])
-        dummy_input = np.zeros(dummy_shape)
-        dummy_pred = model.predict(dummy_input)
-        logger.info(f"✓ Test prediction successful: {dummy_pred[0]:.8f}")
-        # Verify n_features_in_ is set
-        if hasattr(model, 'n_features_in_'):
-            logger.info(f"✓ Model has n_features_in_={model.n_features_in_}")
-        else:
-            logger.error(f"❌ Model missing n_features_in_ attribute (unfitted)")
-            raise RuntimeError("Model not properly fitted before saving")
-    except Exception as e:
-        logger.error(f"❌ Test prediction failed: {e}. Model is not fitted properly.")
-        raise
     
     # Explicitly save model using both pickle and joblib for reliability
     try:
@@ -223,17 +225,6 @@ def train_model(df: pd.DataFrame) -> tuple[object, List[str]]:
         logger.info("✅ Model saved via joblib.dump() to model.pkl")
     except Exception as e:
         logger.error(f"❌ joblib.dump() failed: {e}")
-        raise
-    
-    # FINAL VERIFICATION: Load and test the saved model file
-    logger.info("Final verification: loading and testing saved model.pkl...")
-    try:
-        with open("model.pkl", "rb") as f:
-            loaded_model = pickle.load(f)
-        verify_pred = loaded_model.predict(dummy_input)
-        logger.info(f"✓ Loaded model prediction successful: {verify_pred[0]:.8f}")
-    except Exception as e:
-        logger.error(f"❌ Failed to load/test model.pkl: {e}")
         raise
     
     return model, feature_cols
@@ -371,6 +362,47 @@ def submit_prediction(value: float, cfg: Config) -> bool:
         return False
 
 ###############################################################################
+# Model Verification
+###############################################################################
+def verify_saved_model(model_path: str = "model.pkl", feature_count: int = 10) -> bool:
+    """Verify that saved model is fitted and can make predictions."""
+    if not os.path.exists(model_path):
+        logger.error(f"❌ Model file not found: {model_path}")
+        return False
+    
+    try:
+        with open(model_path, "rb") as f:
+            loaded_model = pickle.load(f)
+        logger.info(f"✅ Model loaded from {model_path}")
+    except Exception as e:
+        logger.error(f"❌ Failed to load model: {e}")
+        return False
+    
+    # Check if fitted
+    try:
+        if not hasattr(loaded_model, 'n_features_in_'):
+            logger.error("❌ Loaded model is not fitted (missing n_features_in_)")
+            return False
+        if loaded_model.n_features_in_ != feature_count:
+            logger.error(f"❌ Model feature count mismatch: {loaded_model.n_features_in_} != {feature_count}")
+            return False
+        logger.info(f"✅ Model fitted with correct features: {loaded_model.n_features_in_}")
+    except Exception as e:
+        logger.error(f"❌ Model verification failed: {e}")
+        return False
+    
+    # Test prediction
+    try:
+        dummy = np.zeros((1, feature_count))
+        test_pred = loaded_model.predict(dummy)
+        logger.info(f"✅ Loaded model prediction test passed: {float(test_pred[0]):.8f}")
+    except Exception as e:
+        logger.error(f"❌ Loaded model prediction failed: {e}")
+        return False
+    
+    return True
+
+###############################################################################
 # Orchestration
 ###############################################################################
 def run(cfg: Config) -> int:
@@ -381,11 +413,11 @@ def run(cfg: Config) -> int:
         labeled = add_forward_log_return_target(feats, cfg.horizon_hours)
         model, cols = train_model(labeled)
         
-        # Verify model.pkl exists
-        if not os.path.exists("model.pkl"):
-            logger.error("CRITICAL: model.pkl was not saved. Aborting.")
+        # Verify model.pkl was saved and is usable
+        if not verify_saved_model("model.pkl", len(cols)):
+            logger.error("CRITICAL: model.pkl verification failed. Aborting.")
             return 1
-        logger.info("✅ model.pkl verified to exist.")
+        logger.info("✅ model.pkl verification complete.")
         
         # Save features for later use
         with open("features.json", "w") as f:

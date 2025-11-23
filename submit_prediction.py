@@ -142,43 +142,56 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 ###############################################################################
-# Model Validation
-###############################################################################
-def validate_model_fitted(model, expected_features: int) -> bool:
-    """Validate that a loaded model is properly fitted."""
-    try:
-        # Check for n_features_in_ attribute (set by sklearn/xgboost after fitting)
-        if not hasattr(model, 'n_features_in_'):
-            logger.error(f"❌ Model not fitted: missing n_features_in_ attribute")
-            return False
-        
-        if model.n_features_in_ != expected_features:
-            logger.error(f"❌ Model feature mismatch: expected {expected_features}, got {model.n_features_in_}")
-            return False
-        
-        # Test prediction on dummy input
-        dummy_input = np.zeros((1, expected_features))
-        try:
-            test_pred = model.predict(dummy_input)
-            if not isinstance(test_pred, np.ndarray) or len(test_pred) != 1:
-                logger.error(f"❌ Model prediction returned invalid output: {test_pred}")
-                return False
-            logger.info(f"✓ Model validation successful (test pred: {test_pred[0]:.8f})")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Model prediction failed during validation: {e}")
-            return False
-    except Exception as e:
-        logger.error(f"❌ Model validation error: {e}")
-        return False
-
-###############################################################################
 # Prediction
 ###############################################################################
 def predict_forward_log_return(model, x_live: np.ndarray) -> float:
     pred = float(model.predict(x_live)[0])
     logger.info(f"Predicted 168h log-return: {pred:.8f}")
     return pred
+
+###############################################################################
+# Model Validation
+###############################################################################
+def validate_model(model_path: str, feature_count: int) -> bool:
+    """Validate that loaded model is fitted and functional."""
+    import pickle
+    try:
+        with open(model_path, "rb") as f:
+            model = pickle.load(f)
+        logger.info(f"✅ Model loaded from {model_path}")
+    except Exception as e:
+        logger.error(f"❌ Failed to load model: {e}")
+        return False
+    
+    # Check if fitted
+    try:
+        if not hasattr(model, 'n_features_in_'):
+            logger.error("❌ Model not fitted (missing n_features_in_ attribute)")
+            logger.error("   This usually means train.py was not run or model was saved without fitting.")
+            logger.error("   Fix: Run 'python train.py' to train and save a fitted model.")
+            return False
+        if model.n_features_in_ != feature_count:
+            logger.error(f"❌ Feature count mismatch: model expects {model.n_features_in_}, got {feature_count}")
+            logger.error("   This usually means features.json is outdated.")
+            logger.error("   Fix: Run 'python train.py' to regenerate features.json.")
+            return False
+        logger.info(f"✅ Model is fitted with n_features_in_={model.n_features_in_}")
+    except Exception as e:
+        logger.error(f"❌ Model fitted-state verification failed: {e}")
+        return False
+    
+    # Test prediction on dummy input
+    try:
+        dummy_input = np.zeros((1, feature_count))
+        test_pred = model.predict(dummy_input)
+        logger.info(f"✅ Model test prediction passed: {float(test_pred[0]):.8f}")
+    except Exception as e:
+        logger.error(f"❌ Model test prediction failed: {e}")
+        logger.error("   This usually means model.pkl is corrupted or incompatible.")
+        logger.error("   Fix: Run 'python train.py' to retrain and save a fresh model.")
+        return False
+    
+    return True
 
 ###############################################################################
 # Get Account Sequence
@@ -458,79 +471,55 @@ def main():
 
 def main_once(args):
     try:
-        # Load model
-        import pickle
-        logger.info(f"Loading model from {args.model}...")
-        if not os.path.exists(args.model):
-            logger.error(f"❌ CRITICAL: {args.model} not found")
-            return 1
-        
-        with open(args.model, "rb") as f:
-            model = pickle.load(f)
-        logger.info(f"✓ Model loaded successfully (type: {type(model).__name__})")
-        
-        # Load features
-        logger.info(f"Loading features from {args.features}...")
+        # Load and validate features first
         if not os.path.exists(args.features):
-            logger.error(f"❌ CRITICAL: {args.features} not found")
+            logger.error(f"❌ Features file not found: {args.features}")
+            logger.error("   Run 'python train.py' to generate features.json")
             return 1
         
         with open(args.features, "r") as f:
             feature_cols = json.load(f)
-        logger.info(f"✓ Features loaded: {len(feature_cols)} columns")
+        logger.info(f"✅ Loaded {len(feature_cols)} feature columns")
         
-        # VALIDATE MODEL IS FITTED
-        logger.info("Validating model is properly fitted...")
-        if not validate_model_fitted(model, len(feature_cols)):
-            logger.error("❌ CRITICAL: Model validation failed. Model may not be fitted.")
-            logger.info("Attempting to trigger retraining...")
-            # Try to retrain
-            try:
-                import subprocess
-                logger.info("Running train.py to retrain model...")
-                proc = subprocess.run([sys.executable, "train.py"], timeout=300, capture_output=True, text=True)
-                if proc.returncode == 0:
-                    logger.info("✓ Retraining successful, retrying prediction...")
-                    # Reload the newly trained model
-                    with open(args.model, "rb") as f:
-                        model = pickle.load(f)
-                    if not validate_model_fitted(model, len(feature_cols)):
-                        logger.error("❌ Retrained model still invalid")
-                        return 1
-                else:
-                    logger.error(f"❌ Retraining failed: {proc.stderr}")
-                    return 1
-            except Exception as e:
-                logger.error(f"❌ Could not retrain: {e}")
-                return 1
+        # Validate model before using it
+        if not validate_model(args.model, len(feature_cols)):
+            logger.error(f"❌ CRITICAL: Model validation failed. Cannot proceed.")
+            logger.error("   Run 'python train.py' to train a new model.")
+            return 1
+        
+        # Load model (we know it's valid now)
+        import pickle
+        with open(args.model, "rb") as f:
+            model = pickle.load(f)
 
         # Fetch latest data
-        logger.info("Fetching latest BTC/USD data...")
         raw = fetch_latest_btcusd_hourly()
-        logger.info(f"✓ Fetched {len(raw)} data points")
-        
         feats = generate_features(raw)
         if len(feats) == 0:
-            logger.error("❌ No feature data available after engineering")
+            logger.error("No feature data available after feature engineering")
             return 1
-        logger.info(f"✓ Generated {len(feats)} feature rows")
         
+        # Prepare input for prediction
         latest = feats.iloc[-1]
-        x_live = latest[feature_cols].values.reshape(1, -1)
-        logger.info(f"✓ Prepared input shape: {x_live.shape}")
+        try:
+            x_live = latest[feature_cols].values.reshape(1, -1)
+        except KeyError as e:
+            logger.error(f"❌ Missing feature column: {e}")
+            logger.error("   Feature mismatch with current data.")
+            logger.error("   Run 'python train.py' to regenerate features.json")
+            return 1
 
         # Predict
-        logger.info("Generating prediction...")
         pred = predict_forward_log_return(model, x_live)
-        logger.info(f"✓ Prediction: {pred:.8f}")
 
         # Submit
-        logger.info("Submitting prediction to blockchain...")
         success = submit_prediction(pred, args.topic_id, dry_run=args.dry_run)
         logger.info(f"Submission status: {'success' if success else 'skipped or failed'}")
         return 0  # Always return 0 for dry-run or skipped
     except Exception as e:
-        logger.error(f"❌ Fatal error in main_once: {e}", exc_info=True)
+        logger.error(f"Fatal error in main_once: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return 1
 
 if __name__ == "__main__":

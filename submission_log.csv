@@ -90,3 +90,8 @@ accepts 2 arg(s), received 1"
 2025-11-23T00:34:22.774732+00:00,67,-0.005613448563963175,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6642955,"{""inference"": {""topic_id"": 67, ""block_height"": 6642955, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.005613448563963175"", ""extra_data"": """", ""proof"": """"}}",DgZ0pQgGhhksyw3mA4wYI4lgO5rkyC+o5PdwpeYvXpI8PYPzKllmOlSiR3S2SqF8wXmKx6NtVO3X2PQIOgwpEQ==,error: invalid response
 2025-11-23T00:34:30.391150+00:00,67,-0.005613448563963175,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6642955,"{""inference"": {""topic_id"": 67, ""block_height"": 6642955, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.005613448563963175"", ""extra_data"": """", ""proof"": """"}}",DgZ0pQgGhhksyw3mA4wYI4lgO5rkyC+o5PdwpeYvXpI8PYPzKllmOlSiR3S2SqF8wXmKx6NtVO3X2PQIOgwpEQ==,success
 2025-11-23T00:34:39.396211+00:00,67,-0.005613448563963175,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6642955,"{""inference"": {""topic_id"": 67, ""block_height"": 6642955, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.005613448563963175"", ""extra_data"": """", ""proof"": """"}}",DgZ0pQgGhhksyw3mA4wYI4lgO5rkyC+o5PdwpeYvXpI8PYPzKllmOlSiR3S2SqF8wXmKx6NtVO3X2PQIOgwpEQ==,failed: 
+2025-11-23T00:36:39.541658+00:00,67,-0.015132400207221508
+2025-11-23T00:41:12.453642+00:00,67,-0.012248349376022816
+2025-11-23T00:43:23.651008+00:00,67,0.008524484932422638
+2025-11-23T00:43:50.552835+00:00,67,-0.01597006246447563
+2025-11-23T00:44:12.042693+00:00,67,-0.022976921871304512
