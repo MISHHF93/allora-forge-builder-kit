@@ -15,3 +15,5 @@ timestamp,topic_id,prediction,worker,block_height,proof,signature,status,tx_hash
 2025-11-24T00:44:30.483155+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
 2025-11-24T00:48:58.385850+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
 2025-11-24T00:51:21.447777+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:54:48.546289+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:57:21.137447+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A

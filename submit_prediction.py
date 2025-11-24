@@ -299,47 +299,165 @@ def predict_forward_log_return(model, x_live: np.ndarray) -> float:
     return pred
 
 ###############################################################################
-# Model Validation
+# Model Validation (COMPREHENSIVE - Prevents All Model Fitting Issues)
 ###############################################################################
 def validate_model(model_path: str, feature_count: int) -> bool:
-    """Validate that loaded model is fitted and functional."""
+    """
+    Comprehensive model validation to prevent ALL model fitting issues.
+    Checks: file existence, load, fitted state, feature count, prediction capability.
+    """
     import pickle
+    
+    # CHECK 1: File existence
+    if not os.path.exists(model_path):
+        logger.error(f"❌ Model file not found: {model_path}")
+        logger.error("   FIX: Run 'python train.py' to train and save a model")
+        return False
+    
+    # CHECK 2: File is readable and not corrupted
+    try:
+        file_size = os.path.getsize(model_path)
+        logger.debug(f"Model file size: {file_size} bytes")
+        if file_size == 0:
+            logger.error(f"❌ Model file is empty: {model_path}")
+            logger.error("   FIX: Run 'python train.py' to train and save a model")
+            return False
+    except Exception as e:
+        logger.error(f"❌ Cannot access model file: {e}")
+        return False
+    
+    # CHECK 3: Model loads without corruption
     try:
         with open(model_path, "rb") as f:
             model = pickle.load(f)
-        logger.info(f"✅ Model loaded from {model_path}")
+        logger.debug(f"✅ Model deserialized successfully from {model_path}")
+    except pickle.UnpicklingError as e:
+        logger.error(f"❌ Model file is corrupted (pickle error): {e}")
+        logger.error("   FIX: Run 'python train.py' to retrain and save a fresh model")
+        return False
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
+        logger.error("   FIX: Run 'python train.py' to train and save a model")
         return False
     
-    # Check if fitted
+    # CHECK 4: Model is the correct type
+    try:
+        model_type = type(model).__name__
+        if not hasattr(model, 'predict'):
+            logger.error(f"❌ Model object has no predict() method. Type: {model_type}")
+            logger.error("   FIX: Run 'python train.py' to train and save a valid model")
+            return False
+        logger.debug(f"Model type: {model_type} (has predict method)")
+    except Exception as e:
+        logger.error(f"❌ Model type check failed: {e}")
+        return False
+    
+    # CHECK 5: Model is FITTED (has n_features_in_ attribute)
     try:
         if not hasattr(model, 'n_features_in_'):
-            logger.error("❌ Model not fitted (missing n_features_in_ attribute)")
-            logger.error("   This usually means train.py was not run or model was saved without fitting.")
-            logger.error("   Fix: Run 'python train.py' to train and save a fitted model.")
+            logger.error("❌ Model is NOT FITTED (missing n_features_in_ attribute)")
+            logger.error("   This means train.py was not run or model.pkl is incomplete")
+            logger.error("   FIX: Run 'python train.py' to train and save a fitted model")
             return False
-        if model.n_features_in_ != feature_count:
-            logger.error(f"❌ Feature count mismatch: model expects {model.n_features_in_}, got {feature_count}")
-            logger.error("   This usually means features.json is outdated.")
-            logger.error("   Fix: Run 'python train.py' to regenerate features.json.")
-            return False
-        logger.info(f"✅ Model is fitted with n_features_in_={model.n_features_in_}")
+        logger.debug(f"✅ Model is fitted (n_features_in_={model.n_features_in_})")
     except Exception as e:
-        logger.error(f"❌ Model fitted-state verification failed: {e}")
+        logger.error(f"❌ Model fitted-state check failed: {e}")
         return False
     
-    # Test prediction on dummy input
+    # CHECK 6: Feature count matches
     try:
-        dummy_input = np.zeros((1, feature_count))
-        test_pred = model.predict(dummy_input)
-        logger.info(f"✅ Model test prediction passed: {float(test_pred[0]):.8f}")
+        if model.n_features_in_ != feature_count:
+            logger.error(f"❌ Feature count MISMATCH")
+            logger.error(f"   Model expects: {model.n_features_in_} features")
+            logger.error(f"   features.json has: {feature_count} features")
+            logger.error("   FIX: Run 'python train.py' to regenerate features.json and model")
+            return False
+        logger.debug(f"✅ Feature count matches: {feature_count}")
+    except Exception as e:
+        logger.error(f"❌ Feature count check failed: {e}")
+        return False
+    
+    # CHECK 7: Model has expected scikit-learn/XGBoost fitted attributes
+    try:
+        has_coef = hasattr(model, 'coef_')
+        has_intercept = hasattr(model, 'intercept_')
+        has_estimators = hasattr(model, 'estimators_')
+        has_booster = hasattr(model, 'booster_')
+        
+        # At least some fitted attributes should be present
+        fitted_attrs = [has_coef, has_intercept, has_estimators, has_booster]
+        if not any(fitted_attrs):
+            logger.error("❌ Model has no fitted attributes (coef_, intercept_, estimators_, booster_)")
+            logger.error("   This means model.pkl was not properly saved after training")
+            logger.error("   FIX: Run 'python train.py' to retrain and save model properly")
+            return False
+        logger.debug(f"Fitted attributes present: coef_={has_coef}, intercept_={has_intercept}, estimators_={has_estimators}, booster_={has_booster}")
+    except Exception as e:
+        logger.error(f"❌ Fitted attributes check failed: {e}")
+        return False
+    
+    # CHECK 8: Test prediction on ZERO input (most robust test)
+    try:
+        zero_input = np.zeros((1, feature_count))
+        test_pred = model.predict(zero_input)
+        
+        # Validate prediction output
+        if not isinstance(test_pred, np.ndarray) or test_pred.shape != (1,):
+            logger.error(f"❌ Prediction output has wrong shape: {test_pred.shape}")
+            logger.error("   Model may be incompatible or corrupted")
+            logger.error("   FIX: Run 'python train.py' to retrain")
+            return False
+        
+        pred_value = float(test_pred[0])
+        
+        # Check for invalid predictions (NaN, Inf)
+        if np.isnan(pred_value):
+            logger.error(f"❌ Prediction is NaN (not a number)")
+            logger.error("   Model may have numerical issues")
+            logger.error("   FIX: Run 'python train.py' to retrain with better data")
+            return False
+        if np.isinf(pred_value):
+            logger.error(f"❌ Prediction is Inf (infinity)")
+            logger.error("   Model has overflow issues")
+            logger.error("   FIX: Run 'python train.py' to retrain")
+            return False
+        
+        logger.debug(f"✅ Test prediction on zero input successful: {pred_value:.8f}")
+    except TypeError as e:
+        logger.error(f"❌ Model.predict() raised TypeError: {e}")
+        logger.error("   Model may be incompatible with input shape")
+        logger.error("   FIX: Run 'python train.py' to retrain")
+        return False
     except Exception as e:
         logger.error(f"❌ Model test prediction failed: {e}")
-        logger.error("   This usually means model.pkl is corrupted or incompatible.")
-        logger.error("   Fix: Run 'python train.py' to retrain and save a fresh model.")
+        logger.error("   Model.pkl may be corrupted")
+        logger.error("   FIX: Run 'python train.py' to retrain and save a fresh model")
         return False
     
+    # CHECK 9: Test prediction on RANDOM input (stress test)
+    try:
+        random_input = np.random.randn(1, feature_count)
+        random_pred = model.predict(random_input)
+        random_value = float(random_pred[0])
+        
+        if np.isnan(random_value) or np.isinf(random_value):
+            logger.error(f"❌ Prediction on random input produced invalid value: {random_value}")
+            logger.error("   Model has stability issues")
+            logger.error("   FIX: Run 'python train.py' to retrain with better regularization")
+            return False
+        
+        logger.debug(f"✅ Test prediction on random input successful: {random_value:.8f}")
+    except Exception as e:
+        logger.error(f"❌ Model stress test (random input) failed: {e}")
+        logger.error("   FIX: Run 'python train.py' to retrain")
+        return False
+    
+    # ALL CHECKS PASSED
+    logger.info(f"✅ Model validation PASSED - Model is ready")
+    logger.info(f"   ✅ File: {model_path} ({file_size} bytes)")
+    logger.info(f"   ✅ Type: {type(model).__name__}")
+    logger.info(f"   ✅ Fitted: n_features_in_={model.n_features_in_}")
+    logger.info(f"   ✅ Predictions: Working (zero={float(test_pred[0]):.8f}, random={random_value:.8f})")
     return True
 
 ###############################################################################
@@ -913,12 +1031,139 @@ def main():
         exit_code = main_once(args)
         sys.exit(0 if exit_code else 1)
 
+def validate_startup(args) -> bool:
+    """
+    Comprehensive startup validation to ensure model and features are ready.
+    Runs BEFORE daemon starts to catch issues early.
+    """
+    logger.info("=" * 80)
+    logger.info("🔍 PRE-EXECUTION STARTUP VALIDATION")
+    logger.info("=" * 80)
+    
+    # CHECK 1: Features file exists and is readable
+    logger.info("\n[1/4] Checking features.json...")
+    if not os.path.exists(args.features):
+        logger.error(f"❌ Features file not found: {args.features}")
+        logger.error("   FIX: Run 'python train.py' to generate features.json")
+        return False
+    
+    try:
+        with open(args.features, "r") as f:
+            feature_cols = json.load(f)
+        
+        if not isinstance(feature_cols, list) or len(feature_cols) == 0:
+            logger.error(f"❌ features.json is invalid (not a non-empty list)")
+            logger.error("   FIX: Run 'python train.py' to generate valid features.json")
+            return False
+        
+        logger.info(f"   ✅ Features file valid: {len(feature_cols)} columns")
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ features.json is not valid JSON: {e}")
+        logger.error("   FIX: Run 'python train.py' to regenerate features.json")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Error reading features.json: {e}")
+        return False
+    
+    # CHECK 2: Model file exists and has correct size
+    logger.info("\n[2/4] Checking model.pkl file...")
+    if not os.path.exists(args.model):
+        logger.error(f"❌ Model file not found: {args.model}")
+        logger.error("   FIX: Run 'python train.py' to train and save model.pkl")
+        return False
+    
+    try:
+        model_size = os.path.getsize(args.model)
+        if model_size == 0:
+            logger.error(f"❌ model.pkl is empty (0 bytes)")
+            logger.error("   FIX: Run 'python train.py' to train and save a valid model")
+            return False
+        logger.info(f"   ✅ Model file exists: {model_size} bytes")
+    except Exception as e:
+        logger.error(f"❌ Error accessing model.pkl: {e}")
+        return False
+    
+    # CHECK 3: Model is properly fitted and functional (9-point check)
+    logger.info("\n[3/4] Validating model (comprehensive fitted-state check)...")
+    if not validate_model(args.model, len(feature_cols)):
+        logger.error("❌ Model validation FAILED")
+        logger.error("   FIX: Run 'python train.py' to retrain and save a valid model")
+        return False
+    
+    # CHECK 4: Test that we can actually fetch data and make a prediction
+    logger.info("\n[4/4] Testing data fetch and prediction...")
+    try:
+        # Load model
+        import pickle
+        with open(args.model, "rb") as f:
+            model = pickle.load(f)
+        
+        # Try to fetch data
+        try:
+            raw = fetch_latest_btcusd_hourly(hours=168)
+            if len(raw) == 0:
+                logger.error("❌ Data fetch returned zero rows")
+                logger.error("   FIX: Check network connectivity and Tiingo API key")
+                return False
+            logger.debug(f"   ✅ Data fetch successful: {len(raw)} rows")
+        except Exception as e:
+            logger.error(f"❌ Data fetch failed: {e}")
+            logger.error("   FIX: Check network connectivity and TIINGO_API_KEY")
+            return False
+        
+        # Try to generate features
+        try:
+            feats = generate_features(raw)
+            if len(feats) == 0:
+                logger.error("❌ Feature generation returned zero rows")
+                logger.error("   FIX: Check that raw data has enough records (need at least 72 hours)")
+                return False
+            logger.debug(f"   ✅ Feature generation successful: {len(feats)} rows")
+        except Exception as e:
+            logger.error(f"❌ Feature generation failed: {e}")
+            logger.error("   FIX: Check that feature engineering is working correctly")
+            return False
+        
+        # Try to make a prediction
+        try:
+            latest = feats.iloc[-1]
+            x_live = latest[feature_cols].values.reshape(1, -1)
+            pred = model.predict(x_live)
+            pred_value = float(pred[0])
+            
+            if np.isnan(pred_value) or np.isinf(pred_value):
+                logger.error(f"❌ Prediction produced invalid value: {pred_value}")
+                logger.error("   FIX: Retrain model with 'python train.py'")
+                return False
+            
+            logger.info(f"   ✅ Prediction successful: {pred_value:.8f}")
+        except Exception as e:
+            logger.error(f"❌ Prediction failed: {e}")
+            logger.error("   FIX: Check that model and features are compatible")
+            return False
+    
+    except Exception as e:
+        logger.error(f"❌ Startup test failed: {e}")
+        return False
+    
+    # ALL CHECKS PASSED
+    logger.info("\n" + "=" * 80)
+    logger.info("✅ STARTUP VALIDATION COMPLETE - ALL CHECKS PASSED")
+    logger.info("=" * 80)
+    return True
+
 def run_daemon(args):
     """
     Run as a long-lived daemon until December 15, 2025.
     Handles all exceptions, never silently fails, includes hourly heartbeat.
     """
     global _shutdown_requested
+    
+    # Validate startup before beginning daemon loop
+    if not validate_startup(args):
+        logger.error("❌ STARTUP VALIDATION FAILED - ABORTING DAEMON START")
+        logger.error("   Address the issues above and try again")
+        return 1
     
     interval = int(os.getenv("SUBMISSION_INTERVAL", "3600"))  # 1 hour default
     competition_end = datetime(2025, 12, 15, 0, 0, 0, tzinfo=timezone.utc)
