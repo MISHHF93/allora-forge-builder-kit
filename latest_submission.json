@@ -1,12 +1,21 @@
 {
-  "timestamp": "2025-11-24T01:02:19.376244+00:00",
+  "timestamp": "2025-11-24T02:21:31.524372+00:00",
   "topic_id": 67,
   "prediction": -0.02882043644785881,
   "worker": "allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma",
-  "block_height": 0,
-  "proof": {},
-  "signature": "",
-  "status": "skipped_no_nonce",
-  "tx_hash": null,
-  "rpc_endpoint": "N/A"
+  "block_height": 6659515,
+  "proof": {
+    "inference": {
+      "topic_id": 67,
+      "block_height": 6659515,
+      "inferer": "allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma",
+      "value": "-0.02882043644785881",
+      "extra_data": "",
+      "proof": ""
+    }
+  },
+  "signature": "lIdJvFA4ptqzB1gk9cghw7tXdfWq97hlH43U8dDeLcs6lDDkSgEG/P77BoVdw5lccLSGMjwg1HO5KspIlH7o2Q==",
+  "status": "success_pending_confirmation",
+  "tx_hash": "66B8F59448CE96CB6E638C991EC2D72B3216FFC2E94BF0F9A44B57A3AA681DFC",
+  "rpc_endpoint": "Primary"
 }

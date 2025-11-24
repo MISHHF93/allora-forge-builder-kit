@@ -43,8 +43,8 @@ load_dotenv()
 # Other endpoints may be available depending on network configuration
 RPC_ENDPOINTS = [
     {"url": "https://allora-rpc.testnet.allora.network/", "name": "Primary", "priority": 1},
-    # {"url": "https://allora-testnet-rpc.allthatnode.com:1317/", "name": "AllThatNode", "priority": 2},
-    # {"url": "https://allora.api.chandrastation.com/", "name": "ChandraStation", "priority": 3},
+    {"url": "http://allora-rpc.testnet.allora.network:26657/", "name": "Primary-HTTP", "priority": 2},
+    {"url": "tcp://allora-rpc.testnet.allora.network:26657/", "name": "Primary-TCP", "priority": 3},
 ]
 
 # Global state for RPC endpoint rotation with enhanced tracking
@@ -464,50 +464,72 @@ def validate_model(model_path: str, feature_count: int) -> bool:
 # Get Account Sequence with Enhanced RPC Handling
 ###############################################################################
 def get_account_sequence(wallet: str) -> int:
-    """Query account sequence from Allora network with RPC failover and validation."""
+    """Query account sequence from Allora network.
+    
+    Since the RPC is unreliable, we'll attempt to get it but also provide
+    a mechanism to skip this check since the CLI handles sequence internally.
+    """
+    logger.debug(f"Attempting to query account sequence for {wallet}")
+    
+    # Try using requests directly to bypass CLI issues
+    try:
+        import requests
+        url = "https://allora-rpc.testnet.allora.network"
+        
+        # Use REST endpoint if available
+        rest_url = f"{url.replace(':26657', '')}/cosmos/auth/v1beta1/accounts/{wallet}"
+        logger.debug(f"Attempting direct REST query to {rest_url}")
+        
+        response = requests.get(rest_url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if 'account' in data:
+                sequence = int(data['account']['sequence'])
+                logger.debug(f"✅ Got account sequence: {sequence} (REST)")
+                return sequence
+        
+        logger.debug(f"  REST endpoint returned {response.status_code}")
+    except Exception as e:
+        logger.debug(f"  REST attempt failed: {e}")
+    
+    # Fallback to CLI method with shorter timeout
     cli = shutil.which("allorad") or shutil.which("allora")
     if not cli:
-        logger.error("❌ Allora CLI not found in PATH")
-        return 0
+        logger.debug("❌ Allora CLI not found in PATH, will attempt submission anyway")
+        return -1  # Return -1 to indicate "unknown but try anyway"
     
     rpc_endpoint = get_rpc_endpoint()
-    logger.debug(f"Querying account sequence via RPC: {rpc_endpoint['name']} ({rpc_endpoint['url']})")
+    logger.debug(f"Querying account sequence via CLI: {rpc_endpoint['name']}")
     
     cmd = [cli, "query", "auth", "account", wallet, 
            "--node", rpc_endpoint["url"],
            "--output", "json"]
     
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        # Shorter timeout since RPC is unreliable
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         
         if proc.returncode == 0:
-            # Validate response is JSON, not HTML error
             is_valid, data = validate_json_response(proc.stdout, f"for account {wallet}")
             if not is_valid:
-                mark_rpc_failed(rpc_endpoint["url"], "Invalid JSON response (likely HTML error)")
-                return 0
+                mark_rpc_failed(rpc_endpoint["url"], "Invalid JSON response")
+                return -1  # Return -1 to indicate "unknown but try anyway"
             
             sequence = int(data["account"]["value"]["sequence"])
-            logger.debug(f"✅ Got account sequence: {sequence} from {rpc_endpoint['name']}")
+            logger.debug(f"✅ Got account sequence: {sequence}")
             reset_rpc_endpoint(rpc_endpoint["url"])
             return sequence
         else:
-            error_msg = proc.stderr.strip()
-            logger.warning(f"⚠️  Query failed for account {wallet} on {rpc_endpoint['name']}: {error_msg}")
-            mark_rpc_failed(rpc_endpoint["url"], error_msg)
-            return 0
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ Failed to parse account sequence response: {e}")
-        mark_rpc_failed(rpc_endpoint["url"], f"JSON decode error: {e}")
-        return 0
+            logger.debug(f"⚠️  CLI query failed: {proc.stderr.strip()}")
+            mark_rpc_failed(rpc_endpoint["url"], "Query failed")
+            return -1  # Return -1 to indicate "unknown but try anyway"
     except subprocess.TimeoutExpired:
-        logger.error(f"❌ Query timed out (30s) for account sequence on {rpc_endpoint['name']}")
-        mark_rpc_failed(rpc_endpoint["url"], "Timeout (30s)")
-        return 0
-    except Exception as e:
-        logger.error(f"❌ Error querying account sequence: {e}")
-        mark_rpc_failed(rpc_endpoint["url"], str(e))
-        return 0
+        logger.debug(f"⚠️  CLI query timed out (5s), will attempt submission anyway")
+        mark_rpc_failed(rpc_endpoint["url"], "Timeout")
+        return -1  # Return -1 to indicate "unknown but try anyway"
+    except Exception as ex:
+        logger.debug(f"⚠️  CLI error: {ex}, will attempt submission anyway")
+        return -1  # Return -1 to indicate "unknown but try anyway"
 
 ###############################################################################
 # Get Unfulfilled Nonce with Enhanced RPC Handling
@@ -785,7 +807,11 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
         )
         return False
     
-    logger.debug(f"Account sequence: {sequence}")
+    if sequence > 0:
+        logger.debug(f"Account sequence: {sequence}")
+    else:
+        logger.warning(f"⚠️  Could not determine account sequence, will attempt submission anyway")
+        logger.info(f"💡 The CLI will auto-discover the correct sequence")
 
     # Create wallet for signing
     mnemonic = os.getenv("MNEMONIC", "").strip()
@@ -872,8 +898,12 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
                "--fees", "2500000uallo",
                "--broadcast-mode", "sync",
                "--gas", "250000",
-               "--sequence", str(sequence),
                "--output", "json"]
+        
+        # Only add sequence if we successfully retrieved it
+        if sequence > 0:
+            cmd.extend(["--sequence", str(sequence)])
+        
         if dry_run:
             cmd.append("--dry-run")
             logger.info("Dry-run mode: simulating submission")
