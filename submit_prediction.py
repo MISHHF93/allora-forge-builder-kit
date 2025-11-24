@@ -476,6 +476,10 @@ def get_unfulfilled_nonce(topic_id: int) -> int:
         else:
             error_msg = proc.stderr.strip()
             logger.warning(f"⚠️  Query failed for unfulfilled nonces: {error_msg}")
+            # Check for gRPC specific errors
+            if "grpc_status:12" in error_msg or "received http2 header with status: 404" in error_msg.lower():
+                logger.warning(f"   ⚠️  gRPC 404 error - RPC service may have transient issue")
+                logger.warning(f"   This is typically resolved by retrying")
             mark_rpc_failed(rpc_endpoint["url"], error_msg)
             return 0
     except json.JSONDecodeError as e:
@@ -811,6 +815,13 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
                 if "invalid character" in cli_error.lower() or "looking for beginning" in cli_error.lower():
                     logger.error(f"   ⚠️  Received invalid response (likely HTML error page)")
                     mark_rpc_failed(rpc_endpoint["url"], "Invalid response (HTML or malformed JSON)")
+                elif "grpc_status:12" in cli_error or "received http2 header with status: 404" in cli_error.lower():
+                    logger.error(f"   ⚠️  gRPC 404 error - RPC endpoint may not support this operation")
+                    logger.error(f"   This is typically a transient issue with the RPC service")
+                    mark_rpc_failed(rpc_endpoint["url"], "gRPC 404 - RPC service issue")
+                elif "connection refused" in cli_error.lower() or "connection reset" in cli_error.lower():
+                    logger.error(f"   ⚠️  Connection error - RPC endpoint may be temporarily unavailable")
+                    mark_rpc_failed(rpc_endpoint["url"], "Connection failed")
                 else:
                     logger.error(f"   May indicate RPC connectivity issues")
                     mark_rpc_failed(rpc_endpoint["url"], cli_error)
@@ -818,6 +829,7 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
                 status = f"cli_error: {cli_error[:100]}"
                 if attempt < _max_submission_retries - 1:
                     logger.info(f"🔄 Retrying with next RPC endpoint...")
+                    time.sleep(2)  # Brief pause before retry
                     continue
                 break
         except subprocess.TimeoutExpired:
