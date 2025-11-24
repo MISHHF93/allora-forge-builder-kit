@@ -36,3 +36,10 @@ timestamp,topic_id,prediction,worker,block_height,proof,signature,status,tx_hash
 2025-11-24T03:20:39.492785+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
 2025-11-24T03:21:04.257382+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
 2025-11-24T03:21:24.086253+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:37:27.866737+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6660235,"{""inference"": {""topic_id"": 67, ""block_height"": 6660235, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.02882043644785881"", ""extra_data"": """", ""proof"": """"}}",cksx3gfr1C0ubkrxQSmWlmOBCKzc44zpu3boboV9I1tEXesfNH+lgvLDOjS6EMNi9qEjgxxWrXgJQKMnSFH5tA==,success_pending_confirmation,292639496865CB4B0F7F2F7239A8F3646BAEEF8BA0B782069A4DCD15767D4FA2,Primary
+2025-11-24T03:42:29.732660+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:42:37.315621+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:42:57.361100+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:48:14.424966+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:49:30.480842+00:00,67,0.024734998121857643,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6660513,"{""inference"": {""topic_id"": 67, ""block_height"": 6660513, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""0.024734998121857643"", ""extra_data"": """", ""proof"": """"}}",,success
+2025-11-24T03:49:50.466018+00:00,67,-0.07608044892549515,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A

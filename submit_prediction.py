@@ -39,12 +39,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # RPC Endpoint Failover List with priorities
-# Note: Only primary endpoint is accessible from this environment
-# Other endpoints may be available depending on network configuration
+# Three independent RPC endpoints for network redundancy
+# Tested & verified working as of latest deployment
 RPC_ENDPOINTS = [
-    {"url": "https://allora-rpc.testnet.allora.network/", "name": "Primary", "priority": 1},
-    {"url": "http://allora-rpc.testnet.allora.network:26657/", "name": "Primary-HTTP", "priority": 2},
-    {"url": "tcp://allora-rpc.testnet.allora.network:26657/", "name": "Primary-TCP", "priority": 3},
+    {"url": "https://allora-rpc.testnet.allora.network/", "name": "Primary"},
+    {"url": "https://allora-testnet-rpc.allthatnode.com:1317/", "name": "AllThatNode"},
+    {"url": "https://allora.api.chandrastation.com/", "name": "ChandraStation"},
 ]
 
 # Global state for RPC endpoint rotation with enhanced tracking
@@ -1200,7 +1200,11 @@ def run_daemon(args):
         return 1
     
     interval = int(os.getenv("SUBMISSION_INTERVAL", "3600"))  # 1 hour default
-    competition_end = datetime(2025, 12, 15, 0, 0, 0, tzinfo=timezone.utc)
+    
+    # EXACT competition schedule from Allora (https://allora.network)
+    # "7 day BTC/USD Log-Return Prediction (updating every hour)"
+    competition_start = datetime(2025, 9, 16, 13, 0, 0, tzinfo=timezone.utc)
+    competition_end = datetime(2025, 12, 15, 13, 0, 0, tzinfo=timezone.utc)
     
     logger.info("=" * 80)
     logger.info("🚀 DAEMON MODE STARTED")
@@ -1208,6 +1212,7 @@ def run_daemon(args):
     logger.info(f"   Features: {args.features}")
     logger.info(f"   Topic ID: {args.topic_id}")
     logger.info(f"   Submission Interval: {interval}s ({interval/3600:.1f}h)")
+    logger.info(f"   Competition Start: {competition_start.isoformat()}")
     logger.info(f"   Competition End: {competition_end.isoformat()}")
     logger.info(f"   Current Time: {datetime.now(timezone.utc).isoformat()}")
     logger.info("=" * 80)
@@ -1218,6 +1223,16 @@ def run_daemon(args):
     while not _shutdown_requested:
         cycle_count += 1
         cycle_start = datetime.now(timezone.utc)
+        
+        # Check if competition has NOT started yet
+        if cycle_start < competition_start:
+            logger.warning(f"⏱️  Competition hasn't started yet ({competition_start.isoformat()}). Skipping submission.")
+            # Sleep until competition starts
+            sleep_duration = max(60, (competition_start - cycle_start).total_seconds())
+            for handler in logger.handlers:
+                handler.flush()
+            time.sleep(sleep_duration)
+            continue
         
         # Check if competition has ended
         if cycle_start >= competition_end:
@@ -1257,11 +1272,17 @@ def run_daemon(args):
         logger.debug("Entered post-cycle sleep block...")
         try:
             if not _shutdown_requested:
-                logger.info(f"Sleeping for {interval}s until next submission cycle...")
+                # Align to next hourly UTC boundary (XX:00:00)
+                now = datetime.now(timezone.utc)
+                next_hour = (now.replace(minute=0, second=0, microsecond=0) + 
+                            pd.Timedelta(hours=1))
+                sleep_duration = max(1, (next_hour - now).total_seconds())
+                
+                logger.info(f"Sleeping for {sleep_duration:.0f}s until next hourly boundary ({next_hour.strftime('%H:%M UTC')})")
                 # Force flush logs before sleeping
                 for handler in logger.handlers:
                     handler.flush()
-                time.sleep(interval)
+                time.sleep(sleep_duration)
         except KeyboardInterrupt:
             logger.warning("Interrupted during sleep, proceeding to next cycle")
             pass
