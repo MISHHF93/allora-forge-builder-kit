@@ -38,14 +38,27 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()
 
-# RPC Endpoint Failover List with priorities
-# Three independent RPC endpoints for network redundancy
-# Tested & verified working as of latest deployment
-RPC_ENDPOINTS = [
-    {"url": "https://allora-rpc.testnet.allora.network/", "name": "Primary"},
-    {"url": "https://allora-testnet-rpc.allthatnode.com:1317/", "name": "AllThatNode"},
-    {"url": "https://allora.api.chandrastation.com/", "name": "ChandraStation"},
-]
+###############################################################################
+# RPC Endpoint Helper Functions (before logger setup)
+###############################################################################
+def normalize_rpc_url(url: str) -> str:
+    """Normalize RPC URL to ensure proper formatting for allorad CLI."""
+    url = url.strip()
+    # Ensure trailing slash for REST endpoints
+    if not url.endswith("/"):
+        url += "/"
+    return url
+
+def get_default_rpc_endpoints():
+    """Return default RPC endpoints (hardcoded fallback)."""
+    return [
+        {"url": "https://allora-rpc.testnet.allora.network/", "name": "Primary"},
+        {"url": "https://allora-testnet-rpc.allthatnode.com:1317/", "name": "AllThatNode"},
+        {"url": "https://allora.api.chandrastation.com/", "name": "ChandraStation"},
+    ]
+
+# Placeholder - will be populated after logger setup
+RPC_ENDPOINTS = get_default_rpc_endpoints()
 
 # Global state for RPC endpoint rotation with enhanced tracking
 _rpc_endpoint_index = 0
@@ -94,49 +107,77 @@ def validate_json_response(response_text: str, context: str = "") -> tuple[bool,
         return False, {}
 
 ###############################################################################
-# RPC Endpoint Management with Enhanced Failover
+# RPC Endpoint Management with Enhanced Failover & Format Detection
 ###############################################################################
 def get_rpc_endpoint() -> dict:
-    """Get the next working RPC endpoint with automatic failover."""
+    """Get the next working RPC endpoint with automatic failover.
+    
+    Features:
+    - Automatic rotation through endpoints
+    - Tracks failed endpoints and skips them
+    - Resets failure count after 3 retries
+    - Supports gRPC, REST, and hybrid endpoints
+    """
     global _rpc_endpoint_index, _failed_rpc_endpoints
     
-    # Count of working endpoints
+    # Count of working endpoints (less than 3 failures)
     working_endpoints = [e for e in RPC_ENDPOINTS if _failed_rpc_endpoints.get(e["url"], 0) < 3]
     
-    # If all endpoints exhausted, reset
+    # If all endpoints exhausted, reset failure tracking
     if not working_endpoints:
-        logger.info("🔄 Resetting failed RPC endpoints - all exceeded retry limit")
+        logger.warning("⚠️  All RPC endpoints have exceeded retry limit, resetting...")
+        logger.warning(f"   Failed endpoints: {list(_failed_rpc_endpoints.keys())}")
         _failed_rpc_endpoints.clear()
         working_endpoints = RPC_ENDPOINTS
         _rpc_endpoint_index = 0
     
-    # Get next endpoint
+    # Get next endpoint (round-robin)
     endpoint = working_endpoints[_rpc_endpoint_index % len(working_endpoints)]
     _rpc_endpoint_index += 1
     
-    logger.debug(f"Selected RPC endpoint: {endpoint['name']} ({endpoint['url']})")
+    failure_count = _failed_rpc_endpoints.get(endpoint["url"], 0)
+    if failure_count > 0:
+        logger.debug(f"Selected RPC endpoint: {endpoint['name']} ({endpoint['url']}) - Failures: {failure_count}/3")
+    else:
+        logger.debug(f"Selected RPC endpoint: {endpoint['name']} ({endpoint['url']})")
+    
     return endpoint
 
 def mark_rpc_failed(endpoint_url: str, error: str = ""):
-    """Mark an RPC endpoint as failed and track failure count."""
+    """Mark an RPC endpoint as failed and track failure count.
+    
+    After 3 failures, endpoint will be skipped until all endpoints fail,
+    then all failure counts reset.
+    """
     global _failed_rpc_endpoints
     current_failures = _failed_rpc_endpoints.get(endpoint_url, 0)
-    _failed_rpc_endpoints[endpoint_url] = current_failures + 1
+    new_failure_count = current_failures + 1
+    _failed_rpc_endpoints[endpoint_url] = new_failure_count
     
     endpoint_name = next((e["name"] for e in RPC_ENDPOINTS if e["url"] == endpoint_url), "Unknown")
-    logger.warning(
-        f"⚠️  RPC endpoint marked failed: {endpoint_name}\n"
-        f"   Failures: {_failed_rpc_endpoints[endpoint_url]}/3\n"
-        f"   Error: {error}"
-    )
+    
+    # Log failure with escalating severity
+    if new_failure_count >= 3:
+        logger.error(
+            f"❌ RPC endpoint DISABLED: {endpoint_name}\n"
+            f"   URL: {endpoint_url}\n"
+            f"   Failures: {new_failure_count}/3 (disabled)\n"
+            f"   Error: {error}"
+        )
+    else:
+        logger.warning(
+            f"⚠️  RPC endpoint marked failed: {endpoint_name}\n"
+            f"   Failures: {new_failure_count}/3\n"
+            f"   Error: {error}"
+        )
 
 def reset_rpc_endpoint(endpoint_url: str):
     """Reset RPC endpoint failure count after successful use."""
     global _failed_rpc_endpoints
-    if endpoint_url in _failed_rpc_endpoints:
+    if endpoint_url in _failed_rpc_endpoints and _failed_rpc_endpoints[endpoint_url] > 0:
         _failed_rpc_endpoints[endpoint_url] = 0
         endpoint_name = next((e["name"] for e in RPC_ENDPOINTS if e["url"] == endpoint_url), "Unknown")
-        logger.debug(f"✅ Reset failure count for {endpoint_name}")
+        logger.debug(f"✅ RPC endpoint recovered: {endpoint_name}")
 
 
 ###############################################################################
@@ -182,6 +223,50 @@ def setup_logging(log_file: str = "logs/submission.log"):
     return logger
 
 logger = setup_logging()
+
+###############################################################################
+# Load RPC Endpoints from .env or use hardcoded defaults
+###############################################################################
+def load_rpc_endpoints_from_env():
+    """Load RPC endpoints from .env with proper formatting."""
+    rpc_env = os.getenv("RPC_ENDPOINTS", "").strip()
+    
+    if rpc_env:
+        # Handle comma-separated URLs
+        if "," in rpc_env:
+            urls = [url.strip() for url in rpc_env.split(",")]
+            endpoints = [
+                {"url": normalize_rpc_url(url), "name": f"Endpoint-{i+1}"} 
+                for i, url in enumerate(urls)
+            ]
+            logger.info(f"✅ Loaded {len(endpoints)} RPC endpoints from .env (comma-separated)")
+            for i, ep in enumerate(endpoints, 1):
+                logger.debug(f"   {i}. {ep['name']}: {ep['url']}")
+            return endpoints
+        # Handle JSON array format
+        elif rpc_env.startswith("["):
+            try:
+                urls = json.loads(rpc_env)
+                endpoints = [
+                    {"url": normalize_rpc_url(url), "name": f"Endpoint-{i+1}"} 
+                    for i, url in enumerate(urls)
+                ]
+                logger.debug(f"✅ Loaded {len(endpoints)} RPC endpoints from .env (JSON format)")
+                for i, ep in enumerate(endpoints, 1):
+                    logger.debug(f"   {i}. {ep['name']}: {ep['url']}")
+                return endpoints
+            except json.JSONDecodeError as e:
+                logger.warning(f"⚠️  RPC_ENDPOINTS in .env is not valid JSON: {e}")
+    
+    # Fallback to hardcoded defaults
+    endpoints = get_default_rpc_endpoints()
+    logger.debug(f"📋 Using {len(endpoints)} hardcoded RPC endpoints (defaults)")
+    for i, ep in enumerate(endpoints, 1):
+        logger.debug(f"   {i}. {ep['name']}: {ep['url']}")
+    return endpoints
+
+# Load RPC endpoints after logger is available
+RPC_ENDPOINTS = load_rpc_endpoints_from_env()
 
 # Global state for daemon
 _shutdown_requested = False

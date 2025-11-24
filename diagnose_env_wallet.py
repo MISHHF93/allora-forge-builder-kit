@@ -107,14 +107,44 @@ for var_name, description in required_vars.items():
     else:
         print(f"❌ {var_name}: NOT SET ({description})")
 
-# 5. Test RPC endpoints
+# 5. Test RPC endpoints from .env or defaults
 print("\n🌐 [STEP 5] Testing RPC endpoint connectivity...")
-rpc_endpoints = [
-    {"url": "https://allora-rpc.testnet.allora.network/", "name": "Primary"},
-    {"url": "https://allora-testnet-rpc.allthatnode.com:1317/", "name": "AllThatNode"},
-    {"url": "https://allora.api.chandrastation.com/", "name": "ChandraStation"},
-]
 
+# Load RPC endpoints (same logic as submit_prediction.py)
+rpc_env = os.getenv("RPC_ENDPOINTS", "").strip()
+rpc_endpoints = []
+
+if rpc_env:
+    # Handle comma-separated URLs
+    if "," in rpc_env:
+        urls = [url.strip() for url in rpc_env.split(",")]
+        rpc_endpoints = [
+            {"url": url if url.endswith("/") else url + "/", "name": f"Custom-{i+1}"} 
+            for i, url in enumerate(urls)
+        ]
+        print(f"📋 Loaded {len(rpc_endpoints)} RPC endpoints from .env (RPC_ENDPOINTS)")
+    # Handle JSON array format
+    elif rpc_env.startswith("["):
+        try:
+            urls = json.loads(rpc_env)
+            rpc_endpoints = [
+                {"url": url if url.endswith("/") else url + "/", "name": f"Custom-{i+1}"} 
+                for i, url in enumerate(urls)
+            ]
+            print(f"📋 Loaded {len(rpc_endpoints)} RPC endpoints from .env (JSON format)")
+        except json.JSONDecodeError:
+            print("⚠️  RPC_ENDPOINTS in .env is not valid JSON, using defaults")
+
+# Fall back to hardcoded defaults if no .env config
+if not rpc_endpoints:
+    rpc_endpoints = [
+        {"url": "https://allora-rpc.testnet.allora.network/", "name": "Primary"},
+        {"url": "https://allora-testnet-rpc.allthatnode.com:1317/", "name": "AllThatNode"},
+        {"url": "https://allora.api.chandrastation.com/", "name": "ChandraStation"},
+    ]
+    print(f"📋 Using {len(rpc_endpoints)} hardcoded RPC endpoints")
+
+print(f"\n   Testing {len(rpc_endpoints)} endpoint(s):")
 for endpoint in rpc_endpoints:
     try:
         response = requests.get(
@@ -123,15 +153,15 @@ for endpoint in rpc_endpoints:
             headers={"User-Agent": "allora-diagnostic/1.0"}
         )
         if response.status_code < 500:
-            print(f"✅ {endpoint['name']}: Responsive ({response.status_code})")
+            print(f"   ✅ {endpoint['name']}: Responsive ({response.status_code})")
         else:
-            print(f"⚠️  {endpoint['name']}: Server error ({response.status_code})")
+            print(f"   ⚠️  {endpoint['name']}: Server error ({response.status_code})")
     except requests.exceptions.ConnectTimeout:
-        print(f"❌ {endpoint['name']}: Connection timeout")
+        print(f"   ❌ {endpoint['name']}: Connection timeout")
     except requests.exceptions.ConnectionError as e:
-        print(f"❌ {endpoint['name']}: Connection error - {str(e)[:50]}")
+        print(f"   ❌ {endpoint['name']}: Connection error - {str(e)[:50]}")
     except Exception as e:
-        print(f"⚠️  {endpoint['name']}: {type(e).__name__}")
+        print(f"   ⚠️  {endpoint['name']}: {type(e).__name__}")
 
 # 6. Try to create wallet from mnemonic
 print("\n🔓 [STEP 6] Testing wallet creation from mnemonic...")

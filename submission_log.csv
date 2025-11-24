@@ -45,3 +45,4 @@ timestamp,topic_id,prediction,worker,block_height,proof,signature,status,tx_hash
 2025-11-24T03:49:50.466018+00:00,67,-0.07608044892549515,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
 2025-11-24T06:25:04.353303+00:00,67,-0.07608044892549515,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6661675,"{""inference"": {""topic_id"": 67, ""block_height"": 6661675, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.07608044892549515"", ""extra_data"": """", ""proof"": """"}}",KnRrFU82c72B3/Xh/n+tu3Fny7G+K1Aef4KGnTXtSURva3toEPhWY3XvJ2vi47PNC49/Hsaf66eJDCdtLev0Vg==,success_pending_confirmation,D51058CBB17C3673587D76B4E9C1AD589C10AEECC3DC77F64800CC17A5DC5177,Primary
 2025-11-24T06:25:39.473776+00:00,67,-0.07608044892549515,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T06:32:45.641457+00:00,67,-0.07608044892549515,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
