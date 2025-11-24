@@ -1,4 +1,15 @@
-timestamp,topic_id,prediction,worker,block_height,proof,signature,status
+timestamp,topic_id,prediction,worker,block_height,proof,signature,status,tx_hash,rpc_endpoint
 2025-11-23T06:55:41.050891+00:00,67,-0.038135699927806854,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
 2025-11-23T07:55:41.778988+00:00,67,-0.038135699927806854,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
 2025-11-23T07:56:07.693415+00:00,67,-0.038135699927806854,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:27:08.523217+00:00,67,-0.011969962157309055,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6658365,,,success,,Primary
+2025-11-24T00:28:34.012784+00:00,67,-0.014866059646010399,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6658075,,,failed_no_sequence,,all_failed
+2025-11-24T00:33:07.922454+00:00,67,-0.014866059646010399,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6658075,,,success_pending_confirmation,,Primary
+2025-11-24T00:33:34.478911+00:00,67,-0.014866059646010399,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:35:28.884214+00:00,67,-0.000883568252902478,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6658454,,,success,,Primary
+2025-11-24T00:36:03.722158+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:36:09.949480+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:37:12.702438+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:41:26.784404+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:44:21.980318+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:44:30.483155+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
