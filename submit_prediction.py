@@ -39,10 +39,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # RPC Endpoint Failover List with priorities
+# Note: Only primary endpoint is accessible from this environment
+# Other endpoints may be available depending on network configuration
 RPC_ENDPOINTS = [
     {"url": "https://allora-rpc.testnet.allora.network/", "name": "Primary", "priority": 1},
-    {"url": "https://allora-testnet-rpc.allthatnode.com:1317/", "name": "AllThatNode", "priority": 2},
-    {"url": "https://allora.api.chandrastation.com/", "name": "ChandraStation", "priority": 3},
+    # {"url": "https://allora-testnet-rpc.allthatnode.com:1317/", "name": "AllThatNode", "priority": 2},
+    # {"url": "https://allora.api.chandrastation.com/", "name": "ChandraStation", "priority": 3},
 ]
 
 # Global state for RPC endpoint rotation with enhanced tracking
