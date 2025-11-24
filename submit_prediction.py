@@ -1055,7 +1055,11 @@ def main():
         sys.exit(1)
 
     if args.daemon or args.continuous:
-        run_daemon(args)
+        print(f"[DEBUG] About to call run_daemon()...")
+        sys.stdout.flush()
+        result = run_daemon(args)
+        print(f"[DEBUG] run_daemon() returned: {result}")
+        sys.stdout.flush()
     else:
         # Single run mode
         exit_code = main_once(args)
@@ -1232,11 +1236,13 @@ def run_daemon(args):
             logger.info(f"{'='*80}")
             
             success = main_once(args)
+            logger.debug(f"main_once returned: {success}")
             
             if success:
                 logger.info("✅ Submission cycle completed successfully")
             else:
                 logger.warning("⚠️  Submission cycle completed without successful submission (may be skipped/no nonce)")
+            logger.debug("About to enter sleep phase...")
         
         except Exception as e:
             # CRITICAL: Never silently fail
@@ -1248,9 +1254,13 @@ def run_daemon(args):
                     logger.error(f"   {line}")
             # Continue to next cycle instead of crashing
         
+        logger.debug("Entered post-cycle sleep block...")
         try:
             if not _shutdown_requested:
                 logger.info(f"Sleeping for {interval}s until next submission cycle...")
+                # Force flush logs before sleeping
+                for handler in logger.handlers:
+                    handler.flush()
                 time.sleep(interval)
         except KeyboardInterrupt:
             logger.warning("Interrupted during sleep, proceeding to next cycle")

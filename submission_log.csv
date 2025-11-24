@@ -27,3 +27,12 @@ timestamp,topic_id,prediction,worker,block_height,proof,signature,status,tx_hash
 2025-11-24T02:19:50.779340+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6659515,,,failed_no_sequence,,all_failed
 2025-11-24T02:21:05.247215+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6659515,"{""inference"": {""topic_id"": 67, ""block_height"": 6659515, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.02882043644785881"", ""extra_data"": """", ""proof"": """"}}",lIdJvFA4ptqzB1gk9cghw7tXdfWq97hlH43U8dDeLcs6lDDkSgEG/P77BoVdw5lccLSGMjwg1HO5KspIlH7o2Q==,"cli_error: Error: invalid argument ""-1"" for ""-s, --sequence"" flag: strconv.ParseUint: parsing ""-1"": invalid syn",,Primary-HTTP
 2025-11-24T02:21:31.524372+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6659515,"{""inference"": {""topic_id"": 67, ""block_height"": 6659515, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.02882043644785881"", ""extra_data"": """", ""proof"": """"}}",lIdJvFA4ptqzB1gk9cghw7tXdfWq97hlH43U8dDeLcs6lDDkSgEG/P77BoVdw5lccLSGMjwg1HO5KspIlH7o2Q==,success_pending_confirmation,66B8F59448CE96CB6E638C991EC2D72B3216FFC2E94BF0F9A44B57A3AA681DFC,Primary
+2025-11-24T02:24:47.222955+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:18:43.619660+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:19:22.109343+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:19:40.000368+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:19:47.019720+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:20:01.100741+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:20:39.492785+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:21:04.257382+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:21:24.086253+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
