@@ -67,6 +67,10 @@ _rpc_endpoint_last_used = None
 _submission_attempt_count = 0
 _max_submission_retries = 3
 
+# Default polling configuration for nonce discovery when none are immediately available
+_nonce_poll_seconds = int(os.getenv("NONCE_POLL_SECONDS", "900"))  # total poll window (15 minutes)
+_nonce_poll_interval = int(os.getenv("NONCE_POLL_INTERVAL", "60"))  # check every minute
+
 import requests
 import numpy as np
 import pandas as pd
@@ -619,107 +623,135 @@ def get_account_sequence(wallet: str) -> int:
 ###############################################################################
 # Get Unfulfilled Nonce with Enhanced RPC Handling
 ###############################################################################
-def get_unfulfilled_nonce(topic_id: int) -> int:
+def get_unfulfilled_nonce(topic_id: int, max_attempts: Optional[int] = None) -> int:
     """Query unfulfilled nonces from Allora network with RPC failover and validation."""
     cli = shutil.which("allorad") or shutil.which("allora")
     if not cli:
         logger.error("❌ Allora CLI not found in PATH")
         return 0
-    
-    rpc_endpoint = get_rpc_endpoint()
-    logger.debug(f"Querying unfulfilled nonces for topic {topic_id} via RPC: {rpc_endpoint['name']}")
-    
-    cmd = [cli, "query", "emissions", "unfulfilled-worker-nonces", str(topic_id),
-           "--node", rpc_endpoint["url"],
-           "--output", "json"]
-    
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if proc.returncode == 0:
-            # Validate response is JSON, not HTML error
-            is_valid, data = validate_json_response(proc.stdout, f"for unfulfilled nonces (topic {topic_id})")
-            if not is_valid:
-                mark_rpc_failed(rpc_endpoint["url"], "Invalid JSON response")
-                return 0
-            
-            nonces_data = data.get("nonces", {}).get("nonces", [])
-            nonces = [int(item["block_height"]) for item in nonces_data]
-            
-            if not nonces:
-                logger.info(f"ℹ️  No unfulfilled nonces found for topic {topic_id}")
-                reset_rpc_endpoint(rpc_endpoint["url"])
-                return 0
-            
-            logger.debug(f"✅ Found {len(nonces)} unfulfilled nonces for topic {topic_id}: {nonces}")
-            
-            # Filter out nonces already submitted by this worker
-            wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
-            if not wallet:
-                logger.error("❌ ALLORA_WALLET_ADDR not set")
-                return 0
-            
-            filtered_nonces = []
-            for nonce in nonces:
-                try:
-                    # Check if already submitted
-                    cmd_check = [cli, "query", "emissions", "worker-latest-inference", 
-                                str(topic_id), wallet,
-                                "--node", rpc_endpoint["url"],
-                                "--output", "json"]
-                    proc_check = subprocess.run(cmd_check, capture_output=True, text=True, timeout=30)
-                    
-                    if proc_check.returncode == 0:
-                        is_valid_check, data_check = validate_json_response(proc_check.stdout)
-                        if is_valid_check:
-                            latest_bh = int(data_check.get("latest_inference", {}).get("block_height", 0))
-                            if latest_bh != nonce:
-                                filtered_nonces.append(nonce)
-                                logger.debug(f"  ✓ Nonce {nonce} available (latest submitted: {latest_bh})")
+
+    attempts = max_attempts or max(len(RPC_ENDPOINTS), 1)
+
+    for attempt in range(attempts):
+        rpc_endpoint = get_rpc_endpoint()
+        logger.debug(
+            f"Querying unfulfilled nonces for topic {topic_id} via RPC: {rpc_endpoint['name']} (attempt {attempt + 1}/{attempts})"
+        )
+
+        cmd = [cli, "query", "emissions", "unfulfilled-worker-nonces", str(topic_id),
+               "--node", rpc_endpoint["url"],
+               "--output", "json"]
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if proc.returncode == 0:
+                # Validate response is JSON, not HTML error
+                is_valid, data = validate_json_response(proc.stdout, f"for unfulfilled nonces (topic {topic_id})")
+                if not is_valid:
+                    mark_rpc_failed(rpc_endpoint["url"], "Invalid JSON response")
+                    continue
+
+                nonces_data = data.get("nonces", {}).get("nonces", [])
+                nonces = [int(item["block_height"]) for item in nonces_data]
+
+                if not nonces:
+                    logger.info(f"ℹ️  No unfulfilled nonces found for topic {topic_id}")
+                    reset_rpc_endpoint(rpc_endpoint["url"])
+                    return 0
+
+                logger.debug(f"✅ Found {len(nonces)} unfulfilled nonces for topic {topic_id}: {nonces}")
+
+                # Filter out nonces already submitted by this worker
+                wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
+                if not wallet:
+                    logger.error("❌ ALLORA_WALLET_ADDR not set")
+                    return 0
+
+                filtered_nonces = []
+                for nonce in nonces:
+                    try:
+                        # Check if already submitted
+                        cmd_check = [cli, "query", "emissions", "worker-latest-inference",
+                                    str(topic_id), wallet,
+                                    "--node", rpc_endpoint["url"],
+                                    "--output", "json"]
+                        proc_check = subprocess.run(cmd_check, capture_output=True, text=True, timeout=30)
+
+                        if proc_check.returncode == 0:
+                            is_valid_check, data_check = validate_json_response(proc_check.stdout)
+                            if is_valid_check:
+                                latest_bh = int(data_check.get("latest_inference", {}).get("block_height", 0))
+                                if latest_bh != nonce:
+                                    filtered_nonces.append(nonce)
+                                    logger.debug(f"  ✓ Nonce {nonce} available (latest submitted: {latest_bh})")
+                                else:
+                                    logger.debug(f"  ✗ Nonce {nonce} already submitted")
                             else:
-                                logger.debug(f"  ✗ Nonce {nonce} already submitted")
+                                # Invalid response, assume not submitted
+                                filtered_nonces.append(nonce)
+                                logger.debug(f"  ? Nonce {nonce} check inconclusive (invalid response), will attempt")
                         else:
-                            # Invalid response, assume not submitted
+                            # If check fails, assume not submitted and include it
                             filtered_nonces.append(nonce)
-                            logger.debug(f"  ? Nonce {nonce} check inconclusive (invalid response), will attempt")
-                    else:
-                        # If check fails, assume not submitted and include it
+                            logger.debug(f"  ? Nonce {nonce} check inconclusive (query failed), will attempt submission")
+                    except Exception as e:
+                        logger.warning(f"⚠️  Error checking nonce {nonce}: {e}")
                         filtered_nonces.append(nonce)
-                        logger.debug(f"  ? Nonce {nonce} check inconclusive (query failed), will attempt submission")
-                except Exception as e:
-                    logger.warning(f"⚠️  Error checking nonce {nonce}: {e}")
-                    filtered_nonces.append(nonce)
-            
-            if filtered_nonces:
-                selected_nonce = min(filtered_nonces)
-                logger.info(f"🎯 Selected nonce for submission: block_height={selected_nonce}")
-                reset_rpc_endpoint(rpc_endpoint["url"])
-                return selected_nonce
+
+                if filtered_nonces:
+                    selected_nonce = min(filtered_nonces)
+                    logger.info(f"🎯 Selected nonce for submission: block_height={selected_nonce}")
+                    reset_rpc_endpoint(rpc_endpoint["url"])
+                    return selected_nonce
+                else:
+                    logger.warning(f"⚠️  All unfulfilled nonces already submitted by worker {wallet}")
+                    reset_rpc_endpoint(rpc_endpoint["url"])
+                    return 0
             else:
-                logger.warning(f"⚠️  All unfulfilled nonces already submitted by worker {wallet}")
-                reset_rpc_endpoint(rpc_endpoint["url"])
-                return 0
-        else:
-            error_msg = proc.stderr.strip()
-            logger.warning(f"⚠️  Query failed for unfulfilled nonces: {error_msg}")
-            # Check for gRPC specific errors
-            if "grpc_status:12" in error_msg or "received http2 header with status: 404" in error_msg.lower():
-                logger.warning(f"   ⚠️  gRPC 404 error - RPC service may have transient issue")
-                logger.warning(f"   This is typically resolved by retrying")
-            mark_rpc_failed(rpc_endpoint["url"], error_msg)
-            return 0
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ Failed to parse unfulfilled nonces response: {e}")
-        mark_rpc_failed(rpc_endpoint["url"], f"JSON decode error: {e}")
-        return 0
-    except subprocess.TimeoutExpired:
-        logger.error(f"❌ Query timed out (30s) for unfulfilled nonces on {rpc_endpoint['name']}")
-        mark_rpc_failed(rpc_endpoint["url"], "Timeout (30s)")
-        return 0
-    except Exception as e:
-        logger.error(f"❌ Error querying unfulfilled nonces: {e}")
-        logger.debug(f"Traceback: {traceback.format_exc()}")
-        mark_rpc_failed(rpc_endpoint["url"], str(e))
-        return 0
+                logger.debug(
+                    f"⚠️  RPC query failed on {rpc_endpoint['name']} (code {proc.returncode}): {proc.stderr.strip()}"
+                )
+                mark_rpc_failed(rpc_endpoint["url"], "Query failed")
+        except subprocess.TimeoutExpired:
+            logger.debug(f"⚠️  Unfulfilled nonce query timed out on {rpc_endpoint['name']}")
+            mark_rpc_failed(rpc_endpoint["url"], "Timeout")
+        except Exception as ex:
+            logger.debug(f"⚠️  Unexpected error during nonce query on {rpc_endpoint['name']}: {ex}")
+            mark_rpc_failed(rpc_endpoint["url"], str(ex))
+
+    logger.warning(
+        f"⚠️  Exhausted {attempts} RPC attempts without retrieving unfulfilled nonce data for topic {topic_id}"
+    )
+    return 0
+
+
+###############################################################################
+# Nonce Polling to Avoid Skipping Submission Windows
+###############################################################################
+def wait_for_nonce(topic_id: int) -> tuple[int, str]:
+    """
+    Poll unfulfilled nonces for a bounded time window to avoid skipping cycles.
+
+    Returns (block_height, reason) where reason is "found", "timeout", or "shutdown".
+    """
+    global _shutdown_requested
+
+    deadline = time.time() + _nonce_poll_seconds
+    while time.time() < deadline and not _shutdown_requested:
+        nonce = get_unfulfilled_nonce(topic_id)
+        if nonce:
+            return nonce, "found"
+
+        remaining = max(0, int(deadline - time.time()))
+        sleep_for = min(_nonce_poll_interval, remaining)
+        if sleep_for <= 0:
+            break
+        logger.info(
+            f"⏳ No unfulfilled nonce yet for topic {topic_id}. Polling again in {sleep_for}s (window remaining: {remaining}s)"
+        )
+        time.sleep(sleep_for)
+
+    return 0, "shutdown" if _shutdown_requested else "timeout"
 
 ###############################################################################
 # Validate Transaction On-Chain with Enhanced Response Handling
@@ -842,9 +874,16 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
     
     logger.info(f"🚀 LEADERBOARD SUBMISSION: Preparing prediction for topic {topic_id}")
     
-    block_height = get_unfulfilled_nonce(topic_id)
+    block_height = get_unfulfilled_nonce(topic_id, max_attempts=_max_submission_retries)
+    poll_reason = "initial"
     if block_height == 0:
-        logger.warning("⚠️  No unfulfilled nonce available, skipping submission")
+        logger.warning(
+            "⚠️  No unfulfilled nonce available on first query; entering polling window to avoid skipped cycles"
+        )
+        block_height, poll_reason = wait_for_nonce(topic_id)
+
+    if block_height == 0:
+        status_label = "skipped_no_nonce" if poll_reason == "timeout" else f"skipped_{poll_reason}"
         log_submission_to_csv(
             timestamp=timestamp,
             topic_id=topic_id,
@@ -853,7 +892,7 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
             block_height=0,
             proof={},
             signature="",
-            status="skipped_no_nonce",
+            status=status_label,
             tx_hash="",
             rpc_endpoint="N/A"
         )
@@ -866,10 +905,16 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
             block_height=0,
             proof={},
             signature="",
-            status="skipped_no_nonce",
+            status=status_label,
             tx_hash="",
             rpc_endpoint="N/A"
         )
+        if poll_reason == "timeout":
+            logger.info(
+                "⏭️  Skipping this cycle after polling window expired without unfulfilled nonce availability"
+            )
+        elif poll_reason == "shutdown":
+            logger.info("🛑 Polling stopped due to shutdown request")
         return False
     
     logger.info(f"📊 Prediction value: {value:.10f}")
