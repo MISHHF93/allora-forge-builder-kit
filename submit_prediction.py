@@ -50,12 +50,12 @@ def normalize_rpc_url(url: str) -> str:
     return url
 
 def get_default_rpc_endpoints():
-    """Return default RPC endpoints (hardcoded fallback)."""
+    """Return default RPC endpoints (verified, active)."""
     return [
-        {"url": "https://allora-rpc.testnet.allora.network/", "name": "Primary"},
-        {"url": "https://allora-testnet-rpc.allthatnode.com:1317/", "name": "AllThatNode"},
-        {"url": "https://allora.api.chandrastation.com/", "name": "ChandraStation"},
+        {"url": "https://allora-rpc.testnet.allora.network/", "name": "Allora Official"},
+        {"url": "https://rpc.ankr.com/allora_testnet/", "name": "Ankr"},
     ]
+
 
 # Placeholder - will be populated after logger setup
 RPC_ENDPOINTS = get_default_rpc_endpoints()
