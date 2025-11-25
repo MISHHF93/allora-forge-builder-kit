@@ -880,10 +880,43 @@ def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> boo
     """Submit prediction with RPC failover, retry logic, and comprehensive logging."""
     global _submission_attempt_count
     _submission_attempt_count = 0
-    
+
     timestamp = datetime.now(timezone.utc).isoformat()
     wallet = os.getenv("ALLORA_WALLET_ADDR", "").strip()
-    
+
+    if dry_run:
+        if not wallet:
+            wallet = "dry-run"
+        logger.info(
+            "🧪 DRY-RUN: Skipping on-chain submission. Prediction prepared for topic %s.",
+            topic_id,
+        )
+        log_submission_to_csv(
+            timestamp=timestamp,
+            topic_id=topic_id,
+            prediction=value,
+            worker=wallet,
+            block_height=0,
+            proof={},
+            signature="",
+            status="dry_run",
+            tx_hash="",
+            rpc_endpoint="N/A",
+        )
+        update_latest_submission_json(
+            timestamp=timestamp,
+            topic_id=topic_id,
+            prediction=value,
+            worker=wallet,
+            block_height=0,
+            proof={},
+            signature="",
+            status="dry_run",
+            tx_hash="",
+            rpc_endpoint="N/A",
+        )
+        return True
+
     # Validate wallet before proceeding
     if not wallet:
         logger.error("❌ ALLORA_WALLET_ADDR not set")
@@ -1194,8 +1227,8 @@ def main():
         logger.error(f"❌ CRITICAL: {args.features} not found. Run 'python train.py' first.")
         sys.exit(1)
     
-    # Validate environment
-    required_env = ["ALLORA_WALLET_ADDR", "MNEMONIC", "TOPIC_ID"]
+    # Validate environment (skip wallet requirements for dry-run mode)
+    required_env = [] if args.dry_run else ["ALLORA_WALLET_ADDR", "MNEMONIC"]
     missing = [k for k in required_env if not os.getenv(k)]
     if missing:
         logger.error(f"❌ Missing environment variables: {', '.join(missing)}")
