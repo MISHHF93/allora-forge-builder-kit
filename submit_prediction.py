@@ -75,6 +75,8 @@ import requests
 import numpy as np
 import pandas as pd
 
+from tiingo_fetcher import fetch_btc_data_to_file
+
 from allora_sdk import LocalWallet, AlloraRPCClient
 from allora_sdk.protos.emissions.v9 import InputWorkerDataBundle, InputInferenceForecastBundle, InputInference, InsertWorkerPayloadRequest
 
@@ -292,6 +294,21 @@ signal.signal(signal.SIGHUP, signal_handler)
 ###############################################################################
 def fetch_latest_btcusd_hourly(hours: int = 168, api_timeout: int = 30) -> pd.DataFrame:
     """Fetch recent BTC/USD hourly data for prediction."""
+    if os.getenv("TIINGO_SYNC_BEFORE_SUBMIT", "false").lower() in {"1", "true", "yes"}:
+        sync_end_date = os.getenv("TIINGO_FETCH_END_DATE", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        sync_output = os.getenv("TIINGO_MERGED_OUTPUT", "tiingo_debug/merged_btc_data.json")
+        sync_max_days = int(os.getenv("TIINGO_FETCH_MAX_DAYS", "90"))
+        try:
+            fetch_result = fetch_btc_data_to_file(
+                end_date=sync_end_date,
+                output_path=sync_output,
+                max_days=sync_max_days,
+            )
+            if fetch_result:
+                logger.info("Tiingo merged data refreshed before submission: %s", fetch_result)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Tiingo pre-submit sync failed: %s", exc)
+
     logger.info(f"Fetching latest {hours}h BTC/USD data from Tiingo...")
     tkey = os.getenv("TIINGO_API_KEY", "").strip()
     if not tkey:

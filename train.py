@@ -31,12 +31,7 @@ import requests
 import numpy as np
 import pandas as pd
 
-try:
-    import xgboost as xgb
-    _XGB_AVAILABLE = True
-except Exception as e:
-    logger.error(f"❌ XGBoost import failed: {e}. Install with: pip install xgboost")
-    _XGB_AVAILABLE = False
+from tiingo_fetcher import fetch_btc_data_to_file
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error
 
@@ -49,6 +44,13 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%SZ'
 )
 logger = logging.getLogger("btc_7d_forecast")
+
+try:
+    import xgboost as xgb
+    _XGB_AVAILABLE = True
+except Exception as e:
+    logger.error(f"❌ XGBoost import failed: {e}. Install with: pip install xgboost")
+    _XGB_AVAILABLE = False
 
 ###############################################################################
 # Configuration Dataclass
@@ -475,7 +477,24 @@ def main():
     logger.info("=" * 72)
     logger.info("BTC 7D LOG-RETURN FORECAST - SINGLE RUN")
     logger.info("Config: days_back=%d, submit=%s, topic_id=%d", cfg.days_back, cfg.submit, cfg.topic_id)
-    
+
+    # Refresh local Tiingo cache before training to mirror the shell pipeline
+    fetch_end_date = os.getenv("TIINGO_FETCH_END_DATE", "2025-12-15")
+    fetch_output = os.getenv("TIINGO_MERGED_OUTPUT", "tiingo_debug/merged_btc_data.json")
+    fetch_max_days = int(os.getenv("TIINGO_FETCH_MAX_DAYS", "365"))
+    try:
+        fetch_result = fetch_btc_data_to_file(
+            end_date=fetch_end_date,
+            output_path=fetch_output,
+            max_days=fetch_max_days,
+        )
+        if fetch_result:
+            logger.info("Tiingo merged data refreshed at %s", fetch_result)
+        else:
+            logger.info("Tiingo merged data not refreshed (see earlier warnings if any).")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Tiingo fetcher failed: %s", exc)
+
     # Verify critical dependencies
     if not _XGB_AVAILABLE:
         logger.error("❌ CRITICAL: XGBoost is not installed. Install with: pip install xgboost")
