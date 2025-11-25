@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -13,16 +14,14 @@ import pandas as pd
 from pipeline_core import (
     add_forward_target,
     artifacts_available,
-    fetch_price_history,
+    artifacts_fresh_enough,
     generate_features,
     latest_feature_row,
     log_submission_record,
-    price_coverage_ok,
     save_artifacts,
-    setup_logging,
     train_model,
-    DEFAULT_TOPIC_ID,
 )
+from pipeline_utils import CACHE_PATH, DEFAULT_TOPIC_ID, fetch_price_history, price_coverage_ok, setup_logging
 
 LOG_FILE = ("logs/train.log")
 
@@ -34,8 +33,14 @@ def maybe_skip_training(logger, df: pd.DataFrame, force: bool) -> bool:
         return False
     if not price_coverage_ok(df, min_days=int(os.getenv("FORECAST_DAYS_BACK", "90"))):
         return False
-    logger.info("Cached data and artifacts are fresh; skipping retraining. Set FORCE_RETRAIN=1 to override.")
-    return True
+    model_path = Path("artifacts/model.pkl")
+    features_path = Path("artifacts/features.json")
+    if artifacts_fresh_enough(CACHE_PATH, [model_path, features_path]):
+        logger.info(
+            "Cached data and artifacts are fresh; skipping retraining. Set FORCE_RETRAIN=1 to override."
+        )
+        return True
+    return False
 
 
 def main() -> int:

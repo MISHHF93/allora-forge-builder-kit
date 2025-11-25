@@ -3,10 +3,10 @@
 End-to-end pipeline for the Allora Labs competition, fully in Python (no shell scripts).
 
 ## Workflow
-1. **Fetch**: `pipeline_core.fetch_price_history` pulls hourly BTC/USD prices (Tiingo first, fallback CoinGecko) with retry/backoff and caches under `tiingo_debug/`.
+1. **Fetch**: `pipeline_utils.fetch_price_history` pulls hourly BTC/USD prices (Tiingo first, fallback CoinGecko then synthetic) with retry/backoff, Tiingo rate-limit skips, and caches under `tiingo_debug/` with raw payloads for debugging.
 2. **Validate**: `price_coverage_ok` enforces coverage/freshness before training or submission.
 3. **Train**: `train.py` uses ~90 days of hourly data to model the 7-day log-return target and saves artifacts to `artifacts/`.
-4. **Submit**: `submit_prediction.py` reloads artifacts, regenerates the freshest features, validates predictions, and writes submission metadata to `logs/submission_log.csv` plus `artifacts/latest_submission.json`.
+4. **Submit**: `submit_prediction.py` reloads artifacts, regenerates the freshest features, validates predictions (finite + bounded), and writes submission metadata to `logs/submission_log.csv` plus `artifacts/latest_submission.json`.
 
 ## Usage
 
@@ -35,7 +35,7 @@ Environment toggles:
 - `artifacts/latest_submission.json`: latest submission payload ready for CLI/SDK hand-off.
 - `logs/train.log`, `logs/submit.log`: pipeline logging.
 - `logs/submission_log.csv`: append-only metadata for training and predictions.
-- `tiingo_debug/`: cached parquet/JSON price history and fetch chunks.
+- `tiingo_debug/`: cached parquet/JSON price history, Tiingo/Coingecko payload captures, and merged chunk logs.
 
 ## Notes
 
