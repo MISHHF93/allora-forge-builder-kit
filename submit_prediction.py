@@ -12,17 +12,14 @@ from pathlib import Path
 import numpy as np
 
 from pipeline_core import (
-    DEFAULT_TOPIC_ID,
     artifacts_available,
-    fetch_price_history,
     generate_features,
     latest_feature_row,
     load_artifacts,
     log_submission_record,
-    price_coverage_ok,
-    setup_logging,
     validate_prediction,
 )
+from pipeline_utils import DEFAULT_TOPIC_ID, fetch_price_history, price_coverage_ok, setup_logging
 
 LOG_FILE = Path("logs/submit.log")
 
