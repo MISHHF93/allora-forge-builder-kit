@@ -21,7 +21,15 @@ from pipeline_core import (
     save_artifacts,
     train_model,
 )
-from pipeline_utils import CACHE_PATH, DEFAULT_TOPIC_ID, fetch_price_history, price_coverage_ok, setup_logging
+from pipeline_utils import (
+    CACHE_PATH,
+    DEFAULT_TOPIC_ID,
+    MIN_COVERAGE_RATIO,
+    coverage_ratio,
+    fetch_price_history,
+    price_coverage_ok,
+    setup_logging,
+)
 
 LOG_FILE = ("logs/train.log")
 
@@ -53,8 +61,25 @@ def main() -> int:
     logger.info("Starting training run: days_back=%s, horizon=%s, force_retrain=%s", days_back, horizon_hours, force_retrain)
 
     prices, fetch_meta = fetch_price_history(days_back, logger, force_refresh=force_refresh)
-    if prices.empty or not price_coverage_ok(prices, days_back):
-        logger.error("Price history unavailable or incomplete: %s", fetch_meta.reason or fetch_meta.source)
+    coverage = fetch_meta.coverage or coverage_ratio(prices, days_back)
+    if prices.empty or coverage < MIN_COVERAGE_RATIO:
+        logger.error(
+            "Price history unavailable or below coverage threshold (%.2f%%): %s",
+            coverage * 100,
+            fetch_meta.reason or fetch_meta.source,
+        )
+        return 1
+
+    if not price_coverage_ok(prices, days_back):
+        logger.warning(
+            "Proceeding with partial price coverage (%.2f%%). Recent data points: %s", coverage * 100, len(prices)
+        )
+
+    latest_ts = pd.to_datetime(prices["timestamp"]).max()
+    if latest_ts.tzinfo is None:
+        latest_ts = latest_ts.tz_localize(timezone.utc)
+    if datetime.now(timezone.utc) - latest_ts > pd.Timedelta(hours=6):
+        logger.error("Latest price data is stale; aborting training run.")
         return 1
 
     if maybe_skip_training(logger, prices, force_retrain):

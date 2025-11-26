@@ -27,6 +27,7 @@ CACHE_PATH = DEBUG_DIR / "btcusd_hourly.parquet"
 RAW_JSON_CACHE = DEBUG_DIR / "btcusd_hourly.json"
 
 DEFAULT_TOPIC_ID = int(os.getenv("TOPIC_ID", os.getenv("ALLORA_TOPIC_ID", "67")))
+MIN_COVERAGE_RATIO = 0.5
 
 
 @dataclass
@@ -34,6 +35,7 @@ class FetchResult:
     source: str
     rows: int
     path: Optional[Path]
+    coverage: float = 0.0
     reason: str = ""
 
 
@@ -114,19 +116,24 @@ def _request_with_retry(
     timeout: int = 30,
     backoff: int = 2,
     logger: Optional[logging.Logger] = None,
-) -> Optional[dict]:
+) -> Tuple[Optional[dict], Optional[int]]:
     for attempt in range(1, attempts + 1):
         try:
             response = requests.get(url, params=params, timeout=timeout)
+            status = response.status_code
+            if status == 429:
+                if logger:
+                    logger.warning("Request hit Tiingo rate limit (429); stopping retries for this chunk.")
+                return None, status
             response.raise_for_status()
-            return response.json()
+            return response.json(), status
         except Exception as exc:
             if logger:
                 logger.warning("Request failed (attempt %s/%s): %s", attempt, attempts, exc)
             if attempt == attempts:
-                return None
+                return None, None
             time.sleep(backoff * attempt)
-    return None
+    return None, None
 
 
 def _format_price_frame(rows: Iterable[Tuple[datetime, float]]) -> pd.DataFrame:
@@ -160,6 +167,8 @@ def fetch_from_tiingo(days_back: int, logger: logging.Logger) -> Optional[pd.Dat
     start = end - timedelta(days=days_back)
     chunk_days = 7
 
+    rate_limit_hits = 0
+
     while start < end:
         chunk_end = min(start + timedelta(days=chunk_days), end)
         params = {
@@ -169,7 +178,20 @@ def fetch_from_tiingo(days_back: int, logger: logging.Logger) -> Optional[pd.Dat
             "endDate": chunk_end.strftime("%Y-%m-%d"),
             "token": token,
         }
-        data = _request_with_retry(url, params, attempts=4, backoff=3, logger=logger)
+        data, status = _request_with_retry(url, params, attempts=3, backoff=3, logger=logger)
+        if status == 429:
+            rate_limit_hits += 1
+            logger.warning(
+                "Tiingo rate limit encountered for %s-%s (hit %s); skipping Tiingo for now.",
+                params["startDate"],
+                params["endDate"],
+                rate_limit_hits,
+            )
+            if rate_limit_hits >= 2:
+                logger.info("Multiple rate limits hit; abandoning remaining Tiingo chunks.")
+                break
+            start = chunk_end
+            continue
         if data is None:
             logger.warning("Tiingo chunk %s-%s failed; skipping chunk.", params["startDate"], params["endDate"])
             start = chunk_end
@@ -180,7 +202,15 @@ def fetch_from_tiingo(days_back: int, logger: logging.Logger) -> Optional[pd.Dat
         if isinstance(data, dict) and "detail" in data:
             detail_msg = str(data.get("detail"))
             if "over your hourly request allocation" in detail_msg:
-                logger.warning("Tiingo rate limit hit for %s-%s; skipping to next chunk.", params["startDate"], params["endDate"])
+                logger.warning(
+                    "Tiingo rate limit detail received for %s-%s; skipping chunk.",
+                    params["startDate"],
+                    params["endDate"],
+                )
+                rate_limit_hits += 1
+                if rate_limit_hits >= 2:
+                    logger.info("Multiple rate limit details received; abandoning remaining Tiingo chunks.")
+                    break
                 start = chunk_end
                 continue
 
@@ -212,7 +242,10 @@ def fetch_from_tiingo(days_back: int, logger: logging.Logger) -> Optional[pd.Dat
 def fetch_from_coingecko(days_back: int, logger: logging.Logger) -> Optional[pd.DataFrame]:
     url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
     params = {"vs_currency": "usd", "days": days_back, "interval": "hourly"}
-    data = _request_with_retry(url, params, attempts=3, backoff=2, logger=logger)
+    data, status = _request_with_retry(url, params, attempts=2, backoff=2, logger=logger)
+    if status == 429:
+        logger.warning("CoinGecko rate limit encountered; skipping CoinGecko fetch.")
+        return None
     if not data or "prices" not in data:
         logger.warning("CoinGecko fetch failed or malformed response.")
         return None
@@ -247,6 +280,21 @@ def fetch_synthetic(days_back: int, logger: logging.Logger) -> pd.DataFrame:
     return synthetic_df
 
 
+def coverage_ratio(df: pd.DataFrame, days_back: int) -> float:
+    if df is None or df.empty:
+        return 0.0
+    df_sorted = df.sort_values("timestamp")
+    start_ts = df_sorted["timestamp"].iloc[0]
+    end_ts = df_sorted["timestamp"].iloc[-1]
+    if isinstance(start_ts, str):
+        start_ts = pd.to_datetime(start_ts)
+    if isinstance(end_ts, str):
+        end_ts = pd.to_datetime(end_ts)
+    coverage_hours = (end_ts - start_ts).total_seconds() / 3600
+    required_hours = max(days_back * 24, 1)
+    return max(0.0, min(coverage_hours / required_hours, 1.0))
+
+
 def load_cached_prices() -> Optional[pd.DataFrame]:
     if CACHE_PATH.exists():
         try:
@@ -275,18 +323,57 @@ def fetch_price_history(days_back: int, logger: logging.Logger, force_refresh: b
     if not force_refresh:
         cached = load_cached_prices()
         if cached is not None and price_coverage_ok(cached, days_back):
-            return cached, FetchResult(source="cache", rows=len(cached), path=CACHE_PATH)
+            return cached, FetchResult(
+                source="cache", rows=len(cached), path=CACHE_PATH, coverage=coverage_ratio(cached, days_back)
+            )
+
+    best_df: Optional[pd.DataFrame] = None
+    best_meta: Optional[FetchResult] = None
+    best_ratio = 0.0
 
     tiingo_df = fetch_from_tiingo(days_back, logger)
-    if tiingo_df is not None and price_coverage_ok(tiingo_df, days_back, freshness_hours=6):
-        _persist_cache(tiingo_df)
-        return tiingo_df, FetchResult(source="tiingo", rows=len(tiingo_df), path=CACHE_PATH)
+    if tiingo_df is not None:
+        ratio = coverage_ratio(tiingo_df, days_back)
+        if price_coverage_ok(tiingo_df, days_back, freshness_hours=6):
+            _persist_cache(tiingo_df)
+            return tiingo_df, FetchResult(
+                source="tiingo", rows=len(tiingo_df), path=CACHE_PATH, coverage=ratio
+            )
+        if ratio > best_ratio:
+            best_df = tiingo_df
+            best_meta = FetchResult(
+                source="tiingo_partial", rows=len(tiingo_df), path=None, coverage=ratio, reason=f"coverage:{ratio:.2f}"
+            )
+            best_ratio = ratio
+        logger.info("Tiingo coverage insufficient (ratio=%.2f); trying fallbacks.", ratio)
 
     coingecko_df = fetch_from_coingecko(days_back, logger)
-    if coingecko_df is not None and price_coverage_ok(coingecko_df, days_back, freshness_hours=6):
-        _persist_cache(coingecko_df)
-        return coingecko_df, FetchResult(source="coingecko", rows=len(coingecko_df), path=CACHE_PATH)
+    if coingecko_df is not None:
+        ratio = coverage_ratio(coingecko_df, days_back)
+        if price_coverage_ok(coingecko_df, days_back, freshness_hours=6):
+            _persist_cache(coingecko_df)
+            return coingecko_df, FetchResult(
+                source="coingecko", rows=len(coingecko_df), path=CACHE_PATH, coverage=ratio
+            )
+        if ratio > best_ratio:
+            best_df = coingecko_df
+            best_meta = FetchResult(
+                source="coingecko_partial", rows=len(coingecko_df), path=None, coverage=ratio, reason=f"coverage:{ratio:.2f}"
+            )
+            best_ratio = ratio
+        logger.info("CoinGecko coverage insufficient (ratio=%.2f); considering synthetic fallback.", ratio)
+
+    if best_df is not None and best_ratio >= MIN_COVERAGE_RATIO:
+        logger.info("Using partial data with coverage ratio %.2f from %s.", best_ratio, best_meta.source)
+        _persist_cache(best_df)
+        return best_df, best_meta  # type: ignore[arg-type]
 
     synthetic_df = fetch_synthetic(days_back, logger)
     _persist_cache(synthetic_df)
-    return synthetic_df, FetchResult(source="synthetic", rows=len(synthetic_df), path=CACHE_PATH, reason="fallback synthetic")
+    return synthetic_df, FetchResult(
+        source="synthetic",
+        rows=len(synthetic_df),
+        path=CACHE_PATH,
+        coverage=coverage_ratio(synthetic_df, days_back),
+        reason="fallback synthetic" if best_ratio < MIN_COVERAGE_RATIO else f"partial coverage:{best_ratio:.2f}",
+    )

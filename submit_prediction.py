@@ -19,7 +19,14 @@ from pipeline_core import (
     log_submission_record,
     validate_prediction,
 )
-from pipeline_utils import DEFAULT_TOPIC_ID, fetch_price_history, price_coverage_ok, setup_logging
+from pipeline_utils import (
+    DEFAULT_TOPIC_ID,
+    MIN_COVERAGE_RATIO,
+    coverage_ratio,
+    fetch_price_history,
+    price_coverage_ok,
+    setup_logging,
+)
 
 LOG_FILE = Path("logs/submit.log")
 
@@ -42,9 +49,19 @@ def main() -> int:
         return 1
 
     prices, fetch_meta = fetch_price_history(days_back, logger, force_refresh=force_refresh)
-    if prices.empty or not price_coverage_ok(prices, min_days=days_back):
-        logger.error("Price data unavailable for submission: %s", fetch_meta.reason or fetch_meta.source)
+    coverage = fetch_meta.coverage or coverage_ratio(prices, days_back)
+    if prices.empty or coverage < MIN_COVERAGE_RATIO:
+        logger.error(
+            "Price data unavailable or below coverage threshold (%.2f%%): %s",
+            coverage * 100,
+            fetch_meta.reason or fetch_meta.source,
+        )
         return 1
+
+    if not price_coverage_ok(prices, min_days=days_back):
+        logger.warning(
+            "Proceeding with partial price coverage (%.2f%%). Recent data points: %s", coverage * 100, len(prices)
+        )
 
     features = generate_features(prices.sort_values("timestamp"))
     if features.empty:
