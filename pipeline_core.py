@@ -14,9 +14,22 @@ from sklearn.linear_model import Ridge
 
 from pipeline_utils import ARTIFACTS_DIR, LOG_DIR, ensure_directories
 
+FEATURE_COLUMNS = [
+    "ret_1h",
+    "ret_24h",
+    "ma_24h",
+    "ma_72h",
+    "vol_24h",
+    "price_pos_24h",
+    "price_pos_72h",
+    "ma_ratio_72_24",
+    "exp_vol_ratio",
+]
+
 
 def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    df = df.dropna(subset=["timestamp", "close"]).sort_values("timestamp")
     df["log_price"] = np.log(df["close"])
     df["ret_1h"] = df["log_price"].diff(1)
     df["ret_24h"] = df["log_price"].diff(24)
@@ -28,7 +41,8 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     df["ma_ratio_72_24"] = df["ma_72h"] / df["ma_24h"] - 1.0
     df["exp_vol_ratio"] = df["vol_24h"].rolling(24).mean() / (df["vol_24h"] + 1e-8) - 1.0
     df = df.dropna().reset_index(drop=True)
-    return df
+    feature_df = df[["timestamp", "close", *FEATURE_COLUMNS]].copy()
+    return feature_df
 
 
 def add_forward_target(df: pd.DataFrame, horizon_hours: int) -> pd.DataFrame:
@@ -71,14 +85,23 @@ def load_artifacts() -> Tuple[object, List[str]]:
     return model, features
 
 
-def latest_feature_row(df: pd.DataFrame, feature_cols: List[str]) -> np.ndarray:
-    return df[feature_cols].iloc[-1:].values
+def latest_feature_row(df: pd.DataFrame, feature_cols: List[str]) -> pd.Series:
+    missing = [col for col in feature_cols if col not in df.columns]
+    if missing:
+        raise ValueError(f"Missing feature columns: {missing}")
+    return df[feature_cols].iloc[-1]
 
 
-def validate_prediction(prediction: float, max_abs: float = 1.5) -> bool:
+def validate_prediction(prediction: float, max_abs: float = 1.5, min_abs: float = 1e-6) -> bool:
     if prediction is None or not math.isfinite(prediction):
         return False
-    return abs(prediction) <= max_abs
+    magnitude = abs(prediction)
+    if magnitude > max_abs:
+        return False
+    if magnitude < min_abs:
+        # guard against degenerate near-zero outputs
+        return False
+    return True
 
 
 def log_submission_record(
