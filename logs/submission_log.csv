@@ -68,3 +68,16 @@ failed to convert address field to address: key with address allo1cxvw0pu9nmpxku
 2025-11-25T03:09:54.701358+00:00,67,0.0011430727317929268,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
 2025-11-25T03:14:52.866920+00:00,67,0.0011430727317929268,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6675355,"{""inference"": {""topic_id"": 67, ""block_height"": 6675355, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""0.0011430727317929268"", ""extra_data"": """", ""proof"": """"}}",KDSotRHOeOfO6Lcg3FKTp3ppNu6C4xWKDrzj0qSA0WQhdg76mbRaqlr6izzSpCQlfMZ7RcJcQ3r6I6/JYvHUQg==,success_pending_confirmation,F237209132CA4A52782E881A3E01DA31BEB10A565DC5C70F9F5AAD481EF23390,Allora Official
 2025-11-25T03:23:59.371299+00:00,67,0.0011430727317929268,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-27T00:02:50.309507+00:00,67,-0.020610887834834113,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,train_artifacts_saved:1921rows,"{""fetch_source"": ""tiingo"", ""rows"": 2161}"
+2025-11-27T00:03:30.313124+00:00,67,-0.02045410238701506,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,prediction_ready,"{""fetch_source"": ""tiingo"", ""rows"": 2881}"
+2025-11-27T00:16:04.021243+00:00,67,-0.02045410238701506,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,prediction_ready,"{""fetch_source"": ""tiingo"", ""rows"": 2881}"
+2025-11-27T00:18:21.552495+00:00,67,-0.024301934467525044,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,prediction_ready,"{""fetch_source"": ""tiingo_partial"", ""rows"": 1849}"
+2025-11-27T00:19:25.245322+00:00,67,-0.1256484764594077,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,prediction_ready,"{""fetch_source"": ""synthetic"", ""rows"": 2881}"
+2025-11-27T00:28:28.545878+00:00,67,0.0006350045021295964,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,train_artifacts_saved:1921rows,"{""fetch_source"": ""synthetic"", ""rows"": 2161}"
+2025-11-27T00:30:30.609780+00:00,67,0.0006350045021295964,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,train_artifacts_saved:1921rows,"{""fetch_source"": ""synthetic"", ""rows"": 2161}"
+2025-11-27T00:50:38.767768+00:00,67,0.001068108659050812,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,prediction_ready,"{""fetch_source"": ""synthetic"", ""rows"": 2881}"
+2025-11-27T01:03:07.866117+00:00,67,-0.018993409661106755,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,prediction_ready,"{""fetch_source"": ""tiingo"", ""rows"": 2881}"
+2025-11-27T01:34:44.588155+00:00,67,-0.01897154234311617,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,prediction_ready,"{""fetch_source"": ""tiingo"", ""rows"": 2881}"
+2025-11-27T03:41:50.081729+00:00,67,-0.019044280639721203,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,prediction_ready,"{""fetch_source"": ""tiingo"", ""rows"": 2881}"
+2025-11-27T03:52:52.795286+00:00,67,-0.019040167653005993,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,prediction_ready,"{""fetch_source"": ""tiingo"", ""rows"": 2881}"
+2025-11-27T04:13:03.415896+00:00,67,-0.019040167653005993,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,prediction_ready,"{""fetch_source"": ""tiingo"", ""rows"": 2881}"

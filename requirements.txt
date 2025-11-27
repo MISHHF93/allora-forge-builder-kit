@@ -46,6 +46,7 @@ platformdirs
 propcache
 protobuf
 pycparser
+python-dotenv
 pycryptodome
 pydantic
 pydantic_core
