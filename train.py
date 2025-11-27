@@ -1,83 +1,77 @@
 import os
-import json
 import joblib
-import numpy as np
-import pandas as pd
-from dotenv import load_dotenv
-from datetime import datetime, UTC
-from sklearn.linear_model import Ridge
+from datetime import datetime, timezone
 
-# === Load config ===
+from dotenv import load_dotenv
+
+from pipeline_core import FEATURE_COLUMNS, add_forward_target, generate_features, train_model
+from pipeline_utils import ARTIFACTS_DIR, DataFetcher, setup_logging
+
 load_dotenv()
 
-DAYS_BACK = 90
-HORIZON = 168
-FORCE_RETRAIN = False
-TIINGO_API_KEY = os.getenv("TIINGO_API_KEY")
-COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
+DAYS_BACK = int(os.getenv("TRAINING_DAYS_BACK", "120"))
+HORIZON = int(os.getenv("HORIZON_HOURS", "168"))
+FORCE_RETRAIN = os.getenv("FORCE_RETRAIN", "0").lower() in {"1", "true", "yes"}
 
-def log(msg):
-    print(f"{datetime.now(UTC).isoformat()}Z - {msg}")
+LOG_PATH = ARTIFACTS_DIR / "train.log"
 
-log(f"INFO - Starting training run: days_back={DAYS_BACK}, horizon={HORIZON}, force_retrain={FORCE_RETRAIN}")
 
-# === Mock or fallback data logic ===
-def fetch_price_series():
-    try:
-        if not TIINGO_API_KEY:
-            raise ValueError("Missing TIINGO_API_KEY")
+def main() -> int:
+    logger = setup_logging("train", log_file=LOG_PATH)
+    logger.info(
+        "Starting training run: days_back=%s, horizon=%s, force_retrain=%s",
+        DAYS_BACK,
+        HORIZON,
+        FORCE_RETRAIN,
+    )
 
-        # Simulated Tiingo rate-limited fallback
-        raise RuntimeError("429 Tiingo rate limit hit")
+    fetcher = DataFetcher(logger)
+    prices, fetch_meta = fetcher.fetch_price_history(
+        DAYS_BACK, force_refresh=FORCE_RETRAIN, allow_fallback=False, freshness_hours=3
+    )
 
-    except Exception as e:
-        log(f"WARNING - {str(e)}")
-        log(f"INFO - Falling back to synthetic price series for {DAYS_BACK} days.")
+    if prices.empty or fetch_meta.fallback_used:
+        logger.error("Training aborted: real market data unavailable (%s).", fetch_meta.source)
+        return 1
 
-        dates = pd.date_range(
-            end=datetime.now(UTC),
-            periods=DAYS_BACK * 24,
-            freq='h'  # FIXED: 'H' deprecated
-        )
+    features_df = generate_features(prices)
+    if features_df.empty:
+        logger.error("No features generated from fetched data.")
+        return 1
 
-        prices = pd.Series(
-            100 + np.random.randn(len(dates)).cumsum(),
-            index=dates
-        )
-        return prices
+    feature_target_df = add_forward_target(features_df, horizon_hours=HORIZON)
+    feature_target_df = feature_target_df.dropna(subset=FEATURE_COLUMNS + ["target"])
 
-# === Feature Engineering ===
-def generate_features(prices: pd.Series):
-    df = pd.DataFrame({
-        "price": prices,
-        "return_1h": prices.pct_change(1),
-        "return_24h": prices.pct_change(24),
-        "volatility_24h": prices.pct_change(1).rolling(24).std(),
-        "momentum_24h": prices - prices.shift(24),
-    }).dropna()
-    return df
+    if feature_target_df.empty:
+        logger.error("Not enough data to create targets; check coverage and horizon.")
+        return 1
 
-# === Train Model ===
-prices = fetch_price_series()
-features_df = generate_features(prices)
+    model = train_model(feature_target_df, FEATURE_COLUMNS)
 
-X_train = features_df.drop(columns=["price"])
-y_train = features_df["price"].pct_change(HORIZON).shift(-HORIZON).dropna()
+    bundle = {
+        "model": model,
+        "feature_names": FEATURE_COLUMNS,
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "horizon_hours": HORIZON,
+        "data_source": fetch_meta.source,
+        "rows_used": len(feature_target_df),
+    }
 
-# Align X and y
-X_train = X_train.iloc[:len(y_train)]
-y_train = y_train.iloc[:len(X_train)]
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    bundle_path = ARTIFACTS_DIR / "model_bundle.joblib"
+    joblib.dump(bundle, bundle_path)
 
-model = Ridge()
-model.fit(X_train, y_train)
+    sample_row = feature_target_df[FEATURE_COLUMNS].iloc[-1:]
+    sample_pred = float(model.predict(sample_row)[0])
+    logger.info(
+        "Training complete using %s rows from %s. Example pred=%.6f",
+        len(feature_target_df),
+        fetch_meta.source,
+        sample_pred,
+    )
+    logger.info("Model bundle saved to %s", bundle_path)
+    return 0
 
-# === Save model and feature names together ===
-feature_names = X_train.columns.tolist()
-joblib.dump({'model': model, 'feature_names': feature_names}, 'model_bundle.joblib')
 
-# === Example Prediction (check inference shape) ===
-example_input = pd.DataFrame([X_train.iloc[-1]], columns=feature_names)
-example_prediction = model.predict(example_input)[0]
-
-log(f"INFO - Training complete. Example prediction on latest row: {example_prediction:.8f}")
-
+if __name__ == "__main__":
+    raise SystemExit(main())

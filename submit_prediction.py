@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate and submit a 7-day BTC/USD log-return forecast using saved artifacts."""
+"""Prepare and persist a forecast payload using validated market data."""
 
 from __future__ import annotations
 
@@ -9,102 +9,131 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
+import joblib
 import pandas as pd
-import joblib  # ✅ Added to load model_bundle.joblib
 
+from network_gate import query_window_status
 from pipeline_core import (
+    FEATURE_COLUMNS,
     generate_features,
     latest_feature_row,
     log_submission_record,
     validate_prediction,
 )
 from pipeline_utils import (
+    ARTIFACTS_DIR,
     DEFAULT_TOPIC_ID,
     MIN_COVERAGE_RATIO,
+    DataFetcher,
     coverage_ratio,
-    fetch_price_history,
     price_coverage_ok,
     setup_logging,
 )
 
+MODEL_BUNDLE_PATH = ARTIFACTS_DIR / "model_bundle.joblib"
 LOG_FILE = Path("logs/submit.log")
+PAYLOAD_PATH = ARTIFACTS_DIR / "latest_submission.json"
+
+
+def load_bundle(logger):
+    if not MODEL_BUNDLE_PATH.exists():
+        logger.error("Model bundle missing at %s", MODEL_BUNDLE_PATH)
+        raise FileNotFoundError(MODEL_BUNDLE_PATH)
+    bundle = joblib.load(MODEL_BUNDLE_PATH)
+    model = bundle.get("model")
+    feature_names = bundle.get("feature_names", FEATURE_COLUMNS)
+    return model, feature_names, bundle
+
 
 def main() -> int:
     logger = setup_logging("submit", log_file=LOG_FILE)
-    days_back = int(os.getenv("FORECAST_DAYS_BACK", "120"))
     topic_id = int(os.getenv("TOPIC_ID", os.getenv("ALLORA_TOPIC_ID", DEFAULT_TOPIC_ID)))
+    worker = os.getenv("ALLORA_WALLET_ADDR", "unknown")
+    days_back = int(os.getenv("FORECAST_DAYS_BACK", "120"))
     force_refresh = os.getenv("FORCE_FETCH", "0").lower() in {"1", "true", "yes"}
 
     logger.info("Loading model bundle for topic %s", topic_id)
     try:
-        model_bundle = joblib.load("model_bundle.joblib")
-        model = model_bundle["model"]
-        feature_names = model_bundle["feature_names"]
+        model, feature_names, bundle_meta = load_bundle(logger)
     except Exception as exc:
-        logger.error("Failed to load model_bundle.joblib: %s", exc)
+        logger.error("Failed to load model bundle: %s", exc)
         return 1
 
-    prices, fetch_meta = fetch_price_history(days_back, logger, force_refresh=force_refresh)
-    coverage = fetch_meta.coverage or coverage_ratio(prices, days_back)
-    if prices.empty or coverage < MIN_COVERAGE_RATIO:
-        logger.error(
-            "Price data unavailable or below coverage threshold (%.2f%%): %s",
-            coverage * 100,
-            fetch_meta.reason or fetch_meta.source,
-        )
-        return 1
-
-    if not price_coverage_ok(prices, min_days=days_back):
+    # Confirm on-chain submission window readiness
+    window_status = query_window_status(topic_id, worker, logger)
+    if not window_status.ok_to_submit():
         logger.warning(
-            "Proceeding with partial price coverage (%.2f%%). Recent data points: %s",
-            coverage * 100, len(prices)
+            "Submission blocked: topic_active=%s worker_has_nonce=%s cli_found=%s errors=%s",
+            window_status.topic_active,
+            window_status.worker_has_nonce,
+            window_status.cli_found,
+            window_status.errors,
         )
+        return 2
 
-    features = generate_features(prices.sort_values("timestamp"))
-    if features.empty:
-        logger.error("No features available for submission.")
+    fetcher = DataFetcher(logger)
+    prices, fetch_meta = fetcher.fetch_price_history(
+        days_back, force_refresh=force_refresh, allow_fallback=True, freshness_hours=3
+    )
+    coverage = fetch_meta.coverage or coverage_ratio(prices, days_back)
+
+    if prices.empty or coverage < MIN_COVERAGE_RATIO:
+        logger.error("Price data insufficient: coverage=%.2f%% source=%s", coverage * 100, fetch_meta.source)
         return 1
 
-    # ✅ Ensure input to model has correct feature structure
-    x_live_raw = latest_feature_row(features, feature_names)
+    if fetch_meta.fallback_used:
+        logger.error("Blocking submission because fallback/synthetic data is active (%s)", fetch_meta.source)
+        return 1
+
+    if not price_coverage_ok(prices, min_days=days_back, freshness_hours=3):
+        logger.warning("Proceeding with partial coverage: %.2f%%", coverage * 100)
+
+    features = generate_features(prices)
+    if features.empty:
+        logger.error("No features generated from price history")
+        return 1
+
+    try:
+        x_live_raw = latest_feature_row(features, feature_names)
+    except Exception as exc:
+        logger.error("Feature mismatch detected: %s", exc)
+        return 1
     x_live = pd.DataFrame([x_live_raw], columns=feature_names)
 
     prediction = float(model.predict(x_live)[0])
 
     if not validate_prediction(prediction):
-        logger.error("Prediction failed validation (non-finite or out of bounds).")
+        logger.error("Prediction failed validation (non-finite, out of bounds, or degenerate)")
         return 1
 
-    worker = os.getenv("ALLORA_WALLET_ADDR", "unknown")
     submission_payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "topic_id": topic_id,
         "prediction_log_return_7d": prediction,
+        "data_source": fetch_meta.source,
     }
 
-    logger.info("Prediction ready for submission: %.8f", prediction)
-
-    # Save payload (for submission via CLI/SDK)
-    artifact_path = Path("artifacts") / "latest_submission.json"
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    with artifact_path.open("w") as f:
+    PAYLOAD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with PAYLOAD_PATH.open("w") as f:
         json.dump(submission_payload, f, indent=2)
-    logger.info("Saved submission payload to %s", artifact_path)
+    logger.info("Saved submission payload to %s", PAYLOAD_PATH)
 
-    # Record submission metadata
     log_submission_record(
         timestamp=datetime.now(timezone.utc),
         topic_id=topic_id,
         prediction=prediction,
         worker=worker,
         status="prediction_ready",
-        extra={"fetch_source": fetch_meta.source, "rows": fetch_meta.rows},
+        extra={
+            "fetch_source": fetch_meta.source,
+            "coverage": coverage,
+            "bundle_trained_at": bundle_meta.get("trained_at"),
+            "window_errors": window_status.errors,
+        },
     )
 
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     sys.exit(main())
-
