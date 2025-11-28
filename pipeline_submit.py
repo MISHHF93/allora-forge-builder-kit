@@ -12,9 +12,12 @@ from typing import Tuple
 def _build_payload(topic_id: int, value: float) -> str:
     """Return proto-text payload expected by the insert-worker-payload command."""
 
+    normalized_topic = int(topic_id)
+    normalized_value = float(value)
+
     # The CLI expects a single argument with proto-text formatting (not JSON).
     # Example: "topic_id: 67 value: -0.07178"
-    return f"topic_id: {int(topic_id)} value: {value}"
+    return f"topic_id: {normalized_topic} value: {normalized_value}"
 
 
 def submit_prediction_to_chain(

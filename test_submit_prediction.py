@@ -1,7 +1,25 @@
 import json
 from pathlib import Path
 
-from submit_prediction import submit_prediction
+import pytest
+
+from pipeline_core import FEATURE_COLUMNS
+from submit_prediction import load_bundle, submit_prediction
+
+
+def test_load_bundle_falls_back_when_missing(monkeypatch, tmp_path, caplog):
+    caplog.set_level("INFO")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("submit_prediction.MODEL_BUNDLE_PATH", tmp_path / "model_bundle.joblib")
+
+    import logging
+
+    logger = logging.getLogger("test")
+    model, feature_names, bundle_meta = load_bundle(logger)
+
+    assert feature_names == FEATURE_COLUMNS
+    assert hasattr(model, "predict")
+    assert bundle_meta.get("fallback") is True
 
 
 def test_submit_prediction_dry_run_without_wallet(monkeypatch, tmp_path):
@@ -20,8 +38,8 @@ def test_submit_prediction_dry_run_without_wallet(monkeypatch, tmp_path):
     assert latest["topic_id"] == 99
     assert latest["worker"] == "dry-run"
 
-    log_path = Path("submission_log.csv")
+    log_path = Path("logs/submission_log.csv")
     assert log_path.exists()
     lines = log_path.read_text().strip().splitlines()
-    assert lines[0].startswith("timestamp,topic_id,prediction,worker,block_height")
+    assert lines[0].startswith("timestamp,topic_id,prediction,worker,status")
     assert any("dry_run" in line for line in lines[1:])

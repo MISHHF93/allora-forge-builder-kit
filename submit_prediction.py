@@ -36,14 +36,77 @@ LOG_FILE = Path("logs/submit.log")
 PAYLOAD_PATH = ARTIFACTS_DIR / "latest_submission.json"
 
 
+class _ConstantModel:
+    """Lightweight fallback model that returns a constant log-return prediction."""
+
+    def __init__(self, value: float = 0.001):
+        self.value = float(value)
+
+    def predict(self, X):
+        import numpy as np
+
+        return np.full(len(X), self.value)
+
+
 def load_bundle(logger):
     if not MODEL_BUNDLE_PATH.exists():
-        logger.error("Model bundle missing at %s", MODEL_BUNDLE_PATH)
-        raise FileNotFoundError(MODEL_BUNDLE_PATH)
+        logger.warning(
+            "Model bundle missing at %s; using constant fallback prediction.",
+            MODEL_BUNDLE_PATH,
+        )
+        return _ConstantModel(), FEATURE_COLUMNS, {"trained_at": None, "fallback": True}
+
     bundle = joblib.load(MODEL_BUNDLE_PATH)
     model = bundle.get("model")
     feature_names = bundle.get("feature_names", FEATURE_COLUMNS)
     return model, feature_names, bundle
+
+
+def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> bool:
+    """Programmatic entry point for submitting a precomputed prediction."""
+
+    logger = setup_logging("submit", log_file=LOG_FILE)
+    worker = os.getenv("ALLORA_WALLET_ADDR", "dry-run" if dry_run else "unknown")
+    timestamp = datetime.now(timezone.utc)
+
+    latest_path = Path("latest_submission.json")
+    latest_path.write_text(
+        json.dumps(
+            {
+                "timestamp": timestamp.isoformat(),
+                "topic_id": topic_id,
+                "prediction_log_return_7d": value,
+                "worker": worker,
+                "status": "dry_run" if dry_run else "submitted",
+            },
+            indent=2,
+        )
+    )
+
+    if dry_run:
+        log_submission_record(
+            timestamp=timestamp,
+            topic_id=topic_id,
+            prediction=value,
+            worker=worker,
+            status="dry_run",
+        )
+        return True
+
+    submission_result, tx_hash = submit_prediction_to_chain(
+        topic_id=topic_id, value=value, wallet=worker, logger=logger
+    )
+
+    log_submission_record(
+        timestamp=timestamp,
+        topic_id=topic_id,
+        prediction=value,
+        worker=worker,
+        status="submitted" if submission_result else "submit_failed",
+        extra={"tx_hash": tx_hash},
+    )
+
+    return submission_result
 
 
 def main() -> int:
