@@ -20,6 +20,7 @@ from pipeline_core import (
     log_submission_record,
     validate_prediction,
 )
+from pipeline_submit import submit_prediction_to_chain
 from pipeline_utils import (
     ARTIFACTS_DIR,
     DEFAULT_TOPIC_ID,
@@ -118,21 +119,26 @@ def main() -> int:
         json.dump(submission_payload, f, indent=2)
     logger.info("Saved submission payload to %s", PAYLOAD_PATH)
 
+    submission_result, tx_hash = submit_prediction_to_chain(
+        topic_id=topic_id, value=prediction, wallet=worker, logger=logger
+    )
+
     log_submission_record(
         timestamp=datetime.now(timezone.utc),
         topic_id=topic_id,
         prediction=prediction,
         worker=worker,
-        status="prediction_ready",
+        status="submitted" if submission_result else "submit_failed",
         extra={
             "fetch_source": fetch_meta.source,
             "coverage": coverage,
             "bundle_trained_at": bundle_meta.get("trained_at"),
             "window_errors": window_status.errors,
+            "tx_hash": tx_hash,
         },
     )
 
-    return 0
+    return 0 if submission_result else 1
 
 
 if __name__ == "__main__":
