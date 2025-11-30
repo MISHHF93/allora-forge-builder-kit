@@ -1,0 +1,16 @@
+# ~/.allorad/config/client.toml
+
+# The network chain ID
+chain-id = "allora-testnet-1"
+
+# The keyring's backend, where the keys are stored (os|file|kwallet|pass|test|memory)
+keyring-backend = "test"
+
+# CLI output format (text|json)
+output = "json"
+
+# RPC interface URL to reach the Allora network
+node = "https://allora-rpc.testnet.allora.network/"
+
+# Transaction broadcasting mode (sync|async)
+broadcast-mode = "sync"
