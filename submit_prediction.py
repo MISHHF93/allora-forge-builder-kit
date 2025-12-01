@@ -20,7 +20,6 @@ from pipeline_core import (
     log_submission_record,
     validate_prediction,
 )
-from pipeline_submit import submit_prediction_to_chain
 from pipeline_utils import (
     ARTIFACTS_DIR,
     DEFAULT_TOPIC_ID,
@@ -44,7 +43,6 @@ class _ConstantModel:
 
     def predict(self, X):
         import numpy as np
-
         return np.full(len(X), self.value)
 
 
@@ -54,59 +52,57 @@ def load_bundle(logger):
             "Model bundle missing at %s; using constant fallback prediction.",
             MODEL_BUNDLE_PATH,
         )
-        return _ConstantModel(), FEATURE_COLUMNS, {"trained_at": None, "fallback": True}
+        return _ConstantModel(), FEATURE_COLUMNS, {"trained_at": None, "fallback": True, "horizon_hours": 168}
 
     bundle = joblib.load(MODEL_BUNDLE_PATH)
     model = bundle.get("model")
     feature_names = bundle.get("feature_names", FEATURE_COLUMNS)
-    return model, feature_names, bundle
+    horizon_hours = bundle.get("horizon_hours", 168)
+    return model, feature_names, bundle, horizon_hours
 
 
-def submit_prediction(value: float, topic_id: int, dry_run: bool = False) -> bool:
-    """Programmatic entry point for submitting a precomputed prediction."""
+def get_prediction_label(horizon_hours: int) -> str:
+    if horizon_hours <= 24:
+        return "prediction_log_return_1d"
+    elif horizon_hours <= 168:
+        return "prediction_log_return_7d"
+    elif horizon_hours <= 336:
+        return "prediction_log_return_14d"
+    else:
+        return f"prediction_log_return_{horizon_hours}h"
 
-    logger = setup_logging("submit", log_file=LOG_FILE)
-    worker = os.getenv("ALLORA_WALLET_ADDR", "dry-run" if dry_run else "unknown")
-    timestamp = datetime.now(timezone.utc)
 
-    latest_path = Path("latest_submission.json")
-    latest_path.write_text(
-        json.dumps(
-            {
-                "timestamp": timestamp.isoformat(),
-                "topic_id": topic_id,
-                "prediction_log_return_7d": value,
-                "worker": worker,
-                "status": "dry_run" if dry_run else "submitted",
-            },
-            indent=2,
-        )
-    )
+def submit_prediction_to_chain(topic_id: int, value: float, wallet: str, logger) -> tuple[bool, str]:
+    from subprocess import run, CalledProcessError
 
-    if dry_run:
-        log_submission_record(
-            timestamp=timestamp,
-            topic_id=topic_id,
-            prediction=value,
-            worker=worker,
-            status="dry_run",
-        )
-        return True
+    payload = {
+        "topic_id": topic_id,
+        "value": value
+    }
+    PAYLOAD_PATH.write_text(json.dumps(payload))
 
-    submission_result, tx_hash = submit_prediction_to_chain(
-        topic_id=topic_id, value=value, wallet=worker, logger=logger
-    )
+    cmd = [
+        "allorad", "tx", "emissions", "insert-worker-payload",
+        "--payload", str(PAYLOAD_PATH),
+        "--from", wallet,
+        "--keyring-backend", "test",
+        "--chain-id", os.getenv("CHAIN_ID", "allora-testnet-1"),
+        "--node", os.getenv("NODE_RPC", "https://allora-rpc.testnet.allora.network/"),
+        "--fees", os.getenv("FEES", "5000stake"),
+        "--gas", os.getenv("GAS", "200000"),
+        "--yes",
+        "--broadcast-mode", "sync",
+        "--output", "json"
+    ]
 
-    log_submission_record(
-        timestamp=timestamp,
-        topic_id=topic_id,
-        prediction=value,
-        worker=worker,
-        status="submitted" if submission_result else "submit_failed",
-        extra={"tx_hash": tx_hash},
-    )
-
-    return submission_result
+    try:
+        logger.info("📨 Submitting prediction: topic_id=%s value=%.6f", topic_id, value)
+        result = run(cmd, capture_output=True, text=True, check=True)
+        logger.debug("TX output: %s", result.stdout)
+        return True, result.stdout
+    except CalledProcessError as e:
+        logger.error("❌ TX failed with code %s: %s", e.returncode, e.stderr.strip())
+        return False, e.stderr.strip()
 
 
 def main() -> int:
@@ -118,18 +114,20 @@ def main() -> int:
 
     logger.info("Loading model bundle for topic %s", topic_id)
     try:
-        model, feature_names, bundle_meta = load_bundle(logger)
+        model, feature_names, bundle_meta, horizon_hours = load_bundle(logger)
     except Exception as exc:
         logger.error("Failed to load model bundle: %s", exc)
         return 1
 
-    # Confirm on-chain submission window readiness
+    prediction_label = get_prediction_label(horizon_hours)
+    logger.info("Using prediction horizon: %s hours -> %s", horizon_hours, prediction_label)
+
     window_status = query_window_status(topic_id, worker, logger)
     if not window_status.ok_to_submit():
         logger.warning(
-            "Submission blocked: topic_active=%s worker_has_nonce=%s cli_found=%s errors=%s",
+            "Submission blocked: topic_active=%s worker_can_submit=%s cli_found=%s errors=%s",
             window_status.topic_active,
-            window_status.worker_has_nonce,
+            window_status.worker_can_submit,
             window_status.cli_found,
             window_status.errors,
         )
@@ -146,8 +144,7 @@ def main() -> int:
         return 1
 
     if fetch_meta.fallback_used:
-        logger.error("Blocking submission because fallback/synthetic data is active (%s)", fetch_meta.source)
-        return 1
+        logger.warning("Using synthetic/fallback data for submission: %s", fetch_meta.source)
 
     if not price_coverage_ok(prices, min_days=days_back, freshness_hours=3):
         logger.warning("Proceeding with partial coverage: %.2f%%", coverage * 100)
@@ -173,8 +170,10 @@ def main() -> int:
     submission_payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "topic_id": topic_id,
-        "prediction_log_return_7d": prediction,
+        prediction_label: prediction,
+        "horizon_hours": horizon_hours,
         "data_source": fetch_meta.source,
+        "uses_synthetic_data": fetch_meta.fallback_used,
     }
 
     PAYLOAD_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -198,6 +197,8 @@ def main() -> int:
             "bundle_trained_at": bundle_meta.get("trained_at"),
             "window_errors": window_status.errors,
             "tx_hash": tx_hash,
+            "horizon_hours": horizon_hours,
+            "uses_synthetic_data": fetch_meta.fallback_used,
         },
     )
 
@@ -206,3 +207,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

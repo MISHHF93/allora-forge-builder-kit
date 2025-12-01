@@ -1,0 +1,84 @@
+"""
+Allora network status helpers for v0.14.0 CLI with positional arguments.
+"""
+
+from __future__ import annotations
+import json, shutil, subprocess
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+@dataclass
+class WindowStatus:
+    cli_found: bool
+    topic_active: Optional[bool] = None
+    worker_registered: Optional[bool] = None
+    worker_can_submit: Optional[bool] = None
+    latest_nonce: Optional[int] = None
+    raw_outputs: Dict[str, object] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+    def ok_to_submit(self) -> bool:
+        return (
+            self.cli_found
+            and self.topic_active is True
+            and self.worker_registered is True
+            and self.worker_can_submit is True
+        )
+
+def _run_cli(cmd: list[str], logger):
+    cli = shutil.which("allorad")
+    if not cli:
+        raise FileNotFoundError("allorad CLI not installed")
+
+    full_cmd = [cli] + cmd
+    logger.debug("Running CLI command: %s", " ".join(full_cmd))
+
+    # Defensive check: no None or empty strings
+    if any(arg in [None, ""] for arg in full_cmd):
+        raise ValueError(f"Malformed CLI command (empty arg): {full_cmd}")
+
+    proc = subprocess.run(full_cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
+
+    output = proc.stdout.strip()
+    logger.debug("Raw CLI output: '%s'", output)
+
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError:
+        result = {}
+        for line in output.splitlines():
+            if ':' in line:
+                k, v = line.split(':', 1)
+                k = k.strip()
+                v = v.strip()
+                if v.lower() == 'true':
+                    result[k] = True
+                elif v.lower() == 'false':
+                    result[k] = False
+                elif v.isdigit():
+                    result[k] = int(v)
+                else:
+                    result[k] = v
+        return result if result else {"raw": output}
+
+def query_window_status(topic_id: int, wallet: str, logger) -> WindowStatus:
+    status = WindowStatus(cli_found=bool(shutil.which("allorad")))
+    if not status.cli_found:
+        status.errors.append("allorad CLI not found")
+        return status
+
+    # 1️⃣ Check if topic is active
+    try:
+        resp = _run_cli(["query", "emissions", "is-topic-active", str(topic_id)], logger)
+        status.raw_outputs["is_topic_active"] = resp
+        status.topic_active = resp.get("active", str(resp).lower() == "true")
+        logger.info("✅ Topic %s active: %s", topic_id, status.topic_active)
+    except Exception as exc:
+        status.errors.append(f"is-topic-active error: {exc}")
+        logger.error("❌ Topic active check failed: %s", exc)
+
+    # 2️⃣ Check if worker is registered
+    try:
+        resp = _run_cli(["query", "emissions", "is-worker-registered", str(topic_id), wallet], logger)
