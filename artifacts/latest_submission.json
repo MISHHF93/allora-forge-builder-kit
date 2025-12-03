@@ -1,1 +1,10 @@
-{"topic_id": 67, "value": 0.0015297051267672383}
+{
+  "timestamp": "2025-12-03T04:12:50.084360+00:00",
+  "topic_id": 67,
+  "prediction_log_return_14d": -0.12969775453460333,
+  "horizon_hours": 310,
+  "data_source": "synthetic",
+  "uses_synthetic_data": true,
+  "model_type": "trained",
+  "coverage_ratio": 1.0
+}
