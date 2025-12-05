@@ -1,10 +1,21 @@
 {
-  "timestamp": "2025-12-03T04:12:50.084360+00:00",
+  "timestamp": "2025-12-05T23:05:27.015016+00:00",
   "topic_id": 67,
-  "prediction_log_return_14d": -0.12969775453460333,
-  "horizon_hours": 310,
-  "data_source": "synthetic",
-  "uses_synthetic_data": true,
-  "model_type": "trained",
-  "coverage_ratio": 1.0
+  "prediction": -0.003894621506333351,
+  "worker": "allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma",
+  "block_height": 6833755,
+  "proof": {
+    "inference": {
+      "topic_id": 67,
+      "block_height": 6833755,
+      "inferer": "allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma",
+      "value": "-0.003894621506333351",
+      "extra_data": "",
+      "proof": ""
+    }
+  },
+  "signature": "llbSFEZeYYtw6DUKQcnYaoZ0DFR+WrXHqfBuX5g7JLIqnp1DaiRJSSIqh+jtLCxOLTMv1/LQWhZaISN0xmyrbg==",
+  "status": "success_pending_confirmation",
+  "tx_hash": "D53E145168798C5756BBCC9910EC1A7E26DBFF56343AA38948DA16F4AF24E2CD",
+  "rpc_endpoint": "Endpoint-1"
 }

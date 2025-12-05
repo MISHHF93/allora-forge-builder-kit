@@ -1,0 +1,55 @@
+timestamp,topic_id,prediction,worker,block_height,proof,signature,status,tx_hash,rpc_endpoint
+2025-11-23T06:55:41.050891+00:00,67,-0.038135699927806854,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-23T07:55:41.778988+00:00,67,-0.038135699927806854,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-23T07:56:07.693415+00:00,67,-0.038135699927806854,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:27:08.523217+00:00,67,-0.011969962157309055,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6658365,,,success,,Primary
+2025-11-24T00:28:34.012784+00:00,67,-0.014866059646010399,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6658075,,,failed_no_sequence,,all_failed
+2025-11-24T00:33:07.922454+00:00,67,-0.014866059646010399,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6658075,,,success_pending_confirmation,,Primary
+2025-11-24T00:33:34.478911+00:00,67,-0.014866059646010399,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:35:28.884214+00:00,67,-0.000883568252902478,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6658454,,,success,,Primary
+2025-11-24T00:36:03.722158+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:36:09.949480+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:37:12.702438+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:41:26.784404+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:44:21.980318+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:44:30.483155+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:48:58.385850+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:51:21.447777+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:54:48.546289+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:57:21.137447+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T00:57:59.280640+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T01:02:19.376244+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T01:05:13.820997+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T01:06:38.112233+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T02:06:38.788131+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T02:18:04.278486+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6659515,,,failed_no_sequence,,all_failed
+2025-11-24T02:18:16.857735+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6659515,,,failed_no_sequence,,all_failed
+2025-11-24T02:19:50.779340+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6659515,,,failed_no_sequence,,all_failed
+2025-11-24T02:21:05.247215+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6659515,"{""inference"": {""topic_id"": 67, ""block_height"": 6659515, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.02882043644785881"", ""extra_data"": """", ""proof"": """"}}",lIdJvFA4ptqzB1gk9cghw7tXdfWq97hlH43U8dDeLcs6lDDkSgEG/P77BoVdw5lccLSGMjwg1HO5KspIlH7o2Q==,"cli_error: Error: invalid argument ""-1"" for ""-s, --sequence"" flag: strconv.ParseUint: parsing ""-1"": invalid syn",,Primary-HTTP
+2025-11-24T02:21:31.524372+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6659515,"{""inference"": {""topic_id"": 67, ""block_height"": 6659515, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.02882043644785881"", ""extra_data"": """", ""proof"": """"}}",lIdJvFA4ptqzB1gk9cghw7tXdfWq97hlH43U8dDeLcs6lDDkSgEG/P77BoVdw5lccLSGMjwg1HO5KspIlH7o2Q==,success_pending_confirmation,66B8F59448CE96CB6E638C991EC2D72B3216FFC2E94BF0F9A44B57A3AA681DFC,Primary
+2025-11-24T02:24:47.222955+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:18:43.619660+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:19:22.109343+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:19:40.000368+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:19:47.019720+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:20:01.100741+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:20:39.492785+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:21:04.257382+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:21:24.086253+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:37:27.866737+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6660235,"{""inference"": {""topic_id"": 67, ""block_height"": 6660235, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.02882043644785881"", ""extra_data"": """", ""proof"": """"}}",cksx3gfr1C0ubkrxQSmWlmOBCKzc44zpu3boboV9I1tEXesfNH+lgvLDOjS6EMNi9qEjgxxWrXgJQKMnSFH5tA==,success_pending_confirmation,292639496865CB4B0F7F2F7239A8F3646BAEEF8BA0B782069A4DCD15767D4FA2,Primary
+2025-11-24T03:42:29.732660+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:42:37.315621+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:42:57.361100+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:48:14.424966+00:00,67,-0.02882043644785881,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T03:49:30.480842+00:00,67,0.024734998121857643,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6660513,"{""inference"": {""topic_id"": 67, ""block_height"": 6660513, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""0.024734998121857643"", ""extra_data"": """", ""proof"": """"}}",,success
+2025-11-24T03:49:50.466018+00:00,67,-0.07608044892549515,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T06:25:04.353303+00:00,67,-0.07608044892549515,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6661675,"{""inference"": {""topic_id"": 67, ""block_height"": 6661675, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.07608044892549515"", ""extra_data"": """", ""proof"": """"}}",KnRrFU82c72B3/Xh/n+tu3Fny7G+K1Aef4KGnTXtSURva3toEPhWY3XvJ2vi47PNC49/Hsaf66eJDCdtLev0Vg==,success_pending_confirmation,D51058CBB17C3673587D76B4E9C1AD589C10AEECC3DC77F64800CC17A5DC5177,Primary
+2025-11-24T06:25:39.473776+00:00,67,-0.07608044892549515,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T06:32:45.641457+00:00,67,-0.07608044892549515,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T06:34:14.251189+00:00,67,-0.07608044892549515,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T06:34:28.452294+00:00,67,-0.07608044892549515,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-11-24T06:36:31.316884+00:00,67,-0.07608044892549515,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_no_nonce,,N/A
+2025-12-05T23:02:06.491238+00:00,67,-0.0033052258659154177,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6834180,"{""inference"": {""topic_id"": 67, ""block_height"": 6834180, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.0033052258659154177"", ""extra_data"": """", ""proof"": """"}}",,success
+2025-12-05T23:04:08.578168+00:00,67,-0.003894621506333351,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,0,,,skipped_validation_failed: Validation error: 'AlloraAPIClient' object has no attribute 'is_topic_active',,N/A
+2025-12-05T23:05:27.015016+00:00,67,-0.003894621506333351,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6833755,"{""inference"": {""topic_id"": 67, ""block_height"": 6833755, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.003894621506333351"", ""extra_data"": """", ""proof"": """"}}",llbSFEZeYYtw6DUKQcnYaoZ0DFR+WrXHqfBuX5g7JLIqnp1DaiRJSSIqh+jtLCxOLTMv1/LQWhZaISN0xmyrbg==,success_pending_confirmation,D53E145168798C5756BBCC9910EC1A7E26DBFF56343AA38948DA16F4AF24E2CD,Endpoint-1
+2025-12-05T23:33:34.793058+00:00,67,-0.006936694495379925,allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma,6834510,"{""inference"": {""topic_id"": 67, ""block_height"": 6834510, ""inferer"": ""allo1cxvw0pu9nmpxku9acj5h2q3daq3m0jac5q6vma"", ""value"": ""-0.006936694495379925"", ""extra_data"": """", ""proof"": """"}}",,success
