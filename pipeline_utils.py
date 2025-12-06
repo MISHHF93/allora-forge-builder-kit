@@ -25,6 +25,7 @@ ARTIFACTS_DIR = Path("artifacts")
 CACHE_DIR = ARTIFACTS_DIR / "cache"
 RAW_JSON_CACHE = CACHE_DIR / "btcusd_hourly.json"
 CACHE_PATH = CACHE_DIR / "btcusd_hourly.parquet"
+TIINGO_RATE_LIMIT_TRACKER = CACHE_DIR / "tiingo_rate_limit_tracker.json"
 
 DEFAULT_TOPIC_ID = int(os.getenv("TOPIC_ID", os.getenv("ALLORA_TOPIC_ID", "67")))
 MIN_COVERAGE_RATIO = 0.5
@@ -42,6 +43,85 @@ class FetchResult:
 def ensure_directories() -> None:
     for path in (LOG_DIR, ARTIFACTS_DIR, CACHE_DIR):
         path.mkdir(parents=True, exist_ok=True)
+
+def update_rate_limit_tracker(success: bool, status_code: Optional[int] = None) -> None:
+    """Update the rate limit tracker with request results."""
+    try:
+        tracker = {"requests": [], "daily_count": 0, "last_reset": None}
+        if TIINGO_RATE_LIMIT_TRACKER.exists():
+            with TIINGO_RATE_LIMIT_TRACKER.open("r") as f:
+                tracker = json.load(f)
+        
+        now = datetime.now(timezone.utc)
+        today = now.date().isoformat()
+        
+        # Reset daily count if it's a new day
+        if tracker.get("last_reset") != today:
+            tracker["daily_count"] = 0
+            tracker["last_reset"] = today
+        
+        # Add this request
+        tracker["requests"].append({
+            "timestamp": now.isoformat(),
+            "success": success,
+            "status_code": status_code
+        })
+        
+        # Keep only last 100 requests
+        tracker["requests"] = tracker["requests"][-100:]
+        
+        if success:
+            tracker["daily_count"] += 1
+        
+        # Save tracker
+        with TIINGO_RATE_LIMIT_TRACKER.open("w") as f:
+            json.dump(tracker, f, indent=2)
+            
+    except Exception as e:
+        # Don't fail if tracker update fails
+        pass
+
+def cleanup_old_cache_files() -> None:
+    """Clean up old Tiingo chunk cache files."""
+    try:
+        if not CACHE_DIR.exists():
+            return
+            
+        for cache_file in CACHE_DIR.glob("tiingo_chunk_*.json"):
+            try:
+                # Remove files older than 7 days
+                if time.time() - cache_file.stat().st_mtime > 7 * 24 * 3600:
+                    cache_file.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def should_skip_tiingo_request() -> bool:
+    """Check if we should skip Tiingo requests based on rate limiting."""
+    try:
+        if not TIINGO_RATE_LIMIT_TRACKER.exists():
+            return False
+            
+        with TIINGO_RATE_LIMIT_TRACKER.open("r") as f:
+            tracker = json.load(f)
+        
+        # Check recent failures
+        recent_requests = tracker.get("requests", [])
+        recent_failures = [r for r in recent_requests[-10:] if not r.get("success", True)]
+        
+        if len(recent_failures) >= 3:
+            return True
+            
+        # Check daily limit (conservative estimate)
+        daily_count = tracker.get("daily_count", 0)
+        if daily_count >= 400:  # Conservative limit
+            return True
+            
+        return False
+        
+    except Exception:
+        return False
 
 def setup_logging(name: str, log_file: Path) -> logging.Logger:
     ensure_directories()
@@ -147,14 +227,35 @@ class DataFetcher:
             try:
                 response = self.session.get(url, params=params, timeout=timeout)
                 status = response.status_code
+                
+                # Update rate limit tracker
+                success = status not in (418, 429) and 200 <= status < 300
+                update_rate_limit_tracker(success, status)
+                
+                # Log response headers for rate limit debugging
+                if status == 429:
+                    self.logger.debug("Tiingo headers: %s", dict(response.headers))
+                    retry_after = response.headers.get('Retry-After')
+                    if retry_after:
+                        self.logger.warning("Tiingo retry-after: %s seconds", retry_after)
+                        try:
+                            time.sleep(min(int(retry_after), 60))  # Cap at 60 seconds
+                            continue
+                        except ValueError:
+                            pass
+                
                 if status in (418, 429):
                     self.logger.warning("Rate-limit or ban from %s (status=%s). attempt=%s/%s", url, status, attempt, attempts)
-                    time.sleep(backoff * attempt)
+                    # Adaptive backoff: start at 5s, increase exponentially
+                    sleep_time = 5 * attempt
+                    self.logger.info("Sleeping %s seconds before retry...", sleep_time)
+                    time.sleep(sleep_time)
                     continue
                 response.raise_for_status()
                 return response.json(), status
             except Exception as exc:
                 self.logger.warning("Request failure %s attempt %s/%s: %s", url, attempt, attempts, exc)
+                update_rate_limit_tracker(False, None)
                 if attempt == attempts:
                     return None, None
                 time.sleep(backoff * attempt)
@@ -165,37 +266,79 @@ class DataFetcher:
         if not token:
             return None
 
+        # Check if we should skip Tiingo requests due to rate limiting
+        if should_skip_tiingo_request():
+            self.logger.warning("Skipping Tiingo requests due to recent rate limit issues")
+            return None
+
         url = "https://api.tiingo.com/tiingo/crypto/prices"
         rows: List[Tuple[datetime, float]] = []
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=days_back)
         chunk_days = 7
 
+        # Limit chunks per call to avoid bulk rate limiting
+        max_chunks = int(os.getenv("TIINGO_MAX_CHUNKS", "5"))
+        chunks_processed = 0
+
         rate_limit_hits = 0
 
-        while start < end:
+        while start < end and chunks_processed < max_chunks:
             chunk_end = min(start + timedelta(days=chunk_days), end)
-            params = {
-                "tickers": "btcusd",
-                "resampleFreq": "1hour",
-                "startDate": start.strftime("%Y-%m-%d"),
-                "endDate": chunk_end.strftime("%Y-%m-%d"),
-                "token": token,
-            }
-            data, status = self._request_with_backoff(url, params, attempts=3, backoff=3)
-            if status == 429:
-                rate_limit_hits += 1
-                self.logger.warning("Tiingo rate limit encountered for %s-%s (hit %s); skipping chunk.", params["startDate"], params["endDate"], rate_limit_hits)
-                if rate_limit_hits >= 2:
-                    break
-                start = chunk_end
-                continue
-            if data is None:
-                self.logger.warning("Tiingo chunk %s-%s failed; skipping chunk.", params["startDate"], params["endDate"])
-                start = chunk_end
-                continue
-
-            price_data = data[0].get("priceData", []) if isinstance(data[0], dict) else []
+            chunk_key = f"{start.strftime('%Y-%m-%d')}_{chunk_end.strftime('%Y-%m-%d')}"
+            chunk_cache_path = CACHE_DIR / f"tiingo_chunk_{chunk_key}.json"
+            
+            # Try to load from chunk cache first
+            chunk_data = None
+            if chunk_cache_path.exists():
+                try:
+                    with chunk_cache_path.open("r") as f:
+                        cached = json.load(f)
+                    # Check if cache is fresh (less than 24 hours old)
+                    cache_time = datetime.fromisoformat(cached["timestamp"])
+                    if datetime.now(timezone.utc) - cache_time < timedelta(hours=24):
+                        chunk_data = cached["data"]
+                        self.logger.debug("Loaded chunk %s from cache", chunk_key)
+                    else:
+                        chunk_cache_path.unlink()  # Remove stale cache
+                except Exception:
+                    pass
+            
+            if chunk_data is None:
+                params = {
+                    "tickers": "btcusd",
+                    "resampleFreq": "1hour",
+                    "startDate": start.strftime("%Y-%m-%d"),
+                    "endDate": chunk_end.strftime("%Y-%m-%d"),
+                    "token": token,
+                }
+                data, status = self._request_with_backoff(url, params, attempts=3, backoff=3)
+                if status == 429:
+                    rate_limit_hits += 1
+                    self.logger.warning("Tiingo rate limit encountered for %s-%s (hit %s); skipping chunk.", params["startDate"], params["endDate"], rate_limit_hits)
+                    if rate_limit_hits >= 2:
+                        break
+                    start = chunk_end
+                    continue
+                if data is None:
+                    self.logger.warning("Tiingo chunk %s-%s failed; skipping chunk.", params["startDate"], params["endDate"])
+                    start = chunk_end
+                    continue
+                
+                chunk_data = data
+                # Cache the chunk
+                try:
+                    cache_entry = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "data": chunk_data
+                    }
+                    with chunk_cache_path.open("w") as f:
+                        json.dump(cache_entry, f)
+                except Exception:
+                    pass
+            
+            chunks_processed += 1
+            price_data = chunk_data[0].get("priceData", []) if isinstance(chunk_data[0], dict) else []
             for item in price_data:
                 ts_raw = item.get("date")
                 close = item.get("close")
@@ -230,6 +373,7 @@ class DataFetcher:
 
     def fetch_price_history(self, days_back: int, force_refresh: bool = False, allow_fallback: bool = False, freshness_hours: int = 2) -> Tuple[pd.DataFrame, FetchResult]:
         ensure_directories()
+        cleanup_old_cache_files()
 
         if not force_refresh:
             cached = load_cached_prices()
@@ -241,6 +385,28 @@ class DataFetcher:
                     path=CACHE_PATH,
                     coverage=coverage_ratio(cached, days_back),
                     stale=False,
+                )
+
+        # Check if Tiingo is rate limited before attempting
+        if should_skip_tiingo_request():
+            self.logger.warning("Tiingo rate limiting detected, skipping API calls")
+            if allow_fallback:
+                synthetic_df = self._fetch_synthetic(days_back)
+                return synthetic_df, FetchResult(
+                    source="synthetic",
+                    rows=len(synthetic_df),
+                    path=None,
+                    coverage=coverage_ratio(synthetic_df, days_back),
+                    fallback_used=True,
+                    reason="tiingo_rate_limited"
+                )
+            else:
+                return pd.DataFrame(), FetchResult(
+                    source="none",
+                    rows=0,
+                    path=None,
+                    coverage=0.0,
+                    reason="tiingo_rate_limited"
                 )
 
         self.logger.info("Fetching market data from Tiingo...")

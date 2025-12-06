@@ -1,4 +1,5 @@
 import os
+import json
 import joblib
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -10,7 +11,7 @@ from pipeline_utils import ARTIFACTS_DIR, DataFetcher, setup_logging
 load_dotenv()
 
 # ✅ Training config from env
-DAYS_BACK = int(os.getenv("TRAINING_DAYS_BACK", "90"))
+DAYS_BACK = int(os.getenv("TRAINING_DAYS_BACK", "30"))
 HORIZON = int(os.getenv("HORIZON_HOURS", "168"))  # Default 7 days
 FORCE_RETRAIN = os.getenv("FORCE_RETRAIN", "0").lower() in {"1", "true", "yes"}
 
@@ -106,6 +107,11 @@ def main() -> int:
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     bundle_path = ARTIFACTS_DIR / "model_bundle.joblib"
     joblib.dump(bundle, bundle_path)
+
+    # ✅ Save features for later use
+    with open("features.json", "w") as f:
+        json.dump(FEATURE_COLUMNS, f)
+    logger.info(f"Features saved to features.json ({len(FEATURE_COLUMNS)} columns)")
 
     # ✅ Log sample prediction
     sample_row = feature_target_df[FEATURE_COLUMNS].iloc[-1:]

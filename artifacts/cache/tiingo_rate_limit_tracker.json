@@ -1,0 +1,81 @@
+{
+  "requests": [
+    {
+      "timestamp": "2025-12-06T00:50:57.437014+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:51:02.458189+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:51:12.475530+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:51:27.497092+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:51:32.514160+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:51:42.530491+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:51:57.547024+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:52:02.568472+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:52:12.584768+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:52:27.606189+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:52:32.628006+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:52:42.650732+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:52:57.671212+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:53:02.687663+00:00",
+      "success": false,
+      "status_code": 429
+    },
+    {
+      "timestamp": "2025-12-06T00:53:12.709267+00:00",
+      "success": false,
+      "status_code": 429
+    }
+  ],
+  "daily_count": 0,
+  "last_reset": "2025-12-06"
+}
